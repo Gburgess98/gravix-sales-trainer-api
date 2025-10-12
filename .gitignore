@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.build/
+.env
+.env.*
+.DS_Store
+*.log
+# audio & large binaries
+*.wav
+*.mp3
+sample_call.wav/
