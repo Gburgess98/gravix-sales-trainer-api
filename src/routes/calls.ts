@@ -29,8 +29,22 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function getUserIdHeader(req: any): string {
-  const uid = req.header("x-user-id");
-  if (!uid || !UUID_RE.test(uid)) throw new Error("Missing or invalid x-user-id");
+  // Accept a few aliases to be resilient across proxies/CDNs
+  const cand =
+    req.header("x-user-id") ||
+    req.header("x-gravix-user-id") ||
+    req.header("x-forwarded-user-id") ||
+    null;
+
+  // Optional DEV-only escape hatch via query string (ONLY if you enable it)
+  const allowQs = process.env.ALLOW_DEV_UID_QS === "1";
+  const qsUid = allowQs ? (req.query?.dev_uid as string | undefined) : undefined;
+
+  const uid = (cand || qsUid || "").trim();
+
+  if (!uid || !UUID_RE.test(uid)) {
+    throw new Error("Missing or invalid x-user-id");
+  }
   return uid;
 }
 

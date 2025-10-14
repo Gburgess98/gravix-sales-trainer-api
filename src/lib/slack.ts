@@ -148,12 +148,14 @@ export function buildScoreBlocksFromRubric(input: ScoreSummaryInput) {
   if (base) {
     const openUrl = `${base.replace(/\/$/, "")}/calls/${callId}`;
     const crmUrl = `${base.replace(/\/$/, "")}/calls/${callId}?panel=crm`;
+    const coachUrl = `${base.replace(/\/$/, "")}/calls/${callId}?panel=coach&assign=1`;
     blocks.push({ type: "divider" });
     blocks.push({
       type: "actions",
       elements: [
         { type: "button", text: { type: "plain_text", text: "Open Call" }, url: openUrl, action_id: "open_call" },
         { type: "button", text: { type: "plain_text", text: "Link / Review CRM" }, url: crmUrl, action_id: "open_crm" },
+        { type: "button", text: { type: "plain_text", text: "Assign Drill" }, url: coachUrl, action_id: "assign_drill" },
       ],
     });
   }
@@ -184,6 +186,9 @@ export function buildScoreBlocks(s: SummaryInput) {
 
   const header = `*${Math.round(s.overallScore)}* / 100  •  Intro ${s.section.intro} | Disc ${s.section.discovery} | Obj ${s.section.objection} | Close ${s.section.close}`;
 
+  const baseFromCall = s.callUrl ? s.callUrl.replace(/\/calls\/[^\/?#]+.*/, "") : "";
+  const coachUrl = baseFromCall ? `${baseFromCall}/calls/${s.callId}?panel=coach&assign=1` : s.callUrl;
+
   const subtitleParts = [
     s.repName ? `Rep: ${s.repName}` : null,
     s.contactName ? `Contact: ${s.contactName}` : null,
@@ -208,6 +213,7 @@ export function buildScoreBlocks(s: SummaryInput) {
       type: "actions",
       elements: [
         { type: "button", text: { type: "plain_text", text: "Open Call" }, url: s.callUrl, action_id: "open_call" },
+        { type: "button", text: { type: "plain_text", text: "Assign Drill" }, url: coachUrl, action_id: "assign_drill" },
         { type: "button", text: { type: "plain_text", text: "Recent Calls" }, url: s.recentUrl, action_id: "open_recent" },
       ],
     },

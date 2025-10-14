@@ -1,7 +1,7 @@
 ﻿// src/lib/scoring.ts
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { getOpenAI, AI_MODEL, OPENAI_TIMEOUT_MS } from "./openai";
-import { postSlackSummary } from "./slack";
+import { postScoreSummary } from "./slack";
 
 export const RUBRIC_VERSION = "v1"; // bump when rubric changes
 
@@ -66,50 +66,14 @@ export function heuristicScoreFallback(): LlmScore {
   };
 }
 
-// at top of the file add/confirm this import:
-import { postScoreSummary } from "./slack";
-
-// ... keep your other code ...
-
-/** Best-effort Slack notifier */
-async function notifySlack(opts: {
-  callId: string;
-  scores: { intro: number; discovery: number; objection: number; close: number; overall: number };
-  // optional context fields if you have them:
-  durationSec?: number;
-  repName?: string;
-  contactName?: string;
-  company?: string;
-}) {
-  try {
-    const WEB = process.env.WEB_BASE_URL || "https://gravix-sales-trainer-web.vercel.app";
-
-    await postScoreSummary({
-      callId: opts.callId,
-      overallScore: opts.scores.overall,
-      section: {
-        intro: opts.scores.intro,
-        discovery: opts.scores.discovery,
-        objection: opts.scores.objection,
-        close: opts.scores.close,
-      },
-      durationSec: opts.durationSec,
-      repName: opts.repName,
-      contactName: opts.contactName,
-      company: opts.company,
-      callUrl: `${WEB}/calls/${opts.callId}`,
-      recentUrl: `${WEB}/recent-calls`,
-    });
-
-    console.log("[score] Slack summary posted");
-  } catch (err) {
-    console.error("[score] Slack summary failed", err);
-  }
-}
-
-
 /** Write a score row into call_scores (non-blocking if table missing) */
-async function writeScoreHistory(supabase: SupabaseClient, callId: string, model: string, overall: number, rubric: any) {
+async function writeScoreHistory(
+  supabase: SupabaseClient,
+  callId: string,
+  model: string,
+  overall: number,
+  rubric: any
+) {
   try {
     const { error } = await supabase.from("call_scores").insert({
       call_id: callId,
@@ -124,14 +88,74 @@ async function writeScoreHistory(supabase: SupabaseClient, callId: string, model
   }
 }
 
-export async function scoreWithLLM(opts: { supabase: SupabaseClient; callId: string }): Promise<LlmScore> {
+/** Best-effort Slack notifier (safe: silently skips if webhook unset) */
+async function notifySlack(opts: {
+  supabase: SupabaseClient;
+  callId: string;
+  scores: {
+    intro: number;
+    discovery: number;
+    objection: number;
+    close: number;
+    overall: number;
+  };
+  durationSec?: number | null;
+  repIdFallback?: string | null;
+}) {
+  try {
+    // Try to resolve a human name for the rep if you store it in profiles
+    let repName: string | undefined = undefined;
+    if (opts.repIdFallback) {
+      try {
+        const { data } = await opts.supabase
+          .from("profiles")
+          .select("full_name")
+          .eq("id", opts.repIdFallback)
+          .maybeSingle();
+        repName = (data as any)?.full_name || opts.repIdFallback || undefined;
+      } catch {
+        repName = opts.repIdFallback || undefined;
+      }
+    }
+
+    const WEB =
+      (process.env.PUBLIC_WEB_BASE ||
+        process.env.WEB_BASE_URL ||
+        "http://localhost:3000").replace(/\/$/, "");
+
+    await postScoreSummary({
+      callId: opts.callId,
+      overallScore: opts.scores.overall,
+      section: {
+        intro: opts.scores.intro,
+        discovery: opts.scores.discovery,
+        objection: opts.scores.objection,
+        close: opts.scores.close,
+      },
+      durationSec: typeof opts.durationSec === "number" ? opts.durationSec : undefined,
+      repName,
+      callUrl: `${WEB}/calls/${opts.callId}`,
+      recentUrl: `${WEB}/recent-calls`,
+      // webhookUrl optional — postScoreSummary will default to SLACK_WEBHOOK_URL
+    });
+
+    console.log("[score] Slack summary posted");
+  } catch (err) {
+    console.error("[score] Slack summary failed", err);
+  }
+}
+
+export async function scoreWithLLM(opts: {
+  supabase: SupabaseClient;
+  callId: string;
+}): Promise<LlmScore> {
   const { supabase, callId } = opts;
 
   try {
-    // Minimal, schema-agnostic select (includes user_id for Slack fallback)
+    // Pull minimal call meta (include duration for Slack; user_id to resolve rep)
     const { data: call, error: callErr } = await supabase
       .from("calls")
-      .select("id, filename, user_id")
+      .select("id, filename, user_id, duration_sec")
       .eq("id", callId)
       .single();
     if (callErr || !call) throw new Error("call_not_found");
@@ -211,6 +235,7 @@ export async function scoreWithLLM(opts: { supabase: SupabaseClient; callId: str
       supabase,
       callId,
       repIdFallback: (call as any)?.user_id ?? null,
+      durationSec: (call as any)?.duration_sec ?? null,
       scores: {
         intro: parsed.intro.score,
         discovery: parsed.discovery.score,
@@ -222,7 +247,12 @@ export async function scoreWithLLM(opts: { supabase: SupabaseClient; callId: str
 
     return parsed;
   } catch (err: any) {
-    console.warn("[scoreWithLLM] LLM failed, using heuristic:", err?.status ?? "", err?.code ?? "", err?.message ?? err);
+    console.warn(
+      "[scoreWithLLM] LLM failed, using heuristic:",
+      err?.status ?? "",
+      err?.code ?? "",
+      err?.message ?? err
+    );
 
     const fb = heuristicScoreFallback();
 
@@ -247,11 +277,23 @@ export async function scoreWithLLM(opts: { supabase: SupabaseClient; callId: str
     // History row (non-blocking)
     await writeScoreHistory(opts.supabase, opts.callId, fb.model, fb.overall, rubric);
 
-    // Slack for fallback
+    // Grab duration if present for Slack
+    let durationSec: number | null = null;
+    try {
+      const { data } = await opts.supabase
+        .from("calls")
+        .select("duration_sec")
+        .eq("id", opts.callId)
+        .single();
+      durationSec = (data as any)?.duration_sec ?? null;
+    } catch {}
+
+    // Slack fallback
     await notifySlack({
       supabase: opts.supabase,
       callId: opts.callId,
       repIdFallback: null,
+      durationSec,
       scores: {
         intro: fb.intro.score,
         discovery: fb.discovery.score,
