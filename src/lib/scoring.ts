@@ -1,5 +1,6 @@
 ﻿// src/lib/scoring.ts
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { createClient } from "@supabase/supabase-js";
 import { getOpenAI, AI_MODEL, OPENAI_TIMEOUT_MS } from "./openai";
 import { postScoreSummary } from "./slack";
 
@@ -230,6 +231,29 @@ export async function scoreWithLLM(opts: {
     // History row (non-blocking)
     await writeScoreHistory(supabase, callId, parsed.model, parsed.overall, rubric);
 
+    // CRM Activity: record a score event (best-effort; non-blocking)
+    try {
+      const svc = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+      // fetch linkage for account/contact so the activity appears on their timelines
+      const { data: callRow } = await svc
+        .from('calls')
+        .select('id, account_id, contact_id, score_overall')
+        .eq('id', callId)
+        .single();
+
+      const overall = typeof (callRow as any)?.score_overall === 'number' ? (callRow as any).score_overall : parsed.overall;
+      const summary = `Scored ${Math.round(overall)}`;
+
+      await svc.from('activities').insert({
+        type: 'score',
+        summary,
+        account_id: (callRow as any)?.account_id ?? null,
+        contact_id: (callRow as any)?.contact_id ?? null,
+      });
+    } catch (e) {
+      console.warn('[score] activity insert failed', e);
+    }
+
     // Slack (best-effort)
     await notifySlack({
       supabase,
@@ -276,6 +300,28 @@ export async function scoreWithLLM(opts: {
 
     // History row (non-blocking)
     await writeScoreHistory(opts.supabase, opts.callId, fb.model, fb.overall, rubric);
+
+    // CRM Activity: record a score event for fallback (best-effort)
+    try {
+      const svc = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+      const { data: callRow } = await svc
+        .from('calls')
+        .select('id, account_id, contact_id, score_overall')
+        .eq('id', opts.callId)
+        .single();
+
+      const overall = typeof (callRow as any)?.score_overall === 'number' ? (callRow as any).score_overall : fb.overall;
+      const summary = `Scored ${Math.round(overall)}`;
+
+      await svc.from('activities').insert({
+        type: 'score',
+        summary,
+        account_id: (callRow as any)?.account_id ?? null,
+        contact_id: (callRow as any)?.contact_id ?? null,
+      });
+    } catch (e) {
+      console.warn('[score] activity insert failed (fallback)', e);
+    }
 
     // Grab duration if present for Slack
     let durationSec: number | null = null;

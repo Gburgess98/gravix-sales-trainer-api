@@ -2,6 +2,7 @@ import { Router } from "express";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { postSlack } from "../lib/slack";
+import 'dotenv/config';
 
 const router = Router();
 const supa = createClient(
@@ -153,37 +154,64 @@ router.get("/", async (req, res) => {
 });
 
 /* -----------------------------------------------------------------
-   GET /v1/calls/paged?limit=10&cursor=<ISO or epoch>  → cursor paging
-   - Uses x-user-id header for the requester (safer for service-role API)
+   GET /v1/calls/paged?limit=10&cursor=...
 ------------------------------------------------------------------ */
 router.get("/paged", async (req, res) => {
   try {
     const requester = getUserIdHeader(req);
     const rawLimit = Number(req.query.limit ?? 10);
     const limit = Math.min(Math.max(rawLimit, 1), 50);
-
     const cursor = req.query.cursor ? String(req.query.cursor) : null;
+    const search = (req.query.q as string | undefined)?.trim() ?? "";
 
     let q = supa
       .from("calls")
-      .select("*")
+      .select(
+        `
+          id,
+          user_id,
+          org_id,
+          filename,
+          storage_path,
+          status,
+          created_at,
+          duration_sec,
+          duration_ms,
+          score_overall,
+          ai_model,
+          rep_name,
+          tags,
+          summary,
+          flags
+        `
+      )
       .eq("user_id", requester)
       .order("created_at", { ascending: false })
-      .limit(limit + 1); // one extra to compute nextCursor
+      .limit(limit + 1);
 
+    // cursor-based pagination (keep existing behaviour)
     if (cursor) {
-      const cursorDate = isNaN(Number(cursor)) ? new Date(cursor) : new Date(Number(cursor));
+      const cursorDate = isNaN(Number(cursor))
+        ? new Date(cursor)
+        : new Date(Number(cursor));
       if (isNaN(cursorDate.getTime())) {
         return res.status(400).json({ ok: false, error: "invalid cursor" });
       }
       q = q.lt("created_at", cursorDate.toISOString());
     }
 
+    // simple search on filename + summary
+    if (search) {
+      q = q.or(
+        `filename.ilike.%${search}%,summary.ilike.%${search}%`
+      );
+    }
+
     const { data, error } = await q;
     if (error) throw error;
 
-    let nextCursor: string | null = null;
     let items = data ?? [];
+    let nextCursor: string | null = null;
 
     if (items.length > limit) {
       const last = items[limit - 1];
@@ -191,17 +219,36 @@ router.get("/paged", async (req, res) => {
       items = items.slice(0, limit);
     }
 
-    res.json({ ok: true, calls: items, nextCursor });
+    // Shape payload for web: keep existing fields, add new UX bits
+    const mapped = items.map((c) => ({
+      id: c.id,
+      filename: c.filename,
+      status: c.status,
+      created_at: c.created_at,
+      duration_sec: c.duration_sec,
+      duration_ms: c.duration_ms ?? null,
+      score_overall: c.score_overall,
+      ai_model: c.ai_model,
+      type: c.storage_path ? "upload" : "live",
+      rep_name: c.rep_name ?? null,
+      tags: c.tags ?? null,
+      summary: c.summary ?? null,
+      flags: c.flags ?? [],
+    }));
+
+    return res.json({ ok: true, calls: mapped, nextCursor });
   } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    console.error(e);
+    return res
+      .status(400)
+      .json({ ok: false, error: e.message ?? "bad_request" });
   }
 });
-
 /* ----------------------------------------------------------------
-   GET /v1/calls/:id/audio-url → signed URL for secure audio playback
+   GET /v1/calls/:id/signed-audio → signed URL for audio playback
    (ORDERED BEFORE /:id so it doesn't get captured by the :id route)
 ----------------------------------------------------------------- */
-router.get("/:id/audio-url", async (req, res) => {
+router.get("/:id/signed-audio", async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!UUID_RE.test(id)) {
@@ -225,7 +272,7 @@ router.get("/:id/audio-url", async (req, res) => {
     }
 
     const bucket = process.env.SUPABASE_STORAGE_BUCKET || "calls";
-    const ttl = Number(process.env.SIGNED_URL_TTL_SEC || 3600); // seconds
+    const ttl = Number(process.env.SIGNED_URL_TTL_SEC || 300); // default 5 min
 
     const { data: signed, error: signErr } = await supa
       .storage
@@ -347,23 +394,67 @@ router.get("/:id", async (req, res) => {
     if (!UUID_RE.test(id)) {
       return res.status(400).json({ ok: false, error: "invalid id" });
     }
+
     const requester = getUserIdHeader(req);
 
     const { data: call, error } = await supa
       .from("calls")
-      .select("*")
+      .select(
+        `
+          id,
+          user_id,
+          org_id,
+          filename,
+          storage_path,
+          status,
+          created_at,
+          duration_sec,
+          duration_ms,
+          score_overall,
+          ai_model,
+          rep_name,
+          tags,
+          summary,
+          flags
+        `
+      )
       .eq("id", id)
       .single();
 
-    if (error || !call) return res.status(404).json({ ok: false, error: "not_found" });
+    if (error || !call) {
+      return res.status(404).json({ ok: false, error: "not_found" });
+    }
+
     if (call.user_id !== requester) {
       return res.status(403).json({ ok: false, error: "forbidden" });
     }
 
-    res.json({ ok: true, call });
+    const mapped = {
+      id: call.id,
+      filename: call.filename,
+      status: call.status,
+      created_at: call.created_at,
+      duration_sec: call.duration_sec,
+      duration_ms: call.duration_ms ?? null,
+      score_overall: call.score_overall,
+      ai_model: call.ai_model,
+      type: call.storage_path ? "upload" : "live",
+      rep_name: call.rep_name ?? null,
+      tags: call.tags ?? null,
+      summary: call.summary ?? null,
+      flags: call.flags ?? [],
+      // keep user/org if you need them on web side:
+      user_id: call.user_id,
+      org_id: call.org_id,
+    };
+
+    return res.json({ ok: true, call: mapped });
   } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    console.error(e);
+    return res
+      .status(400)
+      .json({ ok: false, error: e.message ?? "bad_request" });
   }
 });
 
-export default router;
+module.exports = router;

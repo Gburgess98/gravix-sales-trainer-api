@@ -23,6 +23,13 @@ export type SlackBlock =
 
 type SlackPayload = { text?: string; blocks?: SlackBlock[] };
 
+// --- Dry-run flag (used inside poster functions) ---
+const SLACK_DRY_RUN = (process.env.SLACK_DRY_RUN || "false").toLowerCase() === "true";
+
+export function getAssignWebhook(): string | null {
+  return process.env.SLACK_ASSIGN_WEBHOOK || process.env.SLACK_WEBHOOK_URL || null;
+}
+
 // ---------- Low-level posters ----------
 export async function postSlack(
   text: string,
@@ -30,9 +37,16 @@ export async function postSlack(
   explicitWebhook?: string
 ) {
   const url = explicitWebhook || process.env.SLACK_WEBHOOK_URL;
+  const body: SlackPayload = blocks?.length ? { text, blocks } : { text };
+
+  // Dry-run: log and skip network
+  if (SLACK_DRY_RUN) {
+    console.log("[slack] DRY RUN postSlack payload:", JSON.stringify(body, null, 2));
+    return { ok: true as const };
+  }
+
   if (!url) return { ok: false as const, skipped: true as const }; // non-fatal
 
-  const body: SlackPayload = blocks?.length ? { text, blocks } : { text };
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -51,9 +65,15 @@ export async function postSlackSummary(
   explicitWebhook?: string
 ) {
   const url = explicitWebhook || process.env.SLACK_WEBHOOK_URL;
+  const body: SlackPayload = { text: payload.text, blocks: payload.blocks };
+
+  if (SLACK_DRY_RUN) {
+    console.log("[slack] DRY RUN postSlackSummary payload:", JSON.stringify(body, null, 2));
+    return { ok: true as const };
+  }
+
   if (!url) return { ok: false as const, skipped: true as const }; // non-fatal
 
-  const body: SlackPayload = { text: payload.text, blocks: payload.blocks };
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -105,6 +125,15 @@ function secText(label: string, s?: RubricSection | null) {
   return `*${label}*: ${score}\n${notes}`;
 }
 
+// --- ADD: robust base + URL builders ---
+const PUBLIC_WEB_BASE_RAW = (process.env.PUBLIC_WEB_BASE || "").trim();
+function resolveWebBase() { return (PUBLIC_WEB_BASE_RAW || "http://localhost:3000").replace(/\/+$/, ""); }
+function buildCallUrl(callId: string, params?: Record<string, string | number | boolean | undefined>) {
+  const url = new URL(`${resolveWebBase()}/calls/${encodeURIComponent(callId)}`);
+  if (params) for (const [k, v] of Object.entries(params)) if (v!=null && v!=="") url.searchParams.set(k, String(v));
+  return url.toString();
+}
+
 /** Compose Slack blocks for a scored call (with notes + action buttons) */
 export function buildScoreBlocksFromRubric(input: ScoreSummaryInput) {
   const {
@@ -143,21 +172,21 @@ export function buildScoreBlocksFromRubric(input: ScoreSummaryInput) {
     { type: "section", text: { type: "mrkdwn", text: secText("Close", rubric?.close) } },
   ];
 
-  // Add action buttons if we can build URLs
-  const base = input.appUrlBase || process.env.APP_URL_BASE || process.env.WEB_ORIGIN || null;
-  if (base) {
-    const openUrl = `${base.replace(/\/$/, "")}/calls/${callId}`;
-    const crmUrl = `${base.replace(/\/$/, "")}/calls/${callId}?panel=crm`;
-    const coachUrl = `${base.replace(/\/$/, "")}/calls/${callId}?panel=coach&assign=1`;
+  // Add action buttons using robust URL builder
+  {
+    const openUrl  = buildCallUrl(callId);
+    const crmUrl   = buildCallUrl(callId, { panel: "crm" });
+    const coachUrl = buildCallUrl(callId, { panel: "coach", assign: 1 });
+
     blocks.push({ type: "divider" });
     blocks.push({
-      type: "actions",
-      elements: [
-        { type: "button", text: { type: "plain_text", text: "Open Call" }, url: openUrl, action_id: "open_call" },
-        { type: "button", text: { type: "plain_text", text: "Link / Review CRM" }, url: crmUrl, action_id: "open_crm" },
-        { type: "button", text: { type: "plain_text", text: "Assign Drill" }, url: coachUrl, action_id: "assign_drill" },
-      ],
-    });
+  type: "actions",
+  elements: [
+    { type: "button", text: { type: "plain_text", text: "🔊 Open Call" }, url: openUrl,  action_id: "open_call" },
+    { type: "button", text: { type: "plain_text", text: "📇 Link / Review CRM" }, url: crmUrl, action_id: "open_crm" },
+    { type: "button", text: { type: "plain_text", text: "🎯 Assign Drill" }, url: coachUrl, action_id: "assign_drill" }
+  ]
+});
   }
 
   return { blocks };
@@ -236,4 +265,35 @@ export function buildScoreBlocks(s: SummaryInput) {
 export async function postScoreSummary(input: ScoreSummaryInput) {
   const payload = buildScoreBlocksFromRubric(input);
   return postSlackSummary(payload);
+}
+
+export async function postAssignNotification(input: {
+  callId: string;
+  assigneeName?: string | null;
+  assigneeWebhook?: string | null;           // direct or channel webhook
+  drillId: string;
+  notes?: string | null;
+}) {
+  const { callId, assigneeName, assigneeWebhook, drillId, notes } = input;
+  const text = `New coaching assignment: ${drillId}`;
+  const url = buildCallUrl(callId, { panel: "coach", assign: 1 });
+
+  const blocks: SlackBlock[] = [
+    { type: "header", text: { type: "plain_text", text: "New Coaching Assignment", emoji: true } },
+    { type: "section", text: { type: "mrkdwn", text: `*Drill:* \`${drillId}\`\n*Call:* \`${callId}\`${assigneeName ? `\n*For:* ${assigneeName}` : ""}${notes ? `\n*Notes:* ${notes}` : ""}` } },
+    { type: "actions", elements: [
+      { type: "button", text: { type: "plain_text", text: "Open Coach Panel" }, url, action_id: "open_coach" }
+    ]},
+  ];
+
+  const resolvedWebhook =
+    (assigneeWebhook && assigneeWebhook.trim()) ||
+    getAssignWebhook();
+
+  if (!resolvedWebhook) {
+    // No webhook configured; skip without throwing
+    return { ok: false as const, skipped: true as const };
+  }
+
+  return postSlack("New Coaching Assignment", blocks, resolvedWebhook);
 }
