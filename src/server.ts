@@ -16,13 +16,13 @@ import crmRouter from "./routes/crm";
 import dashboardRoutes from "./routes/dashboard";
 import sparringRouter from "./routes/sparring";
 
-import adminRoutes from "./routes/admin";
 import coachRoutes from "./routes/coach";
 import teamRoutes from "./routes/team";
 import repsRouter from "./routes/reps";
 import { rewardsRoutes } from "./routes/rewards";
-import { personasRouter } from "./routes/personas";
-
+import { PERSONAS } from "./personas";
+import whispererRouter from "./routes/whisperer";
+import adminRouter from "./routes/admin";
 
 const REQUIRED_ENV = ['SUPABASE_URL','SUPABASE_SERVICE_ROLE_KEY'];
 for (const k of REQUIRED_ENV) {
@@ -1468,45 +1468,6 @@ app.get("/v1/admin/index-hints", requireAdmin, (_req, res) => {
 
 // --- Whisperer: offline preview (regex + silence heuristic) ---
 
-app.post("/v1/whisperer/preview", async (req, res) => {
-  try {
-    const body = (req.body || {}) as {
-      transcript?: string;
-      words?: Array<{ t: number; word: string }>;
-      silenceThresholdMs?: number;
-    };
-    const transcript = (body.transcript || "").toLowerCase();
-    const words = Array.isArray(body.words) ? body.words : [];
-    const silenceMs = Math.min(Math.max(Number(body.silenceThresholdMs || 5000), 1000), 15000);
-
-    const hits: Array<{ t: number | null; type: string; text: string; suggestion: string }> = [];
-
-    // Phrase triggers
-    const rules: Array<{ re: RegExp; type: string; suggestion: string }> = [
-      { re: /\btoo\s+expensive\b/, type: "too_expensive", suggestion: "Acknowledge + reframe ROI. “If it paid for itself in 60 days, would it make sense?”" },
-      { re: /\bthink\s+about\s+it\b/, type: "think_about_it", suggestion: "Lock a next step. “Totally — shall we pencil 10:00 Thursday to reconvene?”" },
-    ];
-    for (const r of rules) {
-      if (r.re.test(transcript)) {
-        hits.push({ t: null, type: r.type, text: r.re.source, suggestion: r.suggestion });
-      }
-    }
-
-    // Silence detection
-    if (words.length >= 2) {
-      for (let i = 1; i < words.length; i++) {
-        const gap = (words[i].t - words[i-1].t);
-        if (gap * 1000 >= silenceMs) {
-          hits.push({ t: Number(words[i].t.toFixed(2)), type: "silence", text: `silence>${Math.round(silenceMs/1000)}s`, suggestion: "Quick check-in. “Still with me?” + ask a binary question." });
-        }
-      }
-    }
-
-    res.json({ ok: true, hits });
-  } catch (e:any) {
-    return res.status(500).json({ ok: false, error: e?.message || "whisperer_preview_failed" });
-  }
-});
 
 /* ------------------------
    Mount feature routers
@@ -1514,13 +1475,16 @@ app.post("/v1/whisperer/preview", async (req, res) => {
 app.use("/v1/calls", callsRouter);
 app.use("/v1/pins", pinsRouter);
 app.use("/v1/crm", crmRouter);
-app.use("/v1/admin", adminRoutes);
 app.use("/v1/coach", coachRoutes);
 app.use("/v1/team", teamRoutes);
 app.use("/v1/reps", repsRouter);
 app.use("/v1/rewards", rewardsRoutes);
 app.use("/v1/sparring", sparringRouter);
-app.use("/v1/sparring/personas", personasRouter);
+app.use("/v1/whisperer", whispererRouter);
+app.use("/v1/admin", adminRouter);
+
+// NOTE: we’re no longer mounting personasRouter here –
+// /v1/sparring/personas is still handled inside sparringRouter
 
 /* ------------------------------------------
    Sim workers: transcription + auto-scoring

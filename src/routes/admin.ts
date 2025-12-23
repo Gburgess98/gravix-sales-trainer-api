@@ -3,7 +3,39 @@ import 'dotenv/config';
 import { Router } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { buildScoreSummaryBlocks } from "../lib/slackBlocks";
+import { getAdminConfig, patchAdminConfig } from "../services/adminConfig";
 export const adminRouter = Router();
+
+// --- Manager gate (MVP RBAC) ----------------------------------------------
+// Uses x-user-id header and reps.tier to determine manager access.
+// Later: replace with proper org_roles / auth-based RBAC.
+async function requireManager(req: any, res: any, next: any) {
+  try {
+    const userId = String(req.header("x-user-id") || req.header("X-User-Id") || "").trim();
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_x_user_id" });
+
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+    if (!url || !key) return res.status(500).json({ ok: false, error: "server_missing_supabase_env" });
+
+    const supa = createClient(url, key, { auth: { autoRefreshToken: false, persistSession: false } });
+    const { data: rep, error } = await supa
+      .from("reps")
+      .select("id,tier")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (error) return res.status(500).json({ ok: false, error: error.message });
+
+    const tier = String((rep as any)?.tier || "");
+    const allowed = tier === "Manager" || tier === "Admin" || tier === "Owner";
+    if (!allowed) return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+
+    return next();
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message ?? "require_manager_failed" });
+  }
+}
 
 adminRouter.post("/force-score/:id", async (req, res) => {
   const { id } = req.params;
@@ -213,6 +245,58 @@ adminRouter.get('/whoami-org', (req, res) => {
   const headerOrg = (req.header('x-org-id') || '').trim() || null;
   const effectiveOrg = headerOrg || (process.env.DEFAULT_ORG_ID || null);
   return res.json({ ok: true, headerOrg, defaultOrgId: process.env.DEFAULT_ORG_ID || null, effectiveOrg });
+});
+
+/* ----------------------------------------------------------------
+   GET /v1/admin/config
+   Returns the single-row admin_config settings.
+----------------------------------------------------------------- */
+adminRouter.get("/config", requireManager, async (_req, res) => {
+  try {
+    const config = await getAdminConfig();
+    return res.json({ ok: true, config });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message ?? "failed_to_load_config" });
+  }
+});
+
+/* ----------------------------------------------------------------
+   PATCH /v1/admin/config
+   Body: { streak_threshold?: number, xp_multiplier?: number, comeback_bonus?: number }
+----------------------------------------------------------------- */
+adminRouter.patch("/config", requireManager, async (req, res) => {
+  try {
+    const { streak_threshold, xp_multiplier, comeback_bonus } = req.body ?? {};
+
+    // light validation (MVP)
+    if (streak_threshold !== undefined) {
+      if (!Number.isInteger(streak_threshold) || streak_threshold < 1 || streak_threshold > 30) {
+        return res.status(400).json({ ok: false, error: "streak_threshold must be an integer 1–30" });
+      }
+    }
+
+    if (xp_multiplier !== undefined) {
+      if (typeof xp_multiplier !== "number" || xp_multiplier < 0.1 || xp_multiplier > 10) {
+        return res.status(400).json({ ok: false, error: "xp_multiplier must be a number 0.1–10" });
+      }
+    }
+
+    if (comeback_bonus !== undefined) {
+      if (!Number.isInteger(comeback_bonus) || comeback_bonus < 0 || comeback_bonus > 5000) {
+        return res.status(400).json({ ok: false, error: "comeback_bonus must be an integer 0–5000" });
+      }
+    }
+
+    // no-op patch protection (optional but nice)
+    if (streak_threshold === undefined && xp_multiplier === undefined && comeback_bonus === undefined) {
+      return res.status(400).json({ ok: false, error: "no_fields_to_update" });
+    }
+
+    const updated = await patchAdminConfig({ streak_threshold, xp_multiplier, comeback_bonus } as any);
+    return res.json({ ok: true, config: updated });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message ?? "failed_to_update_config" });
+  }
 });
 
 export default adminRouter;
