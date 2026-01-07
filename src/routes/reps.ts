@@ -111,7 +111,7 @@ repsRouter.get("/:id/overview", async (req: Request, res: Response) => {
         avatar_url: repRow.avatar_url,
       },
       xp: repRow.xp ?? 0,
-      tier: repRow.tier ?? "Bronze",
+      tier: repRow.tier ?? "SalesRep",
       totals: {
         calls: totalCalls,
         avgScore: avgScore,

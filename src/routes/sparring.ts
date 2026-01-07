@@ -4,6 +4,7 @@ import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 import { PERSONAS } from "../personas";
 import { getScoringConfig } from "../services/scoringConfig";
+import { completeAssignmentsForTarget } from "../lib/assignmentsComplete";
 import {
   getPersonaConfig,
   buildPersonaBehaviourSummary,
@@ -1120,6 +1121,7 @@ router.post("/score", express.json(), async (req, res) => {
         });
       }
 
+
       const { data: updatedRow, error: fetchErr } = await supa
         .from("sparring_sessions")
         .select(
@@ -1134,6 +1136,45 @@ router.post("/score", express.json(), async (req, res) => {
           ok: false,
           error: `score select failed: ${fetchErr?.message || "unknown"}`,
         });
+      }
+
+      // --- Auto-complete latest assigned sparring assignment (system) ---
+      // We intentionally complete the most recent "assigned" sparring assignment for this rep.
+      // (Sparring assignments are often created without a target_id.)
+      try {
+        const repIdForAssign = String((updatedRow as any).rep_id || "").trim();
+        if (repIdForAssign) {
+          const { data: latest, error: latestErr } = await supa
+            .from("assignments")
+            .select("id")
+            .eq("rep_id", repIdForAssign)
+            .eq("type", "sparring")
+            .eq("status", "assigned")
+            .order("created_at", { ascending: false })
+            .limit(1);
+
+          if (latestErr) {
+            console.warn("[sparring.score] load latest sparring assignment failed", latestErr.message);
+          } else {
+            const latestId = Array.isArray(latest) && latest[0]?.id ? String(latest[0].id) : null;
+            if (latestId) {
+              const { error: updAssignErr } = await supa
+                .from("assignments")
+                .update({
+                  status: "completed",
+                  completed_at: new Date().toISOString(),
+                  completed_by: "system",
+                } as any)
+                .eq("id", latestId);
+
+              if (updAssignErr) {
+                console.warn("[sparring.score] complete sparring assignment failed", updAssignErr.message);
+              }
+            }
+          }
+        }
+      } catch (e: any) {
+        console.warn("[sparring.score] assignment auto-complete failed", e?.message || e);
       }
 
       return res.json({

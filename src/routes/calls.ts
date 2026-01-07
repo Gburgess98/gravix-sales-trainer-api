@@ -3,6 +3,7 @@ import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { postSlack } from "../lib/slack";
 import 'dotenv/config';
+import { completeAssignmentsForTarget } from "../lib/assignmentsComplete";
 
 const router = Router();
 const supa = createClient(
@@ -327,6 +328,69 @@ router.post("/:id/score", async (req, res) => {
       .single();
 
     if (error) throw error;
+
+    // --- Auto-complete call_review assignment (system) ---
+    // 1) Prefer a targeted assignment where target_id === callId
+    // 2) If none exists (common in MVP), complete the latest assigned call_review for the rep
+    try {
+      const nowIso = new Date().toISOString();
+      let completedAny = false;
+
+      // (1) Targeted completion: target_id == callId
+      const { data: targeted, error: targetedErr } = await supa
+        .from("assignments")
+        .update({
+          status: "completed",
+          completed_at: nowIso,
+          completed_by: "system",
+        } as any)
+        .eq("rep_id", call.user_id)
+        .eq("type", "call_review")
+        .eq("status", "assigned")
+        .eq("target_id", id)
+        .select("id");
+
+      if (targetedErr) {
+        console.warn("[calls.score] targeted assignment complete failed", targetedErr.message);
+      } else if (Array.isArray(targeted) && targeted.length > 0) {
+        completedAny = true;
+      }
+
+      // (2) Fallback: latest assigned call_review (no target)
+      if (!completedAny) {
+        const { data: latest, error: latestErr } = await supa
+          .from("assignments")
+          .select("id")
+          .eq("rep_id", call.user_id)
+          .eq("type", "call_review")
+          .eq("status", "assigned")
+          .order("created_at", { ascending: false })
+          .limit(1);
+
+        if (latestErr) {
+          console.warn("[calls.score] load latest call_review assignment failed", latestErr.message);
+        } else {
+          const latestId = Array.isArray(latest) && latest[0]?.id ? String(latest[0].id) : null;
+          if (latestId) {
+            const { error: updErr } = await supa
+              .from("assignments")
+              .update({
+                status: "completed",
+                completed_at: nowIso,
+                completed_by: "system",
+              } as any)
+              .eq("id", latestId);
+
+            if (updErr) {
+              console.warn("[calls.score] fallback assignment complete failed", updErr.message);
+            }
+          }
+        }
+      }
+    } catch (e: any) {
+      // never fail scoring due to assignment completion
+      console.warn("[calls.score] assignment auto-complete failed", e?.message || e);
+    }
 
     // ✅ NEW: append a score snapshot to call_scores
     const hist = {

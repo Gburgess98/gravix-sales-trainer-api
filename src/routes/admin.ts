@@ -6,6 +6,18 @@ import { buildScoreSummaryBlocks } from "../lib/slackBlocks";
 import { getAdminConfig, patchAdminConfig } from "../services/adminConfig";
 export const adminRouter = Router();
 
+// --- Roles (lean RBAC v1) -------------------------------------
+const ROLE_VALUES = ["SalesRep", "TeamLead", "Manager", "Owner"] as const;
+type Role = (typeof ROLE_VALUES)[number];
+
+function isRole(x: any): x is Role {
+  return typeof x === "string" && (ROLE_VALUES as readonly string[]).includes(x);
+}
+
+function isManagerRole(role: string | null | undefined) {
+  return role === "Manager" || role === "Owner";
+}
+
 // --- Manager gate (MVP RBAC) ----------------------------------------------
 // Uses x-user-id header and reps.tier to determine manager access.
 // Later: replace with proper org_roles / auth-based RBAC.
@@ -28,7 +40,7 @@ async function requireManager(req: any, res: any, next: any) {
     if (error) return res.status(500).json({ ok: false, error: error.message });
 
     const tier = String((rep as any)?.tier || "");
-    const allowed = tier === "Manager" || tier === "Admin" || tier === "Owner";
+    const allowed = tier === "Manager" || tier === "Owner";
     if (!allowed) return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
 
     return next();
@@ -296,6 +308,84 @@ adminRouter.patch("/config", requireManager, async (req, res) => {
     return res.json({ ok: true, config: updated });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message ?? "failed_to_update_config" });
+  }
+});
+
+
+/* ----------------------------------------------------------------
+   GET /v1/admin/reps
+   Manager-only list of reps for RBAC + operations
+----------------------------------------------------------------- */
+adminRouter.get("/reps", requireManager, async (_req: any, res: any) => {
+  try {
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+    if (!url || !key) return res.status(500).json({ ok: false, error: "server_missing_supabase_env" });
+
+    const supa = createClient(url, key, { auth: { autoRefreshToken: false, persistSession: false } });
+    const { data, error } = await supa
+      .from("reps")
+      .select("id,name,xp,tier,created_at")
+      .order("created_at", { ascending: false })
+      .limit(500);
+
+    if (error) return res.status(500).json({ ok: false, error: error.message });
+    return res.json({ ok: true, reps: data ?? [] });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || "admin_reps_list_failed" });
+  }
+});
+
+/* ----------------------------------------------------------------
+   PATCH /v1/admin/reps/:id
+   Body: { tier: 'SalesRep' | 'TeamLead' | 'Manager' | 'Owner' }
+----------------------------------------------------------------- */
+adminRouter.patch("/reps/:id", requireManager, async (req: any, res: any) => {
+  try {
+    const targetId = String(req.params.id || "").trim();
+    const tier = req.body?.tier as any;
+
+    if (!targetId) return res.status(400).json({ ok: false, error: "missing_rep_id" });
+    if (!isRole(tier)) return res.status(400).json({ ok: false, error: "invalid_tier" });
+
+    const requesterId = String(req.header("x-user-id") || "").trim();
+
+    // Guardrail: prevent demoting the last Manager/Owner
+    if (requesterId && requesterId === targetId && !isManagerRole(tier)) {
+      const url = process.env.SUPABASE_URL;
+      const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+      if (!url || !key) return res.status(500).json({ ok: false, error: "server_missing_supabase_env" });
+
+      const supa = createClient(url, key, { auth: { autoRefreshToken: false, persistSession: false } });
+      const { data: managers, error: mgrErr } = await supa
+        .from("reps")
+        .select("id,tier")
+        .in("tier", ["Manager", "Owner"]);
+
+      if (mgrErr) return res.status(500).json({ ok: false, error: mgrErr.message });
+      if ((managers ?? []).length <= 1) {
+        return res.status(400).json({ ok: false, error: "cannot_demote_last_manager" });
+      }
+    }
+
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+    if (!url || !key) return res.status(500).json({ ok: false, error: "server_missing_supabase_env" });
+
+    const supa = createClient(url, key, { auth: { autoRefreshToken: false, persistSession: false } });
+    const { data: updated, error } = await supa
+      .from("reps")
+      .update({ tier })
+      .eq("id", targetId)
+      .select("id,name,xp,tier,created_at")
+      .single();
+
+    if (error) return res.status(500).json({ ok: false, error: error.message });
+    if (!updated) return res.status(404).json({ ok: false, error: "rep_not_found" });
+
+    return res.json({ ok: true, rep: updated });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || "admin_rep_patch_failed" });
   }
 });
 

@@ -1,7 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import { createClient } from "@supabase/supabase-js";
 
-const MANAGER_TIERS = new Set(["Manager", "Admin", "Owner"]);
+const MANAGER_TIERS = new Set(["Manager", "Owner"]);
 
 export async function requireManager(req: Request, res: Response, next: NextFunction) {
   try {

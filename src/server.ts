@@ -23,8 +23,9 @@ import { rewardsRoutes } from "./routes/rewards";
 import { PERSONAS } from "./personas";
 import whispererRouter from "./routes/whisperer";
 import adminRouter from "./routes/admin";
+import { assignmentsRoutes } from "./routes/assignments";
 
-const REQUIRED_ENV = ['SUPABASE_URL','SUPABASE_SERVICE_ROLE_KEY'];
+const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'];
 for (const k of REQUIRED_ENV) {
   if (!process.env[k] || String(process.env[k]).trim() === '') {
     console.error(`❌ Missing required env: ${k}`);
@@ -44,7 +45,7 @@ function sendJsonError(
     const rid = ((res as any).req?.rid) || ((res as any).req?.headers?.["x-request-id"]) || "no-rid";
     res.status(status).json({ ok: false, error: message, rid, ...(extra || {}) });
   } catch {
-    try { res.status(status).end(); } catch {}
+    try { res.status(status).end(); } catch { }
   }
 }
 
@@ -73,9 +74,9 @@ app.use((req, _res, next) => {
 /* ----------------------------
    CORS (allow Vercel + local)
 ----------------------------- */
-const vercelProd  = "https://gravix-sales-trainer-web.vercel.app";
+const vercelProd = "https://gravix-sales-trainer-web.vercel.app";
 const vercelStage = "https://gravix-staging.vercel.app";
-const localWeb    = process.env.WEB_ORIGIN?.trim() || "http://localhost:3000";
+const localWeb = process.env.WEB_ORIGIN?.trim() || "http://localhost:3000";
 
 const extra = [
   process.env.VERCEL_ORIGIN?.trim(),
@@ -231,7 +232,7 @@ app.get("/v1/reps/:id/overview", async (req, res) => {
         const { data: usr } = await supabase.from("users").select("id,full_name").eq("id", repId).maybeSingle();
         if (usr?.full_name) name = usr.full_name;
       }
-    } catch {}
+    } catch { }
 
     // Calls since window
     const { data: calls } = await supabase
@@ -270,7 +271,7 @@ app.get("/v1/reps/:id/overview", async (req, res) => {
           .limit(50);
         activities = act || [];
       }
-    } catch {}
+    } catch { }
 
     // Build a simple score trend (avg per day) from recent scored calls
     const byDay = new Map<string, { sum: number; n: number }>();
@@ -318,7 +319,7 @@ app.get("/v1/reps/:id/overview", async (req, res) => {
 
       // --- New enriched shape expected by web Rep Profile page ---
       xp: 0,
-      tier: "Bronze",
+      tier: "SalesRep",
       totals: {
         calls: callsCount,
         avgScore: typeof avgScore === "number" ? avgScore : 0,
@@ -364,12 +365,12 @@ app.get("/v1/dashboard/objections/top", async (req, res) => {
 
     const items = Array.from(byLabel.entries())
       .map(([label, count]) => ({ label, count }))
-      .sort((a,b) => b.count - a.count)
+      .sort((a, b) => b.count - a.count)
       .slice(0, limit);
 
     res.set("Cache-Control", "public, max-age=15");
     return res.json({ ok: true, items, since: sinceIso });
-  } catch (e:any) {
+  } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message || "top_objections_failed" });
   }
 });
@@ -556,7 +557,7 @@ app.post("/v1/upload/finalize", async (req, res) => {
     try {
       const test = await supabase.storage.from(BUCKET).createSignedUrl(path, 30);
       if (test.error) throw test.error;
-      await fetch(test.data.signedUrl, { method: "HEAD" }).catch(() => {});
+      await fetch(test.data.signedUrl, { method: "HEAD" }).catch(() => { });
     } catch { /* ignore */ }
 
     const id = path.split("/").pop()!.split(".")[0];
@@ -631,7 +632,7 @@ app.post(
         size_bytes: f.size, sha256: hash, kind, status: "queued", audio_path: key,
       });
       if (dbErrCall) {
-        await supabase.storage.from(BUCKET).remove([key]).catch(() => {});
+        await supabase.storage.from(BUCKET).remove([key]).catch(() => { });
         return res.status(500).json({ ok: false, error: `DB insert failed: ${dbErrCall.message}` });
       }
 
@@ -737,12 +738,12 @@ app.get("/v1/crm/contacts", (req, res) => {
 
 app.post("/v1/crm/unlink", async (req, res) => {
   const { callId, target } = req.body || {}; // "contact" | "account"
-  if (!callId || !target) return res.status(400).json({ ok:false, error:"callId,target required" });
+  if (!callId || !target) return res.status(400).json({ ok: false, error: "callId,target required" });
   const patch = target === "contact" ? { contact_id: null } : target === "account" ? { account_id: null } : null;
-  if (!patch) return res.status(400).json({ ok:false, error:"invalid target" });
+  if (!patch) return res.status(400).json({ ok: false, error: "invalid target" });
   const { error } = await supabase.from("calls").update(patch).eq("id", callId);
-  if (error) return res.status(500).json({ ok:false, error: error.message });
-  res.json({ ok:true });
+  if (error) return res.status(500).json({ ok: false, error: error.message });
+  res.json({ ok: true });
 });
 
 // --- ADD: link a call to a contact stub ---
@@ -825,11 +826,11 @@ app.get("/v1/admin/preview-slack", requireAdmin, async (req, res) => {
     const callId = String(req.query.callId || crypto.randomUUID());
     const overall = Number(req.query.overall || 78);
     const WEB = process.env.PUBLIC_WEB_BASE
-          || process.env.SITE_URL
-          || process.env.WEB_BASE_URL
-          || process.env.WEB_APP_URL
-          || process.env.WEB_ORIGIN
-          || "http://localhost:3000";
+      || process.env.SITE_URL
+      || process.env.WEB_BASE_URL
+      || process.env.WEB_APP_URL
+      || process.env.WEB_ORIGIN
+      || "http://localhost:3000";
 
     const blocksPayload = await buildSlackSummaryBlocks({
       supabase,
@@ -861,11 +862,11 @@ app.post("/v1/admin/post-slack", requireAdmin, async (req, res) => {
     if (!callId) return res.status(400).json({ ok: false, error: "callId required" });
 
     const WEB = process.env.PUBLIC_WEB_BASE
-          || process.env.SITE_URL
-          || process.env.WEB_BASE_URL
-          || process.env.WEB_APP_URL
-          || process.env.WEB_ORIGIN
-          || "http://localhost:3000";
+      || process.env.SITE_URL
+      || process.env.WEB_BASE_URL
+      || process.env.WEB_APP_URL
+      || process.env.WEB_ORIGIN
+      || "http://localhost:3000";
 
     const blocksPayload = await buildSlackSummaryBlocks({
       supabase,
@@ -928,8 +929,8 @@ app.post("/v1/admin/digest/daily", requireAdmin, async (req, res) => {
     const top = Array.from(agg.entries())
       .map(([id, a]) => ({ id, name: names.get(id) || "Rep", avg: a.n ? Math.round(a.sum / a.n) : null, calls: a.n }))
       .filter(x => typeof x.avg === "number")
-      .sort((a,b) => b.avg! - a.avg!)
-      .slice(0,5);
+      .sort((a, b) => b.avg! - a.avg!)
+      .slice(0, 5);
 
     const worst = (calls || [])
       .filter((c: any) => typeof c.score_overall === "number")
@@ -998,13 +999,13 @@ app.get("/v1/coach/assignments", async (req, res) => {
     const accountId = req.query.accountId ? String(req.query.accountId) : null;
     const contactId = req.query.contactId ? String(req.query.contactId) : null;
     const assigneeUserId = (req.query.assigneeUserId || req.query.repId) ? String(req.query.assigneeUserId || req.query.repId) : null;
-    const status = req.query.status ? String(req.query.status) as ("open"|"completed") : null;
+    const status = req.query.status ? String(req.query.status) as ("open" | "completed") : null;
     const orgId = req.query.orgId ? String(req.query.orgId) : null;
 
     const limit = Math.min(Number(req.query.limit || 50), 100);
 
     // Determine mode
-    let mode: "byCall"|"byAccount"|"byContact"|"byAssignee"|null = null;
+    let mode: "byCall" | "byAccount" | "byContact" | "byAssignee" | null = null;
     if (callId) mode = "byCall";
     else if (accountId) mode = "byAccount";
     else if (contactId) mode = "byContact";
@@ -1387,7 +1388,7 @@ app.get('/v1/coach/assignments/by-entity', async (req, res) => {
           map.set(String((c as any).id), String((c as any).filename || (c as any).id));
         }
       }
-    } catch {}
+    } catch { }
 
     const items = (assigns || []).map((x: any) => ({
       id: x.id,
@@ -1482,6 +1483,7 @@ app.use("/v1/rewards", rewardsRoutes);
 app.use("/v1/sparring", sparringRouter);
 app.use("/v1/whisperer", whispererRouter);
 app.use("/v1/admin", adminRouter);
+app.use("/v1/assignments", assignmentsRoutes());
 
 // NOTE: we’re no longer mounting personasRouter here –
 // /v1/sparring/personas is still handled inside sparringRouter
@@ -1543,17 +1545,17 @@ async function simulateScore(jobId: string, callId: string) {
     if (upErr) throw new Error(`score status update failed: ${upErr.message}`);
 
     // Activity: call scored (best-effort)
-try {
-  const summary = `Scored ${Math.round(result.overall)} — Intro ${Math.round(result.intro.score)} / Disc ${Math.round(result.discovery.score)} / Obj ${Math.round(result.objection.score)} / Close ${Math.round(result.close.score)}`;
-  await supabase.from("activities").insert({
-    type: "call_scored",
-    summary,
-    call_id: callId,
-    created_at: new Date().toISOString(),
-  });
-} catch (e:any) {
-  console.warn("[activity] call_scored insert failed:", e?.message || e);
-}
+    try {
+      const summary = `Scored ${Math.round(result.overall)} — Intro ${Math.round(result.intro.score)} / Disc ${Math.round(result.discovery.score)} / Obj ${Math.round(result.objection.score)} / Close ${Math.round(result.close.score)}`;
+      await supabase.from("activities").insert({
+        type: "call_scored",
+        summary,
+        call_id: callId,
+        created_at: new Date().toISOString(),
+      });
+    } catch (e: any) {
+      console.warn("[activity] call_scored insert failed:", e?.message || e);
+    }
 
     console.log("[score] wrote", { callId, overall: result.overall, model: result.model });
 
