@@ -3,7 +3,6 @@ import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { postSlack } from "../lib/slack";
 import 'dotenv/config';
-import { completeAssignmentsForTarget } from "../lib/assignmentsComplete";
 
 const router = Router();
 const supa = createClient(
@@ -25,6 +24,8 @@ const CreateCallSchema = z.object({
 const ScoreSchema = z.object({
   score_overall: z.number().min(0).max(100),
   rubric: z.any().optional(),
+  // Optional: if the client launched this score action from an assignment CTA
+  assignmentId: z.string().uuid().optional(),
 });
 
 const UUID_RE =
@@ -330,33 +331,59 @@ router.post("/:id/score", async (req, res) => {
     if (error) throw error;
 
     // --- Auto-complete call_review assignment (system) ---
-    // 1) Prefer a targeted assignment where target_id === callId
-    // 2) If none exists (common in MVP), complete the latest assigned call_review for the rep
+    // Priority:
+    // 1) If client provides assignmentId, complete that exact assignment
+    // 2) Otherwise complete targeted assignment where target_id === callId
+    // 3) Otherwise complete latest assigned call_review
     try {
       const nowIso = new Date().toISOString();
       let completedAny = false;
 
-      // (1) Targeted completion: target_id == callId
-      const { data: targeted, error: targetedErr } = await supa
-        .from("assignments")
-        .update({
-          status: "completed",
-          completed_at: nowIso,
-          completed_by: "system",
-        } as any)
-        .eq("rep_id", call.user_id)
-        .eq("type", "call_review")
-        .eq("status", "assigned")
-        .eq("target_id", id)
-        .select("id");
+      // (1) Explicit assignment completion (best wiring)
+      if (body.assignmentId) {
+        const { data: explicitRows, error: explicitErr } = await supa
+          .from("assignments")
+          .update({
+            status: "completed",
+            completed_at: nowIso,
+            completed_by: "system",
+          } as any)
+          .eq("id", body.assignmentId)
+          .eq("rep_id", call.user_id)
+          .eq("type", "call_review")
+          .eq("status", "assigned")
+          .select("id");
 
-      if (targetedErr) {
-        console.warn("[calls.score] targeted assignment complete failed", targetedErr.message);
-      } else if (Array.isArray(targeted) && targeted.length > 0) {
-        completedAny = true;
+        if (explicitErr) {
+          console.warn("[calls.score] explicit assignment complete failed", explicitErr.message);
+        } else if (Array.isArray(explicitRows) && explicitRows.length > 0) {
+          completedAny = true;
+        }
       }
 
-      // (2) Fallback: latest assigned call_review (no target)
+      // (2) Targeted completion: target_id == callId
+      if (!completedAny) {
+        const { data: targeted, error: targetedErr } = await supa
+          .from("assignments")
+          .update({
+            status: "completed",
+            completed_at: nowIso,
+            completed_by: "system",
+          } as any)
+          .eq("rep_id", call.user_id)
+          .eq("type", "call_review")
+          .eq("status", "assigned")
+          .eq("target_id", id)
+          .select("id");
+
+        if (targetedErr) {
+          console.warn("[calls.score] targeted assignment complete failed", targetedErr.message);
+        } else if (Array.isArray(targeted) && targeted.length > 0) {
+          completedAny = true;
+        }
+      }
+
+      // (3) Fallback: latest assigned call_review (no target match)
       if (!completedAny) {
         const { data: latest, error: latestErr } = await supa
           .from("assignments")

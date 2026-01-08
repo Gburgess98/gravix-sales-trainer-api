@@ -1138,43 +1138,89 @@ router.post("/score", express.json(), async (req, res) => {
         });
       }
 
-      // --- Auto-complete latest assigned sparring assignment (system) ---
-      // We intentionally complete the most recent "assigned" sparring assignment for this rep.
-      // (Sparring assignments are often created without a target_id.)
+      // --- Auto-complete sparring assignment (Day 15 wiring) ---
+      // Priority:
+      // 1) If the web passes `assignmentId`, complete THAT specific assignment.
+      // 2) Otherwise, complete the latest assigned sparring assignment for this rep.
+      //    Prefer matching `target_id` to persona_id when present.
       try {
         const repIdForAssign = String((updatedRow as any).rep_id || "").trim();
+        const personaIdForAssign = String((updatedRow as any).persona_id || "").trim();
+        const assignmentId = typeof body?.assignmentId === "string" ? body.assignmentId.trim() : "";
+
         if (repIdForAssign) {
-          const { data: latest, error: latestErr } = await supa
-            .from("assignments")
-            .select("id")
-            .eq("rep_id", repIdForAssign)
-            .eq("type", "sparring")
-            .eq("status", "assigned")
-            .order("created_at", { ascending: false })
-            .limit(1);
+          // 1) Exact assignment completion (strongest signal)
+          if (assignmentId) {
+            const { error: updAssignErr } = await supa
+              .from("assignments")
+              .update({
+                status: "completed",
+                completed_at: new Date().toISOString(),
+                completed_by: "system",
+              } as any)
+              .eq("id", assignmentId)
+              .eq("rep_id", repIdForAssign)
+              .eq("status", "assigned");
 
-          if (latestErr) {
-            console.warn("[sparring.score] load latest sparring assignment failed", latestErr.message);
+            if (updAssignErr) {
+              console.warn(
+                "[sparring.score] complete exact assignment failed",
+                updAssignErr.message
+              );
+            }
           } else {
-            const latestId = Array.isArray(latest) && latest[0]?.id ? String(latest[0].id) : null;
-            if (latestId) {
-              const { error: updAssignErr } = await supa
-                .from("assignments")
-                .update({
-                  status: "completed",
-                  completed_at: new Date().toISOString(),
-                  completed_by: "system",
-                } as any)
-                .eq("id", latestId);
+            // 2) Fallback: latest assigned sparring assignment
+            // Prefer target match when target_id exists.
+            let q = supa
+              .from("assignments")
+              .select("id,target_id")
+              .eq("rep_id", repIdForAssign)
+              .eq("type", "sparring")
+              .eq("status", "assigned")
+              .order("created_at", { ascending: false })
+              .limit(5);
 
-              if (updAssignErr) {
-                console.warn("[sparring.score] complete sparring assignment failed", updAssignErr.message);
+            const { data: candidates, error: candErr } = await q;
+            if (candErr) {
+              console.warn(
+                "[sparring.score] load sparring assignment candidates failed",
+                candErr.message
+              );
+            } else {
+              const rows = Array.isArray(candidates) ? candidates : [];
+              const picked =
+                (personaIdForAssign
+                  ? rows.find((r: any) => String(r?.target_id || "").trim() === personaIdForAssign)
+                  : null) ||
+                rows[0] ||
+                null;
+
+              const pickedId = picked?.id ? String(picked.id) : "";
+              if (pickedId) {
+                const { error: updAssignErr } = await supa
+                  .from("assignments")
+                  .update({
+                    status: "completed",
+                    completed_at: new Date().toISOString(),
+                    completed_by: "system",
+                  } as any)
+                  .eq("id", pickedId);
+
+                if (updAssignErr) {
+                  console.warn(
+                    "[sparring.score] complete sparring assignment failed",
+                    updAssignErr.message
+                  );
+                }
               }
             }
           }
         }
       } catch (e: any) {
-        console.warn("[sparring.score] assignment auto-complete failed", e?.message || e);
+        console.warn(
+          "[sparring.score] assignment auto-complete failed",
+          e?.message || e
+        );
       }
 
       return res.json({
