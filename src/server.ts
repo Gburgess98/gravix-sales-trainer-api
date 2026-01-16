@@ -24,6 +24,7 @@ import { PERSONAS } from "./personas";
 import whispererRouter from "./routes/whisperer";
 import adminRouter from "./routes/admin";
 import { assignmentsRoutes } from "./routes/assignments";
+import debugRouter from "./routes/debug";
 
 const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'];
 for (const k of REQUIRED_ENV) {
@@ -94,7 +95,7 @@ const corsOptions: cors.CorsOptions = {
   },
   methods: ["GET", "POST", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "x-user-id", "x-org-id", "x-request-id"],
-  credentials: false,
+  credentials: true,
   maxAge: 86400,
   optionsSuccessStatus: 204,
 };
@@ -113,6 +114,72 @@ app.use((req, res, next) => {
     console.log(`[${rid}] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${ms}ms)`);
   });
   next();
+});
+
+// --- Auth context (defensive): derive a stable user id early ---
+// We keep routes responsible for *authorisation* (manager/rep), but we ensure
+// identity is consistently available and mismatches are caught loudly.
+
+type AuthCtx = { userId: string | null; via: "header" | "jwt" | "env" | null };
+
+function tryDecodeJwtSub(token: string | null): string | null {
+  if (!token) return null;
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return null;
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "===".slice((b64.length + 3) % 4);
+    const json = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+    const sub = typeof json?.sub === "string" ? json.sub : null;
+    return sub && sub.length > 10 ? sub : null;
+  } catch {
+    return null;
+  }
+}
+
+function getBearerToken(req: express.Request): string | null {
+  const raw = (req.header("authorization") || req.header("Authorization") || "").trim();
+  if (!raw) return null;
+  const m = raw.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : null;
+}
+
+function isUuid(v: string | null | undefined) {
+  if (!v) return false;
+  return /^[0-9a-fA-F-]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(v);
+}
+
+// Attach req.userId early so middleware ordering changes can't silently break auth.
+app.use((req, res, next) => {
+  const headerUid = (req.header("x-user-id") || "").trim() || null;
+  const token = getBearerToken(req);
+  const jwtUid = tryDecodeJwtSub(token);
+
+  // DEV escape hatch (local only)
+  const envUid = (process.env.DEV_TEST_UID || "").trim() || null;
+
+  let ctx: AuthCtx = { userId: null, via: null };
+
+  // Priority: explicit header > jwt > env
+  if (isUuid(headerUid)) ctx = { userId: headerUid, via: "header" };
+  else if (isUuid(jwtUid)) ctx = { userId: jwtUid, via: "jwt" };
+  else if (isUuid(envUid)) ctx = { userId: envUid, via: "env" };
+
+  (req as any).auth = ctx;
+  (req as any).userId = ctx.userId;
+  (res.locals as any).userId = ctx.userId;
+  (res.locals as any).authVia = ctx.via;
+
+  // Guardrail: if both header + jwt exist and disagree, fail loudly.
+  if (isUuid(headerUid) && isUuid(jwtUid) && headerUid !== jwtUid) {
+    return sendJsonError(res, 401, "auth_mismatch", {
+      headerUid,
+      jwtUid,
+      hint: "x-user-id and Authorization Bearer token sub do not match",
+    });
+  }
+
+  return next();
 });
 
 // Root: simple status page for browsers/Slack bots
@@ -406,11 +473,14 @@ const upload = multer({ storage: multer.memoryStorage() });
 
 /* --- Helpers --- */
 function getUserId(req: express.Request): string {
-  const uid = req.header("x-user-id") || process.env.DEV_TEST_UID;
-  if (
-    !uid ||
-    !/^[0-9a-fA-F-]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(uid)
-  ) throw new Error("Missing or invalid x-user-id");
+  const fromCtx = (req as any)?.auth?.userId || (req as any)?.userId;
+  const headerUid = req.header("x-user-id");
+  const uid = (String(fromCtx || headerUid || process.env.DEV_TEST_UID || "").trim()) || null;
+
+  if (!uid || !/^[0-9a-fA-F-]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(uid)) {
+    throw new Error("Missing or invalid user id");
+  }
+
   return uid;
 }
 
@@ -1484,6 +1554,7 @@ app.use("/v1/sparring", sparringRouter);
 app.use("/v1/whisperer", whispererRouter);
 app.use("/v1/admin", adminRouter);
 app.use("/v1/assignments", assignmentsRoutes());
+app.use("/v1/debug", debugRouter);
 
 // NOTE: we’re no longer mounting personasRouter here –
 // /v1/sparring/personas is still handled inside sparringRouter

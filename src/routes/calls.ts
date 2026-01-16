@@ -24,7 +24,7 @@ const CreateCallSchema = z.object({
 const ScoreSchema = z.object({
   score_overall: z.number().min(0).max(100),
   rubric: z.any().optional(),
-  // Optional: if the client launched this score action from an assignment CTA
+  // Optional: if the client launched this score action from an assignment CTA (used for auto-complete)
   assignmentId: z.string().uuid().optional(),
 });
 
@@ -49,6 +49,189 @@ function getUserIdHeader(req: any): string {
     throw new Error("Missing or invalid x-user-id");
   }
   return uid;
+}
+
+// Helper: safely auto-complete call_review assignment, never throws.
+async function completeCallReviewAssignmentSafely(opts: {
+  supa: any;
+  repId: string;
+  callId: string;
+  assignmentId?: string;
+}) {
+  const { supa, repId, callId, assignmentId } = opts;
+
+  // Never throw: scoring must succeed even if assignment completion fails.
+  try {
+    const isUuid = (v?: string) => !!v && UUID_RE.test(String(v));
+
+    // Safety: if we don't have a plausible repId, do nothing.
+    if (!repId || String(repId).trim().length < 10 || !isUuid(repId)) {
+      console.warn("[assignments:auto_complete_noop]", {
+        source: "call_review",
+        reason: "invalid_rep_id",
+        rep_id: repId || null,
+        call_id: callId,
+        assignment_id: assignmentId || null,
+      });
+      return;
+    }
+
+    console.info("[assignments:auto_complete_attempt]", {
+      source: "call_review",
+      rep_id: repId,
+      call_id: callId,
+      assignment_id: isUuid(assignmentId) ? assignmentId : null,
+    });
+
+    let completedMethod: "explicit" | "targeted" | "fallback_latest" | null = null;
+    let completedCount = 0;
+
+    const nowIso = new Date().toISOString();
+    const metaPatch = { completed_via: "call_review", call_id: callId };
+
+    // (1) Explicit assignment completion (best wiring)
+    if (isUuid(assignmentId)) {
+      const { data: explicitRows, error: explicitErr } = await supa
+        .from("assignments")
+        .update({
+          status: "completed",
+          completed_at: nowIso,
+          completed_by: "system",
+          meta: metaPatch,
+        } as any)
+        .eq("id", assignmentId)
+        .eq("rep_id", repId)
+        .eq("type", "call_review")
+        .eq("status", "assigned")
+        .select("id");
+
+      if (explicitErr) {
+        console.warn("[assignments:auto_complete_failed]", {
+          source: "call_review",
+          method: "explicit",
+          rep_id: repId,
+          call_id: callId,
+          assignment_id: assignmentId,
+          error: explicitErr.message,
+        });
+      } else if (Array.isArray(explicitRows) && explicitRows.length > 0) {
+        completedMethod = "explicit";
+        completedCount = explicitRows.length;
+      }
+    }
+
+    // (2) Targeted completion: target_id == callId
+    if (!completedMethod) {
+      const { data: targeted, error: targetedErr } = await supa
+        .from("assignments")
+        .update({
+          status: "completed",
+          completed_at: nowIso,
+          completed_by: "system",
+          meta: metaPatch,
+        } as any)
+        .eq("rep_id", repId)
+        .eq("type", "call_review")
+        .eq("status", "assigned")
+        .eq("target_id", callId)
+        .select("id");
+
+      if (targetedErr) {
+        console.warn("[assignments:auto_complete_failed]", {
+          source: "call_review",
+          method: "targeted",
+          rep_id: repId,
+          call_id: callId,
+          assignment_id: isUuid(assignmentId) ? assignmentId : null,
+          error: targetedErr.message,
+        });
+      } else if (Array.isArray(targeted) && targeted.length > 0) {
+        completedMethod = "targeted";
+        completedCount = targeted.length;
+      }
+    }
+
+    // (3) Fallback: latest assigned call_review (no target match)
+    if (!completedMethod) {
+      const { data: latest, error: latestErr } = await supa
+        .from("assignments")
+        .select("id")
+        .eq("rep_id", repId)
+        .eq("type", "call_review")
+        .eq("status", "assigned")
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (latestErr) {
+        console.warn("[assignments:auto_complete_failed]", {
+          source: "call_review",
+          method: "fallback_latest_load",
+          rep_id: repId,
+          call_id: callId,
+          assignment_id: isUuid(assignmentId) ? assignmentId : null,
+          error: latestErr.message,
+        });
+      } else {
+        const latestId = Array.isArray(latest) && latest[0]?.id ? String(latest[0].id) : null;
+        if (latestId && UUID_RE.test(latestId)) {
+          const { data: fallbackRows, error: updErr } = await supa
+            .from("assignments")
+            .update({
+              status: "completed",
+              completed_at: nowIso,
+              completed_by: "system",
+              meta: metaPatch,
+            } as any)
+            .eq("id", latestId)
+            .eq("rep_id", repId)
+            .eq("type", "call_review")
+            .eq("status", "assigned")
+            .select("id");
+
+          if (updErr) {
+            console.warn("[assignments:auto_complete_failed]", {
+              source: "call_review",
+              method: "fallback_latest_update",
+              rep_id: repId,
+              call_id: callId,
+              assignment_id: isUuid(assignmentId) ? assignmentId : null,
+              error: updErr.message,
+            });
+          } else if (Array.isArray(fallbackRows) && fallbackRows.length > 0) {
+            completedMethod = "fallback_latest";
+            completedCount = fallbackRows.length;
+          }
+        }
+      }
+    }
+
+    if (completedMethod) {
+      console.info("[assignments:auto_completed]", {
+        source: "call_review",
+        method: completedMethod,
+        rep_id: repId,
+        call_id: callId,
+        assignment_id: isUuid(assignmentId) ? assignmentId : null,
+        completed_count: completedCount,
+      });
+    } else {
+      console.info("[assignments:auto_complete_noop]", {
+        source: "call_review",
+        reason: "no_matching_open_assignment",
+        rep_id: repId,
+        call_id: callId,
+        assignment_id: isUuid(assignmentId) ? assignmentId : null,
+      });
+    }
+  } catch (e: any) {
+    console.warn("[assignments:auto_complete_failed]", {
+      source: "call_review",
+      rep_id: repId,
+      call_id: callId,
+      assignment_id: assignmentId || null,
+      error: e?.message || String(e),
+    });
+  }
 }
 
 /* ---------------------------------------------
@@ -331,93 +514,13 @@ router.post("/:id/score", async (req, res) => {
     if (error) throw error;
 
     // --- Auto-complete call_review assignment (system) ---
-    // Priority:
-    // 1) If client provides assignmentId, complete that exact assignment
-    // 2) Otherwise complete targeted assignment where target_id === callId
-    // 3) Otherwise complete latest assigned call_review
-    try {
-      const nowIso = new Date().toISOString();
-      let completedAny = false;
-
-      // (1) Explicit assignment completion (best wiring)
-      if (body.assignmentId) {
-        const { data: explicitRows, error: explicitErr } = await supa
-          .from("assignments")
-          .update({
-            status: "completed",
-            completed_at: nowIso,
-            completed_by: "system",
-          } as any)
-          .eq("id", body.assignmentId)
-          .eq("rep_id", call.user_id)
-          .eq("type", "call_review")
-          .eq("status", "assigned")
-          .select("id");
-
-        if (explicitErr) {
-          console.warn("[calls.score] explicit assignment complete failed", explicitErr.message);
-        } else if (Array.isArray(explicitRows) && explicitRows.length > 0) {
-          completedAny = true;
-        }
-      }
-
-      // (2) Targeted completion: target_id == callId
-      if (!completedAny) {
-        const { data: targeted, error: targetedErr } = await supa
-          .from("assignments")
-          .update({
-            status: "completed",
-            completed_at: nowIso,
-            completed_by: "system",
-          } as any)
-          .eq("rep_id", call.user_id)
-          .eq("type", "call_review")
-          .eq("status", "assigned")
-          .eq("target_id", id)
-          .select("id");
-
-        if (targetedErr) {
-          console.warn("[calls.score] targeted assignment complete failed", targetedErr.message);
-        } else if (Array.isArray(targeted) && targeted.length > 0) {
-          completedAny = true;
-        }
-      }
-
-      // (3) Fallback: latest assigned call_review (no target match)
-      if (!completedAny) {
-        const { data: latest, error: latestErr } = await supa
-          .from("assignments")
-          .select("id")
-          .eq("rep_id", call.user_id)
-          .eq("type", "call_review")
-          .eq("status", "assigned")
-          .order("created_at", { ascending: false })
-          .limit(1);
-
-        if (latestErr) {
-          console.warn("[calls.score] load latest call_review assignment failed", latestErr.message);
-        } else {
-          const latestId = Array.isArray(latest) && latest[0]?.id ? String(latest[0].id) : null;
-          if (latestId) {
-            const { error: updErr } = await supa
-              .from("assignments")
-              .update({
-                status: "completed",
-                completed_at: nowIso,
-                completed_by: "system",
-              } as any)
-              .eq("id", latestId);
-
-            if (updErr) {
-              console.warn("[calls.score] fallback assignment complete failed", updErr.message);
-            }
-          }
-        }
-      }
-    } catch (e: any) {
-      // never fail scoring due to assignment completion
-      console.warn("[calls.score] assignment auto-complete failed", e?.message || e);
-    }
+    // Never fail scoring due to assignment completion.
+    await completeCallReviewAssignmentSafely({
+      supa,
+      repId: call.user_id,
+      callId: id,
+      assignmentId: body.assignmentId,
+    });
 
     // ✅ NEW: append a score snapshot to call_scores
     const hist = {

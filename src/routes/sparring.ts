@@ -158,6 +158,12 @@ function clamp100(n: number) {
   return Math.max(0, Math.min(100, Math.round(n)));
 }
 
+function isUuid(v: string) {
+  const s = String(v || "").trim();
+  // basic UUID v4-ish check (good enough for guardrails)
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(s);
+}
+
 function containsAny(text: string, needles: string[]) {
   const t = String(text || "").toLowerCase();
   return needles.some((n) => t.includes(n));
@@ -1138,89 +1144,76 @@ router.post("/score", express.json(), async (req, res) => {
         });
       }
 
-      // --- Auto-complete sparring assignment (Day 15 wiring) ---
-      // Priority:
-      // 1) If the web passes `assignmentId`, complete THAT specific assignment.
-      // 2) Otherwise, complete the latest assigned sparring assignment for this rep.
-      //    Prefer matching `target_id` to persona_id when present.
+
+      // -----------------------------
+      // Assignment auto-complete (SAFE + LOGGED)
+      // -----------------------------
       try {
         const repIdForAssign = String((updatedRow as any).rep_id || "").trim();
         const personaIdForAssign = String((updatedRow as any).persona_id || "").trim();
-        const assignmentId = typeof body?.assignmentId === "string" ? body.assignmentId.trim() : "";
 
-        if (repIdForAssign) {
-          // 1) Exact assignment completion (strongest signal)
-          if (assignmentId) {
-            const { error: updAssignErr } = await supa
-              .from("assignments")
-              .update({
-                status: "completed",
-                completed_at: new Date().toISOString(),
-                completed_by: "system",
-              } as any)
-              .eq("id", assignmentId)
-              .eq("rep_id", repIdForAssign)
-              .eq("status", "assigned");
+        // Accept assignmentId if explicitly provided AND looks valid
+        const rawAssignmentId =
+          typeof body?.assignmentId === "string" ? body.assignmentId.trim() : "";
+        const safeAssignmentId = isUuid(rawAssignmentId) ? rawAssignmentId : "";
 
-            if (updAssignErr) {
-              console.warn(
-                "[sparring.score] complete exact assignment failed",
-                updAssignErr.message
-              );
-            }
+        // Safe guardrails: only attempt if we have a real rep id
+        if (repIdForAssign && repIdForAssign.length > 10) {
+          console.info("[assignments:lifecycle]", {
+            event: "auto_complete_attempt",
+            via: "sparring",
+            rep_id: repIdForAssign,
+            assignment_id: safeAssignmentId || null,
+            target_id: personaIdForAssign || null,
+            session_id: sessionId,
+          });
+
+          const result = await completeAssignmentsForTarget({
+            repId: repIdForAssign,
+            assignmentId: safeAssignmentId || null,
+            type: "sparring",
+            targetId: personaIdForAssign || null,
+            completedVia: "sparring",
+          });
+
+          // Only log auto_completed when something actually completed
+          const completedCount =
+            typeof (result as any)?.completedCount === "number"
+              ? (result as any).completedCount
+              : typeof (result as any)?.completed_count === "number"
+                ? (result as any).completed_count
+                : typeof (result as any)?.count === "number"
+                  ? (result as any).count
+                  : null;
+
+          if (completedCount && completedCount > 0) {
+            console.info("[assignments:lifecycle]", {
+              event: "auto_completed",
+              via: "sparring",
+              rep_id: repIdForAssign,
+              assignment_id: safeAssignmentId || null,
+              target_id: personaIdForAssign || null,
+              session_id: sessionId,
+              completed_count: completedCount,
+            });
           } else {
-            // 2) Fallback: latest assigned sparring assignment
-            // Prefer target match when target_id exists.
-            let q = supa
-              .from("assignments")
-              .select("id,target_id")
-              .eq("rep_id", repIdForAssign)
-              .eq("type", "sparring")
-              .eq("status", "assigned")
-              .order("created_at", { ascending: false })
-              .limit(5);
-
-            const { data: candidates, error: candErr } = await q;
-            if (candErr) {
-              console.warn(
-                "[sparring.score] load sparring assignment candidates failed",
-                candErr.message
-              );
-            } else {
-              const rows = Array.isArray(candidates) ? candidates : [];
-              const picked =
-                (personaIdForAssign
-                  ? rows.find((r: any) => String(r?.target_id || "").trim() === personaIdForAssign)
-                  : null) ||
-                rows[0] ||
-                null;
-
-              const pickedId = picked?.id ? String(picked.id) : "";
-              if (pickedId) {
-                const { error: updAssignErr } = await supa
-                  .from("assignments")
-                  .update({
-                    status: "completed",
-                    completed_at: new Date().toISOString(),
-                    completed_by: "system",
-                  } as any)
-                  .eq("id", pickedId);
-
-                if (updAssignErr) {
-                  console.warn(
-                    "[sparring.score] complete sparring assignment failed",
-                    updAssignErr.message
-                  );
-                }
-              }
-            }
+            console.info("[assignments:lifecycle]", {
+              event: "auto_complete_noop",
+              via: "sparring",
+              rep_id: repIdForAssign,
+              assignment_id: safeAssignmentId || null,
+              target_id: personaIdForAssign || null,
+              session_id: sessionId,
+            });
           }
         }
       } catch (e: any) {
-        console.warn(
-          "[sparring.score] assignment auto-complete failed",
-          e?.message || e
-        );
+        console.warn("[assignments:lifecycle]", {
+          event: "auto_complete_failed",
+          via: "sparring",
+          error: e?.message || e,
+          session_id: sessionId,
+        });
       }
 
       return res.json({

@@ -27,6 +27,12 @@
     "build": "tsc",
     "start": "tsx src/server.ts",
     "start:dev": "ts-node-dev --respawn --transpile-only src/index.ts",
-    "dev": "tsx watch src/server.ts"
+    "dev": "tsx watch src/server.ts",
+    "lint": "echo \"(lint not configured yet)\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "echo \"(no tests yet)\"",
+    "smoke": "bash scripts/smoke.sh",
+    "check": "npm run lint && npm run typecheck && npm run smoke",
+    "check:ci": "npm run lint && npm run typecheck"
   }
 }
