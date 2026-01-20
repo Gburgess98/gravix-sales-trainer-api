@@ -31,7 +31,23 @@ function getUserId(req: Request) {
 }
 
 // Minimal RBAC: allow Manager/Admin/Owner
+
 const MANAGER_ROLES = new Set(["Manager", "Admin", "Owner"]);
+
+async function isManagerUser(userId: string) {
+  const supa = getSupaAdmin();
+
+  const { data, error } = await supa
+    .from("reps")
+    .select("tier")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (error) throw error;
+
+  const tier = String((data as any)?.tier || "");
+  return MANAGER_ROLES.has(tier);
+}
 
 async function requireManager(req: Request, res: Response, next: NextFunction) {
   try {
@@ -81,14 +97,16 @@ export function assignmentsRoutes() {
 
     if (repId !== userId) {
       // Require manager if attempting to view another rep
-      let allowed = false;
-      await new Promise<void>((resolve) => {
-        requireManager(req, res, () => {
-          allowed = true;
-          resolve();
-        });
-      });
-      if (!allowed) return; // requireManager already responded
+      try {
+        const ok = await isManagerUser(userId);
+        if (!ok) {
+          return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        // Keep parity with manager flows that expect authUserId.
+        (req as any).authUserId = userId;
+      } catch (e: any) {
+        return res.status(500).json({ ok: false, error: e?.message || "manager_gate_failed" });
+      }
     }
 
     // If a manager is viewing another rep, only return assignments created by that manager.
@@ -205,7 +223,7 @@ export function assignmentsRoutes() {
     // Only the assignee can complete
     const { data: row, error: findErr } = await supa
       .from("assignments")
-      .select("id, rep_id, status, completed_at")
+      .select("id, rep_id, type, status, completed_at")
       .eq("id", id)
       .maybeSingle();
 
@@ -243,6 +261,43 @@ export function assignmentsRoutes() {
       .select(SELECT_FIELDS)
       .single();
 
+    if (error) return res.status(500).json({ ok: false, error: error.message });
+
+    // -------------------------------
+    // XP (best-effort; never block completion)
+    // -------------------------------
+    // Default XP values (tweak later):
+    // custom=10, call_review=25, sparring=50
+    try {
+      const t = String((row as any)?.type || "");
+      const xp = t === "sparring" ? 50 : t === "call_review" ? 25 : 10;
+
+      // If your rep_xp_events table doesn't have assignment_id, remove it (see note below).
+      await supa.from("rep_xp_events").insert({
+        rep_id: userId,
+        xp,
+        source: "assignment_complete",
+        assignment_id: id,
+        created_at: new Date().toISOString(),
+      } as any);
+
+      console.log("[xp.event]", {
+        event: "xp_awarded",
+        repId: userId,
+        xp,
+        source: "assignment_complete",
+        assignmentId: id,
+      });
+    } catch (e: any) {
+      console.log("[xp.event]", {
+        event: "xp_award_failed",
+        repId: userId,
+        source: "assignment_complete",
+        assignmentId: id,
+        error: e?.message || String(e),
+      });
+    }
+
     console.log("[assign.lifecycle]", {
       event: "manually_completed",
       assignmentId: id,
@@ -250,7 +305,6 @@ export function assignmentsRoutes() {
       completed_by: "rep",
     });
 
-    if (error) return res.status(500).json({ ok: false, error: error.message });
     return res.json({ ok: true, assignment: data });
   });
 
@@ -265,7 +319,7 @@ export function assignmentsRoutes() {
 
     const { data: row, error: findErr } = await supa
       .from("assignments")
-      .select("id, manager_id")
+      .select("id, rep_id, manager_id, type, status, completed_at")
       .eq("id", id)
       .maybeSingle();
 
@@ -288,8 +342,10 @@ export function assignmentsRoutes() {
     return res.json({ ok: true });
   });
 
-  // GET /v1/assignments/manager?rep_id=&status=
+  // GET /v1/assignments/manager?rep_id=&status=&limit=&cursor=
   // Manager views assignments they created (optional filters)
+  // Pagination is cursor-based for scale hardening.
+  // Cursor format: `${created_at}|${id}` (created_at is ISO string)
   r.get("/manager", requireManager, async (req: Request, res: Response) => {
     const supa = getSupaAdmin();
 
@@ -297,19 +353,54 @@ export function assignmentsRoutes() {
     const repId = String((req.query.rep_id as string) || "").trim();
     const status = String((req.query.status as string) || "").trim();
 
+    const rawLimit = String((req.query.limit as any) || "").trim();
+    let limit = Number(rawLimit || 0);
+    if (!Number.isFinite(limit) || limit <= 0) limit = 25; // safe default
+    limit = Math.min(Math.max(limit, 1), 200); // clamp
+
+    const cursor = String((req.query.cursor as any) || "").trim();
+    const [cursorCreatedAt, cursorId] = cursor ? cursor.split("|") : ["", ""];
+
     let q = supa
       .from("assignments")
       .select(SELECT_FIELDS)
       .eq("manager_id", managerId)
-      .order("created_at", { ascending: false });
+      .order("created_at", { ascending: false })
+      .order("id", { ascending: false });
 
     if (repId) q = q.eq("rep_id", repId);
     if (status) q = q.eq("status", status);
 
-    const { data, error } = await q;
+    // Cursor-based pagination (created_at desc, id desc)
+    if (cursorCreatedAt && cursorId) {
+      // Fetch rows strictly "after" the cursor in the ordered list.
+      // created_at < cursorCreatedAt OR (created_at = cursorCreatedAt AND id < cursorId)
+      q = q.or(
+        `created_at.lt.${cursorCreatedAt},and(created_at.eq.${cursorCreatedAt},id.lt.${cursorId})`
+      );
+    }
+
+    // Fetch one extra row to compute nextCursor.
+    const { data, error } = await q.limit(limit + 1);
 
     if (error) return res.status(500).json({ ok: false, error: error.message });
-    return res.json({ ok: true, managerId, assignments: data || [] });
+
+    const rows = (data || []) as any[];
+    const page = rows.slice(0, limit);
+
+    const last = page.length ? page[page.length - 1] : null;
+    const nextCursor = rows.length > limit && last
+      ? `${String(last.created_at || "")}|${String(last.id || "")}`
+      : null;
+
+    // Back-compat: keep `assignments` for existing UI, but also return `items`.
+    return res.json({
+      ok: true,
+      managerId,
+      items: page,
+      assignments: page,
+      nextCursor,
+    });
   });
 
   // GET /v1/assignments/manager/signals

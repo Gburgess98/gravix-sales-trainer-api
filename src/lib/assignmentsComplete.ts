@@ -4,6 +4,24 @@ type CompletedBy = "rep" | "system";
 
 type AssignmentType = "sparring" | "call_review" | "custom";
 
+async function awardXp(opts: {
+  repId: string;
+  xp: number;
+  source: "sparring" | "call_review";
+}) {
+  const { repId, xp, source } = opts;
+  if (!repId || !xp || xp <= 0) return;
+
+  const supa = getSupa();
+
+  await supa.from("rep_xp_events").insert({
+    rep_id: repId,
+    xp,
+    source,
+    created_at: new Date().toISOString(),
+  });
+}
+
 function getSupa() {
   const url = process.env.SUPABASE_URL!;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -36,6 +54,15 @@ async function markCompletedById(opts: {
 
   const { data, error } = await q.select("id");
   if (error) throw error;
+
+  if ((data || []).length > 0 && type) {
+    if (type === "sparring") {
+      await awardXp({ repId, xp: 50, source: "sparring" });
+    }
+    if (type === "call_review") {
+      await awardXp({ repId, xp: 25, source: "call_review" });
+    }
+  }
 
   return { ok: true as const, updated: (data || []).length };
 }
@@ -121,6 +148,13 @@ export async function completeAssignmentsForTarget(opts: {
     .neq("status", "completed");
 
   if (error) throw error;
+
+  if (type === "sparring") {
+    await awardXp({ repId, xp: 50, source: "sparring" });
+  }
+  if (type === "call_review") {
+    await awardXp({ repId, xp: 25, source: "call_review" });
+  }
 }
 
 /**
@@ -143,12 +177,16 @@ export async function completeCallReviewOnScore(opts: {
 
   // 1) Exact assignment
   if (assignmentId) {
-    return await markCompletedById({
+    const result = await markCompletedById({
       assignmentId,
       repId,
       type: "call_review",
       completedBy,
     });
+    if (result.updated > 0) {
+      await awardXp({ repId, xp: 25, source: "call_review" });
+    }
+    return result;
   }
 
   // 2) target_id === callId
@@ -168,15 +206,20 @@ export async function completeCallReviewOnScore(opts: {
 
   if (error) throw error;
   if ((data || []).length > 0) {
+    await awardXp({ repId, xp: 25, source: "call_review" });
     return { ok: true as const, updated: (data || []).length };
   }
 
   // 3) latest assigned call_review
-  return await markCompletedLatestAssigned({
+  const result = await markCompletedLatestAssigned({
     repId,
     type: "call_review",
     completedBy,
   });
+  if (result.updated > 0) {
+    await awardXp({ repId, xp: 25, source: "call_review" });
+  }
+  return result;
 }
 
 /**
@@ -196,17 +239,25 @@ export async function completeSparringOnComplete(opts: {
   if (!repId) return { ok: true as const, updated: 0 };
 
   if (assignmentId) {
-    return await markCompletedById({
+    const result = await markCompletedById({
       assignmentId,
       repId,
       type: "sparring",
       completedBy,
     });
+    if (result.updated > 0) {
+      await awardXp({ repId, xp: 50, source: "sparring" });
+    }
+    return result;
   }
 
-  return await markCompletedLatestAssigned({
+  const result = await markCompletedLatestAssigned({
     repId,
     type: "sparring",
     completedBy,
   });
+  if (result.updated > 0) {
+    await awardXp({ repId, xp: 50, source: "sparring" });
+  }
+  return result;
 }
