@@ -1048,7 +1048,7 @@ router.post("/score", express.json(), async (req, res) => {
 
       const existingMeta =
         row.meta && typeof row.meta === "object" ? { ...row.meta } : {};
-
+      const alreadyCommitted = Boolean((existingMeta as any)?.xp_committed);
       const mergedMeta = {
         ...existingMeta,
         ...(meta || {}),
@@ -1064,6 +1064,11 @@ router.post("/score", express.json(), async (req, res) => {
         xp_bonus_used: bonus,
         xp_awarded: finalXpAwarded,
         outcome,
+
+        // XP commit guard: we only grant rep XP once per session
+        xp_committed: alreadyCommitted,
+        xp_committed_amount: (existingMeta as any)?.xp_committed_amount ?? null,
+        xp_committed_at: (existingMeta as any)?.xp_committed_at ?? null,
       };
 
       let finalDuration =
@@ -1213,6 +1218,113 @@ router.post("/score", express.json(), async (req, res) => {
           via: "sparring",
           error: e?.message || e,
           session_id: sessionId,
+        });
+      }
+
+      // -----------------------------
+      // XP awarding (SAFE + IDEMPOTENT)
+      // - Only commit XP to reps/xp_events once per session
+      // - Session already stores xp_awarded; this is the real "grant"
+      // -----------------------------
+      try {
+        const repIdForXp = String((updatedRow as any).rep_id || "").trim();
+        const metaNow =
+          (updatedRow as any)?.meta && typeof (updatedRow as any).meta === "object"
+            ? ((updatedRow as any).meta as Record<string, any>)
+            : {};
+
+        const already = Boolean(metaNow?.xp_committed);
+        const amount = Number.isFinite(Number(finalXpAwarded)) ? Number(finalXpAwarded) : 0;
+
+        if (!already && repIdForXp && repIdForXp.length > 10 && amount > 0) {
+          const nowIso = new Date().toISOString();
+          console.info("[xp:lifecycle]", {
+            event: "xp_commit_attempt",
+            source: "sparring",
+            rep_id: repIdForXp,
+            session_id: sessionId,
+            amount,
+          });
+
+          // 1) Insert XP event (audit trail)
+          try {
+            const { error: xpEventErr } = await supa
+              .from("xp_events")
+              .insert({
+                id: uuidv4(),
+                rep_id: repIdForXp,
+                source: "sparring",
+                delta: amount,
+                amount,
+                session_id: sessionId,
+                created_at: nowIso,
+              } as any);
+
+            if (xpEventErr) {
+              console.warn("[xp:lifecycle] xp_events insert failed", xpEventErr);
+            }
+          } catch (e: any) {
+            console.warn("[xp:lifecycle] xp_events insert threw", e?.message || e);
+          }
+
+          // 2) Increment reps.xp (leaderboards / totals)
+          try {
+            const { error: incErr } = await supa.rpc("increment_rep_xp", {
+              p_rep_id: repIdForXp,
+              p_delta: amount,
+            });
+
+            if (incErr) {
+              console.warn("[xp:lifecycle] increment_rep_xp rpc failed", incErr);
+            }
+          } catch (e: any) {
+            console.warn("[xp:lifecycle] increment_rep_xp threw", e?.message || e);
+          }
+
+          // 3) Mark committed in session meta (guard against double-awards)
+          try {
+            const committedMeta = {
+              ...metaNow,
+              xp_committed: true,
+              xp_committed_amount: amount,
+              xp_committed_at: nowIso,
+              xp_committed_source: "sparring",
+            };
+
+            await supa
+              .from("sparring_sessions")
+              .update({ meta: committedMeta } as any)
+              .eq("id", sessionId);
+
+            // Keep response in sync
+            (updatedRow as any).meta = committedMeta;
+          } catch (e: any) {
+            console.warn("[xp:lifecycle] session meta commit flag update failed", e?.message || e);
+          }
+
+          console.info("[xp:lifecycle]", {
+            event: "xp_committed",
+            source: "sparring",
+            rep_id: repIdForXp,
+            session_id: sessionId,
+            amount,
+          });
+        } else {
+          console.info("[xp:lifecycle]", {
+            event: "xp_commit_skip",
+            source: "sparring",
+            rep_id: repIdForXp || null,
+            session_id: sessionId,
+            already_committed: already,
+            amount,
+          });
+        }
+      } catch (e: any) {
+        console.warn("[xp:lifecycle]", {
+          event: "xp_commit_failed",
+          source: "sparring",
+          session_id: sessionId,
+          error: e?.message || e,
         });
       }
 
