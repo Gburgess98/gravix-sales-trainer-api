@@ -2,6 +2,7 @@
 import { Router } from "express";
 import type { Request, Response, NextFunction } from "express";
 import { createClient } from "@supabase/supabase-js";
+import crypto from "crypto";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -28,6 +29,38 @@ function getUserId(req: Request) {
       ""
     ).trim()
   );
+}
+
+function formatDayMon(d: Date) {
+  try {
+    return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short" }).format(d);
+  } catch {
+    const mm = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    return `${String(d.getDate()).padStart(2, "0")} ${mm[d.getMonth()]}`;
+  }
+}
+
+function safeTypeNudgeLabel(t: string) {
+  const type = String(t || "").toLowerCase();
+  if (type === "sparring") return "sparring drill";
+  if (type === "call_review") return "call review";
+  return "task";
+}
+
+async function sendSlackWebhook(text: string) {
+  const url = String(process.env.SLACK_WEBHOOK_URL || "").trim();
+  if (!url) throw new Error("missing_slack_webhook_url");
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`slack_webhook_failed:${resp.status}:${body.slice(0, 200)}`);
+  }
 }
 
 // Minimal RBAC: allow Manager/Admin/Owner
@@ -308,6 +341,141 @@ export function assignmentsRoutes() {
     return res.json({ ok: true, assignment: data });
   });
 
+  // POST /v1/assignments/:id/nudge
+  // Manager-only: sends a Slack nudge with context (Task, Explanation, Due date)
+  r.post("/:id/nudge", requireManager, async (req: Request, res: Response) => {
+    try {
+      const supa = getSupaAdmin();
+
+      const managerId = String((req as any).authUserId || "").trim();
+      if (!managerId) return res.status(401).json({ ok: false, error: "missing_user" });
+
+      const id = String(req.params.id || "").trim();
+      if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
+
+      // Fetch assignment
+      const { data: a, error: aErr } = await supa
+        .from("assignments")
+        .select("id,rep_id,manager_id,type,title,status,due_at,created_at,completed_at")
+        .eq("id", id)
+        .maybeSingle();
+
+      if (aErr) return res.status(500).json({ ok: false, error: aErr.message });
+      if (!a) return res.status(404).json({ ok: false, error: "not_found" });
+
+      // Ownership guard: only creator manager can nudge
+      if (String((a as any).manager_id || "") !== managerId) {
+        return res.status(403).json({ ok: false, error: "forbidden_not_owner" });
+      }
+
+      const repId = String((a as any).rep_id || "").trim();
+      const type = String((a as any).type || "").toLowerCase();
+      const title = String((a as any).title || "").trim();
+      const status = String((a as any).status || "").toLowerCase();
+      const dueAtIso = (a as any).due_at ? String((a as any).due_at) : "";
+
+      // Best-effort rep name
+      let repName: string | null = null;
+      try {
+        const { data: rep, error: repErr } = await supa
+          .from("reps")
+          .select("id,name")
+          .eq("id", repId)
+          .maybeSingle();
+        if (!repErr && rep) repName = String((rep as any).name || "").trim() || null;
+      } catch {
+        // ignore
+      }
+
+      // Explanation heuristic (v1)
+      let explanation = "Please complete this task.";
+
+      const now = new Date();
+      const nowIso = now.toISOString();
+      const isOverdue = status !== "completed" && dueAtIso && dueAtIso < nowIso;
+
+      if (isOverdue) {
+        explanation = "This task is overdue and needs attention.";
+      }
+
+      // Missed 2+ times this week: count open assignments of same type for this rep in last 7d
+      try {
+        const since7d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+        const { data: rows, error: rowsErr } = await supa
+          .from("assignments")
+          .select("id,status,type,created_at")
+          .eq("rep_id", repId)
+          .eq("manager_id", managerId)
+          .eq("type", type)
+          .gte("created_at", since7d);
+
+        if (!rowsErr && Array.isArray(rows)) {
+          const openCount = rows.filter((r: any) => String(r.status || "").toLowerCase() !== "completed").length;
+          if (openCount >= 2) {
+            explanation = "You’ve missed this twice this week and it’s holding back your close rate.";
+          }
+        }
+      } catch {
+        // ignore
+      }
+
+      const taskLabel = safeTypeNudgeLabel(type);
+      const taskLine = title
+        ? `Complete your ${taskLabel}: “${title}”`
+        : `Complete your ${taskLabel}`;
+
+      const dueLabel = (() => {
+        const d = dueAtIso ? new Date(dueAtIso) : now;
+        const dayMon = formatDayMon(d);
+
+        if (!dueAtIso) return `Today (${dayMon})`;
+
+        const today = new Date();
+        const sameDay =
+          d.getFullYear() === today.getFullYear() &&
+          d.getMonth() === today.getMonth() &&
+          d.getDate() === today.getDate();
+
+        return sameDay ? `Today (${dayMon})` : dayMon;
+      })();
+
+      // EXACT Slack message format (FINAL)
+      const headerLine = repName
+        ? `👋 Quick nudge from your manager (${repName})`
+        : "👋 Quick nudge from your manager";
+
+      const text = [
+        headerLine,
+        "",
+        "Task:",
+        taskLine,
+        "",
+        "Explanation:",
+        explanation,
+        "",
+        "Due date:",
+        dueLabel,
+        "",
+        "— Gravix Coach",
+      ].join("\n");
+
+      await sendSlackWebhook(text);
+
+      console.log("[nudge]", {
+        event: "sent",
+        assignmentId: id,
+        repId,
+        managerId,
+        via: "slack_webhook",
+        digest: crypto.createHash("sha1").update(text).digest("hex").slice(0, 10),
+      });
+
+      return res.json({ ok: true, sent: "slack" });
+    } catch (e: any) {
+      return res.status(500).json({ ok: false, error: e?.message || "nudge_failed" });
+    }
+  });
+
   // DELETE /v1/assignments/:id
   // Manager can delete assignments they created (ownership enforced)
   r.delete("/:id", requireManager, async (req: Request, res: Response) => {
@@ -493,57 +661,236 @@ export function assignmentsRoutes() {
   });
 
   // GET /v1/assignments/manager/trust
-  // Compact trust payload for manager confidence UI
+  // Compact trust payload for manager confidence UI (24h + 7d)
   r.get("/manager/trust", requireManager, async (req: Request, res: Response) => {
-    const supa = getSupaAdmin();
+    try {
+      const supa = getSupaAdmin();
 
-    const managerId = String((req as any).authUserId || "");
-    const now = new Date();
-    const nowIso = now.toISOString();
-    const sevenDaysAgoIso = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const managerId = String((req as any).authUserId || "");
+      if (!managerId) return res.status(401).json({ ok: false, error: "missing_user" });
 
-    const { data: rows, error } = await supa
-      .from("assignments")
-      .select("rep_id,status,due_at,created_at,completed_at")
-      .eq("manager_id", managerId);
+      const nowMs = Date.now();
+      const since24h = new Date(nowMs - 24 * 60 * 60 * 1000).toISOString();
+      const since7d = new Date(nowMs - 7 * 24 * 60 * 60 * 1000).toISOString();
 
-    if (error) return res.status(500).json({ ok: false, error: error.message });
+      // Pull 7d window (plus some open items) and compute trust in-memory.
+      // Keep it simple and stable (no new RPC required).
+      const { data: rows, error } = await supa
+        .from("assignments")
+        .select("id,rep_id,type,target_id,title,status,due_at,created_at,completed_at,completed_by")
+        .eq("manager_id", managerId)
+        .gte("created_at", since7d)
+        .order("created_at", { ascending: false });
 
-    const list = (rows || []) as any[];
+      if (error) {
+        return res.status(500).json({ ok: false, error: error.message || "trust_query_failed" });
+      }
 
-    const overdue = list.filter((a) => {
-      if (String(a.status) === "completed") return false;
-      if (!a.due_at) return false;
-      return String(a.due_at) < nowIso;
-    }).length;
+      const list = (rows || []) as any[];
 
-    const assigned7d = list.filter((a) => String(a.created_at) >= sevenDaysAgoIso).length;
-    const completed7d = list.filter(
-      (a) => String(a.status) === "completed" && String(a.completed_at) >= sevenDaysAgoIso
-    ).length;
+      const ts = (iso: any) => {
+        const t = new Date(String(iso || "")).getTime();
+        return Number.isFinite(t) ? t : 0;
+      };
 
-    const repsTouched = Array.from(
-      new Set(list.map((a) => String(a.rep_id || "")).filter(Boolean))
-    );
+      const inRange = (iso: any, startIso: string) => {
+        const t = ts(iso);
+        return t > 0 && t >= ts(startIso);
+      };
 
-    const repsCompleted7d = new Set(
-      list
-        .filter((a) => String(a.status) === "completed" && String(a.completed_at) >= sevenDaysAgoIso)
-        .map((a) => String(a.rep_id))
-    );
+      const isToday = (iso: any) => {
+        const d = new Date(String(iso || ""));
+        if (Number.isNaN(d.getTime())) return false;
+        const n = new Date();
+        return (
+          d.getFullYear() === n.getFullYear() &&
+          d.getMonth() === n.getMonth() &&
+          d.getDate() === n.getDate()
+        );
+      };
 
-    const stale = repsTouched.filter((id) => !repsCompleted7d.has(id));
+      const created24 = list.filter((a) => inRange(a.created_at, since24h));
+      const created7 = list;
 
-    return res.json({
-      ok: true,
-      managerId,
-      trust: {
-        overdue,
-        assigned_7d: assigned7d,
-        completed_7d: completed7d,
-        stale_reps: stale,
-      },
-    });
+      const completed24 = list.filter((a) => inRange(a.completed_at, since24h));
+      const completed7 = list.filter((a) => inRange(a.completed_at, since7d));
+
+      const isAuto = (a: any) => String(a.completed_by || "").toLowerCase() === "system";
+      const auto24 = completed24.filter(isAuto);
+      const auto7 = completed7.filter(isAuto);
+
+      const pct = (done: number, created: number) => {
+        if (!created) return 0;
+        return Math.round((done / created) * 1000) / 10; // 1dp
+      };
+
+      // Stuck reasons over OPEN assignments
+      const open = list.filter((a) => String(a.status || "").toLowerCase() === "assigned");
+
+      const isPast = (iso: any) => {
+        const t = ts(iso);
+        return t > 0 && t < nowMs;
+      };
+
+      const reasonFor = (a: any): string => {
+        const type = String(a.type || "").toLowerCase();
+        const hasTarget = !!String(a.target_id || "").trim();
+
+        if (type === "custom" && isPast(a.due_at)) return "Overdue custom task";
+        if (type === "sparring") return "Sparring not completed";
+        if (type === "call_review" && !hasTarget) return "No call picked";
+        if (type === "call_review" && hasTarget) return "Call review not completed";
+        if (isPast(a.due_at)) return "Overdue";
+        return "Not completed";
+      };
+
+      const reasonCounts: Record<string, number> = {};
+      for (const a of open) {
+        const r = reasonFor(a);
+        reasonCounts[r] = (reasonCounts[r] || 0) + 1;
+      }
+
+      const topStuckReason =
+        Object.entries(reasonCounts)
+          .sort((a, b) => b[1] - a[1])
+          .map(([reason, count]) => ({ reason, count }))[0] || { reason: "None", count: 0 };
+
+      // Needs help today: top 5 reps by overdue then open, then oldest completion
+      const repAgg: Record<
+        string,
+        { rep_id: string; overdue: number; open: number; completed_today: number; last_completed_at: string | null }
+      > = {};
+
+      for (const a of list) {
+        const repId = String(a.rep_id || "").trim();
+        if (!repId) continue;
+
+        if (!repAgg[repId]) {
+          repAgg[repId] = {
+            rep_id: repId,
+            overdue: 0,
+            open: 0,
+            completed_today: 0,
+            last_completed_at: null,
+          };
+        }
+
+        if (String(a.status || "").toLowerCase() === "assigned") {
+          repAgg[repId].open += 1;
+          if (isPast(a.due_at)) repAgg[repId].overdue += 1;
+        }
+
+        if (a.completed_at) {
+          if (isToday(a.completed_at)) repAgg[repId].completed_today += 1;
+
+          if (!repAgg[repId].last_completed_at) repAgg[repId].last_completed_at = String(a.completed_at);
+          else {
+            const prev = ts(repAgg[repId].last_completed_at);
+            const cur = ts(a.completed_at);
+            if (cur > prev) repAgg[repId].last_completed_at = String(a.completed_at);
+          }
+        }
+      }
+
+      const needsHelpToday = Object.values(repAgg)
+        .filter((r) => r.open > 0)
+        .sort((a, b) => {
+          if (b.overdue !== a.overdue) return b.overdue - a.overdue;
+          if (b.open !== a.open) return b.open - a.open;
+          const at = ts(a.last_completed_at);
+          const bt = ts(b.last_completed_at);
+          return at - bt; // oldest completion first
+        })
+        .slice(0, 5);
+
+      return res.json({
+        ok: true,
+        managerId,
+        window: { since24h, since7d },
+        completion: {
+          created_24h: created24.length,
+          completed_24h: completed24.length,
+          completion_rate_24h: pct(completed24.length, created24.length),
+          created_7d: created7.length,
+          completed_7d: completed7.length,
+          completion_rate_7d: pct(completed7.length, created7.length),
+        },
+        auto_completed: {
+          auto_24h: auto24.length,
+          auto_7d: auto7.length,
+        },
+        stuck: {
+          top_reason: topStuckReason,
+        },
+        needs_help_today: needsHelpToday,
+      });
+    } catch (e: any) {
+      return res.status(500).json({ ok: false, error: e?.message || "trust_failed" });
+    }
+  });
+
+  return r;
+}
+
+// -----------------------------
+// Reps: tiny self endpoint
+// -----------------------------
+
+export function repsRoutes() {
+  const r = Router();
+
+  // GET /v1/reps/me
+  // Returns lightweight XP summary for the currently authenticated rep.
+  r.get("/me", async (req: Request, res: Response) => {
+    try {
+      const supa = getSupaAdmin();
+
+      const userId = getUserId(req);
+      if (!userId) return res.status(401).json({ ok: false, error: "missing_user" });
+
+      // Total XP comes from reps.xp (safe default 0)
+      const { data: rep, error: repErr } = await supa
+        .from("reps")
+        .select("id,name,tier,xp")
+        .eq("id", userId)
+        .maybeSingle();
+
+      if (repErr) return res.status(500).json({ ok: false, error: repErr.message });
+
+      const xp_total = Number((rep as any)?.xp) || 0;
+
+      // XP today: sum rep_xp_events.xp since start of day (best-effort)
+      let xp_today = 0;
+      try {
+        const start = new Date();
+        start.setHours(0, 0, 0, 0);
+
+        const { data: events, error: evErr } = await supa
+          .from("rep_xp_events")
+          .select("xp,created_at")
+          .eq("rep_id", userId)
+          .gte("created_at", start.toISOString());
+
+        if (!evErr && Array.isArray(events)) {
+          xp_today = events.reduce((sum: number, e: any) => sum + (Number(e?.xp) || 0), 0);
+        }
+      } catch {
+        // ignore
+      }
+
+      return res.json({
+        ok: true,
+        rep: {
+          id: String((rep as any)?.id || userId),
+          name: (rep as any)?.name ?? null,
+          tier: (rep as any)?.tier ?? null,
+          xp_total,
+          xp_today,
+        },
+      });
+    } catch (e: any) {
+      return res.status(500).json({ ok: false, error: e?.message || "reps_me_failed" });
+    }
   });
 
   return r;

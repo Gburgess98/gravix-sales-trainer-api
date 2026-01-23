@@ -940,6 +940,8 @@ router.post("/score", express.json(), async (req, res) => {
     // MODE 1 — REAL SESSION SCORING
     // -----------------------------
     if (typeof sessionId === "string" && sessionId.trim().length) {
+      ;(global as any).__last_completed_count = 0;
+      ;(global as any).__last_xp_awarded_total = 0;
       const { data: row, error: selErr } = await supa
         .from("sparring_sessions")
         .select(
@@ -1179,17 +1181,19 @@ router.post("/score", express.json(), async (req, res) => {
             type: "sparring",
             targetId: personaIdForAssign || null,
             completedVia: "sparring",
+            xpAwarded: finalXpAwarded,
           });
 
-          // Only log auto_completed when something actually completed
           const completedCount =
             typeof (result as any)?.completedCount === "number"
               ? (result as any).completedCount
-              : typeof (result as any)?.completed_count === "number"
-                ? (result as any).completed_count
-                : typeof (result as any)?.count === "number"
-                  ? (result as any).count
-                  : null;
+              : 0;
+          const xpAwardedTotal =
+            typeof (result as any)?.xpAwardedTotal === "number"
+              ? (result as any).xpAwardedTotal
+              : 0;
+          ;(global as any).__last_completed_count = completedCount;
+          ;(global as any).__last_xp_awarded_total = xpAwardedTotal;
 
           if (completedCount && completedCount > 0) {
             console.info("[assignments:lifecycle]", {
@@ -1200,6 +1204,7 @@ router.post("/score", express.json(), async (req, res) => {
               target_id: personaIdForAssign || null,
               session_id: sessionId,
               completed_count: completedCount,
+              xp_awarded_total: xpAwardedTotal,
             });
           } else {
             console.info("[assignments:lifecycle]", {
@@ -1209,6 +1214,7 @@ router.post("/score", express.json(), async (req, res) => {
               assignment_id: safeAssignmentId || null,
               target_id: personaIdForAssign || null,
               session_id: sessionId,
+              xp_awarded_total: xpAwardedTotal,
             });
           }
         }
@@ -1222,111 +1228,21 @@ router.post("/score", express.json(), async (req, res) => {
       }
 
       // -----------------------------
-      // XP awarding (SAFE + IDEMPOTENT)
-      // - Only commit XP to reps/xp_events once per session
-      // - Session already stores xp_awarded; this is the real "grant"
+      // XP GRANT SOURCE OF TRUTH
+      // XP is awarded via assignment completion (rep_xp_events) in completeAssignmentsForTarget.
+      // Do NOT also insert into xp_events or increment reps.xp here (prevents double-award).
       // -----------------------------
-      try {
-        const repIdForXp = String((updatedRow as any).rep_id || "").trim();
-        const metaNow =
-          (updatedRow as any)?.meta && typeof (updatedRow as any).meta === "object"
-            ? ((updatedRow as any).meta as Record<string, any>)
-            : {};
 
-        const already = Boolean(metaNow?.xp_committed);
-        const amount = Number.isFinite(Number(finalXpAwarded)) ? Number(finalXpAwarded) : 0;
-
-        if (!already && repIdForXp && repIdForXp.length > 10 && amount > 0) {
-          const nowIso = new Date().toISOString();
-          console.info("[xp:lifecycle]", {
-            event: "xp_commit_attempt",
-            source: "sparring",
-            rep_id: repIdForXp,
-            session_id: sessionId,
-            amount,
-          });
-
-          // 1) Insert XP event (audit trail)
-          try {
-            const { error: xpEventErr } = await supa
-              .from("xp_events")
-              .insert({
-                id: uuidv4(),
-                rep_id: repIdForXp,
-                source: "sparring",
-                delta: amount,
-                amount,
-                session_id: sessionId,
-                created_at: nowIso,
-              } as any);
-
-            if (xpEventErr) {
-              console.warn("[xp:lifecycle] xp_events insert failed", xpEventErr);
-            }
-          } catch (e: any) {
-            console.warn("[xp:lifecycle] xp_events insert threw", e?.message || e);
-          }
-
-          // 2) Increment reps.xp (leaderboards / totals)
-          try {
-            const { error: incErr } = await supa.rpc("increment_rep_xp", {
-              p_rep_id: repIdForXp,
-              p_delta: amount,
-            });
-
-            if (incErr) {
-              console.warn("[xp:lifecycle] increment_rep_xp rpc failed", incErr);
-            }
-          } catch (e: any) {
-            console.warn("[xp:lifecycle] increment_rep_xp threw", e?.message || e);
-          }
-
-          // 3) Mark committed in session meta (guard against double-awards)
-          try {
-            const committedMeta = {
-              ...metaNow,
-              xp_committed: true,
-              xp_committed_amount: amount,
-              xp_committed_at: nowIso,
-              xp_committed_source: "sparring",
-            };
-
-            await supa
-              .from("sparring_sessions")
-              .update({ meta: committedMeta } as any)
-              .eq("id", sessionId);
-
-            // Keep response in sync
-            (updatedRow as any).meta = committedMeta;
-          } catch (e: any) {
-            console.warn("[xp:lifecycle] session meta commit flag update failed", e?.message || e);
-          }
-
-          console.info("[xp:lifecycle]", {
-            event: "xp_committed",
-            source: "sparring",
-            rep_id: repIdForXp,
-            session_id: sessionId,
-            amount,
-          });
-        } else {
-          console.info("[xp:lifecycle]", {
-            event: "xp_commit_skip",
-            source: "sparring",
-            rep_id: repIdForXp || null,
-            session_id: sessionId,
-            already_committed: already,
-            amount,
-          });
-        }
-      } catch (e: any) {
-        console.warn("[xp:lifecycle]", {
-          event: "xp_commit_failed",
-          source: "sparring",
-          session_id: sessionId,
-          error: e?.message || e,
-        });
-      }
+      // If assignment completion ran, these are set inside the auto-complete try-block.
+      // Default to 0 for safety.
+      const completed_count_safe =
+        typeof (global as any).__last_completed_count === "number"
+          ? (global as any).__last_completed_count
+          : 0;
+      const xp_awarded_total_safe =
+        typeof (global as any).__last_xp_awarded_total === "number"
+          ? (global as any).__last_xp_awarded_total
+          : 0;
 
       return res.json({
         ok: true,
@@ -1336,7 +1252,11 @@ router.post("/score", express.json(), async (req, res) => {
         xp_multiplier_used: mult,
         xp_global_multiplier_used: globalMult,
         xp_bonus_used: bonus,
-        xp_awarded: finalXpAwarded,
+        // Top-level xp_awarded reflects COMMITTED rep XP (assignment completion), not session scoring intent.
+        xp_awarded: xp_awarded_total_safe,
+        xp_awarded_total: xp_awarded_total_safe,
+        completed_count: completed_count_safe,
+        // Keep outcome + session XP available via session.xp_awarded
         outcome,
       });
     }

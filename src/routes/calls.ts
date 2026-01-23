@@ -307,6 +307,10 @@ router.post("/:id/score", async (req, res) => {
     const requester = getUserIdHeader(req);
     const body = ScoreSchema.parse(req.body);
 
+    // Back-compat: allow assignmentId via query string too
+    const assignmentIdFromQuery = typeof req.query.assignmentId === "string" ? req.query.assignmentId : undefined;
+    const effectiveAssignmentId = body.assignmentId || assignmentIdFromQuery || undefined;
+
     // verify ownership
     const { data: call, error: callErr } = await supa
       .from("calls")
@@ -336,6 +340,8 @@ router.post("/:id/score", async (req, res) => {
     // If the client passed assignmentId, we complete that.
     // Otherwise, we fall back to matching targetId (call id) or latest open call_review.
     // Award baseline XP based on score band.
+    let completedCount = 0;
+    let xpAwardedTotal = 0;
     try {
       const score = Number(body.score_overall);
       const xpAwarded = Number.isFinite(score)
@@ -348,7 +354,7 @@ router.post("/:id/score", async (req, res) => {
 
       const result = await completeAssignmentsForTarget({
         repId: call.user_id,
-        assignmentId: body.assignmentId || null,
+        assignmentId: effectiveAssignmentId || null,
         type: "call_review",
         targetId: id,
         completedVia: "call_review",
@@ -357,16 +363,25 @@ router.post("/:id/score", async (req, res) => {
         metaPatch: { call_id: id, score_overall: body.score_overall },
       });
 
+      completedCount =
+        typeof (result as any)?.completedCount === "number"
+          ? (result as any).completedCount
+          : 0;
+      xpAwardedTotal =
+        typeof (result as any)?.xpAwardedTotal === "number"
+          ? (result as any).xpAwardedTotal
+          : 0;
+
       if (result?.completedCount) {
         console.info("[assignments:lifecycle]", {
           event: "auto_completed",
           via: "call_review",
           rep_id: call.user_id,
           call_id: id,
-          assignment_id: body.assignmentId || null,
+          assignment_id: effectiveAssignmentId || null,
           completed_count: result.completedCount,
           method: result.method || null,
-          xp_awarded: xpAwarded,
+          xp_awarded: xpAwardedTotal,
         });
       } else {
         console.info("[assignments:lifecycle]", {
@@ -374,7 +389,7 @@ router.post("/:id/score", async (req, res) => {
           via: "call_review",
           rep_id: call.user_id,
           call_id: id,
-          assignment_id: body.assignmentId || null,
+          assignment_id: effectiveAssignmentId || null,
           reason: result?.reason || "no_matching_open_assignment",
         });
       }
@@ -384,7 +399,7 @@ router.post("/:id/score", async (req, res) => {
         via: "call_review",
         rep_id: call.user_id,
         call_id: id,
-        assignment_id: body.assignmentId || null,
+        assignment_id: effectiveAssignmentId || null,
         error: e?.message || String(e),
       });
     }
@@ -402,7 +417,16 @@ router.post("/:id/score", async (req, res) => {
       console.warn("[score history] insert failed", histErr);
     }
 
-    res.json({ ok: true, call: data });
+    res.json({
+      ok: true,
+      call: data,
+      assignment: effectiveAssignmentId
+        ? { assignmentId: effectiveAssignmentId, via: "call_review" }
+        : undefined,
+      completed_count: completedCount,
+      xp_awarded: xpAwardedTotal,
+      xp_awarded_total: xpAwardedTotal,
+    });
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }

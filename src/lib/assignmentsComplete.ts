@@ -7,19 +7,45 @@ type AssignmentType = "sparring" | "call_review" | "custom";
 async function awardXp(opts: {
   repId: string;
   xp: number;
-  source: "sparring" | "call_review";
+  source: "sparring" | "call_review" | "custom";
+  assignmentId: string;
 }) {
-  const { repId, xp, source } = opts;
-  if (!repId || !xp || xp <= 0) return;
+  const { repId, xp, source, assignmentId } = opts;
+  if (!repId || !assignmentId || !xp || xp <= 0) return { xpAwarded: 0 };
 
   const supa = getSupa();
 
-  await supa.from("rep_xp_events").insert({
+  // Idempotency guard: if we already logged XP for this assignment, do nothing.
+  // (Requires rep_xp_events.assignment_id — if missing, this will harmlessly fail and we’ll fall back to insert.)
+  try {
+    const existing = await supa
+      .from("rep_xp_events")
+      .select("id")
+      .eq("assignment_id", assignmentId)
+      .limit(1)
+      .maybeSingle();
+
+    if (!existing.error && existing.data?.id) {
+      return { xpAwarded: 0 };
+    }
+  } catch {
+    // ignore
+  }
+
+  const { error } = await supa.from("rep_xp_events").insert({
     rep_id: repId,
     xp,
     source,
+    assignment_id: assignmentId,
     created_at: new Date().toISOString(),
-  });
+  } as any);
+
+  if (error) {
+    // If a unique constraint exists, duplicates will land here too.
+    return { xpAwarded: 0, error: error.message };
+  }
+
+  return { xpAwarded: xp };
 }
 
 function getSupa() {
@@ -55,16 +81,35 @@ async function markCompletedById(opts: {
   const { data, error } = await q.select("id");
   if (error) throw error;
 
+  let xpAwardedTotal = 0;
+
   if ((data || []).length > 0 && type) {
-    if (type === "sparring") {
-      await awardXp({ repId, xp: 50, source: "sparring" });
-    }
-    if (type === "call_review") {
-      await awardXp({ repId, xp: 25, source: "call_review" });
+    const ids = (data || []).map((r: any) => r.id).filter(Boolean);
+
+    for (const id of ids) {
+      if (type === "sparring") {
+        const xpRes = await awardXp({
+          repId,
+          xp: 50,
+          source: "sparring",
+          assignmentId: String(id),
+        });
+        xpAwardedTotal += Number((xpRes as any)?.xpAwarded || 0);
+      }
+      if (type === "call_review") {
+        const xpRes = await awardXp({
+          repId,
+          xp: 25,
+          source: "call_review",
+          assignmentId: String(id),
+        });
+        xpAwardedTotal += Number((xpRes as any)?.xpAwarded || 0);
+      }
     }
   }
 
-  return { ok: true as const, updated: (data || []).length };
+  const updated = (data || []).length;
+  return { ok: true as const, updated, completedCount: updated, xpAwardedTotal };
 }
 
 async function markCompletedLatestAssigned(opts: {
@@ -110,7 +155,7 @@ export async function completeAssignmentsForTarget(opts: {
   targetId: string | null;
   assignmentId?: string | null;
   completedBy?: CompletedBy;
-}) {
+}): Promise<{ ok: true; updated: number; completedCount: number; xpAwardedTotal: number }> {
   const {
     repId,
     type,
@@ -119,23 +164,28 @@ export async function completeAssignmentsForTarget(opts: {
     completedBy = "system",
   } = opts;
 
-  if (!repId) return;
+  if (!repId) return { ok: true as const, updated: 0, completedCount: 0, xpAwardedTotal: 0 };
 
   // 1) Exact assignment completion (best signal)
   if (assignmentId) {
-    await markCompletedById({
+    const result = await markCompletedById({
       assignmentId,
       repId,
       type,
       completedBy,
     });
-    return;
+    return {
+      ok: true as const,
+      updated: result.updated,
+      completedCount: (result as any).completedCount ?? result.updated,
+      xpAwardedTotal: (result as any).xpAwardedTotal ?? 0,
+    };
   }
 
   // 2) Back-compat: complete by target match
   const supa = getSupa();
 
-  const { error } = await supa
+  const { data, error } = await supa
     .from("assignments")
     .update({
       status: "completed",
@@ -145,16 +195,40 @@ export async function completeAssignmentsForTarget(opts: {
     .eq("rep_id", repId)
     .eq("type", type)
     .eq("target_id", targetId)
-    .neq("status", "completed");
+    .neq("status", "completed")
+    .select("id");
 
   if (error) throw error;
 
-  if (type === "sparring") {
-    await awardXp({ repId, xp: 50, source: "sparring" });
+  const updated = (data || []).length;
+  let xpAwardedTotal = 0;
+
+  if (updated > 0) {
+    const ids = (data || []).map((r: any) => r.id).filter(Boolean);
+
+    for (const id of ids) {
+      if (type === "sparring") {
+        const xpRes = await awardXp({
+          repId,
+          xp: 50,
+          source: "sparring",
+          assignmentId: String(id),
+        });
+        xpAwardedTotal += Number((xpRes as any)?.xpAwarded || 0);
+      }
+      if (type === "call_review") {
+        const xpRes = await awardXp({
+          repId,
+          xp: 25,
+          source: "call_review",
+          assignmentId: String(id),
+        });
+        xpAwardedTotal += Number((xpRes as any)?.xpAwarded || 0);
+      }
+    }
   }
-  if (type === "call_review") {
-    await awardXp({ repId, xp: 25, source: "call_review" });
-  }
+
+  return { ok: true as const, updated, completedCount: updated, xpAwardedTotal };
 }
 
 /**
@@ -183,9 +257,6 @@ export async function completeCallReviewOnScore(opts: {
       type: "call_review",
       completedBy,
     });
-    if (result.updated > 0) {
-      await awardXp({ repId, xp: 25, source: "call_review" });
-    }
     return result;
   }
 
@@ -206,7 +277,6 @@ export async function completeCallReviewOnScore(opts: {
 
   if (error) throw error;
   if ((data || []).length > 0) {
-    await awardXp({ repId, xp: 25, source: "call_review" });
     return { ok: true as const, updated: (data || []).length };
   }
 
@@ -216,9 +286,6 @@ export async function completeCallReviewOnScore(opts: {
     type: "call_review",
     completedBy,
   });
-  if (result.updated > 0) {
-    await awardXp({ repId, xp: 25, source: "call_review" });
-  }
   return result;
 }
 
@@ -245,9 +312,6 @@ export async function completeSparringOnComplete(opts: {
       type: "sparring",
       completedBy,
     });
-    if (result.updated > 0) {
-      await awardXp({ repId, xp: 50, source: "sparring" });
-    }
     return result;
   }
 
@@ -256,8 +320,5 @@ export async function completeSparringOnComplete(opts: {
     type: "sparring",
     completedBy,
   });
-  if (result.updated > 0) {
-    await awardXp({ repId, xp: 50, source: "sparring" });
-  }
   return result;
 }
