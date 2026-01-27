@@ -35,8 +35,8 @@ router.get("/contacts", async (req, res) => {
     // id (uuid), first_name, last_name, email (unique per tenant), account_id (uuid, nullable), user_id (owner/tenant)
     // Optional: an 'accounts' table with id, name, domain.
     const { data: contacts, error } = await supa
-      .from("contacts")
-      .select("id, first_name, last_name, email, account_id")
+      .from("crm_contacts")
+      .select("id, first_name, last_name, email, account_id, last_contacted_at")
       .eq("user_id", requester)
       .or([
         `first_name.ilike.%${query}%`,
@@ -56,7 +56,7 @@ router.get("/contacts", async (req, res) => {
     let accountMap: Record<string, { name: string | null; domain: string | null }> = {};
     if (accountIds.length) {
       const { data: accounts, error: accErr } = await supa
-        .from("accounts")
+        .from("crm_accounts")
         .select("id, name, domain")
         .in("id", accountIds);
       if (accErr) throw accErr;
@@ -68,9 +68,91 @@ router.get("/contacts", async (req, res) => {
       name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim(),
       email: (c as any).email ?? null,
       company: c.account_id ? (accountMap[c.account_id]?.name ?? accountMap[c.account_id]?.domain ?? null) : null,
+      last_contacted_at: (c as any).last_contacted_at ?? null,
     }));
 
     res.json({ ok: true, items: shaped });
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+  }
+});
+
+/* ---------------------------------------------
+   GET /v1/crm/contacts/:id
+   - Fetch a single contact (owned by requester)
+---------------------------------------------- */
+router.get("/contacts/:id", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const id = String(req.params.id);
+    if (!UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
+
+    const { data: c, error: cErr } = await supa
+      .from("crm_contacts")
+      .select("id, first_name, last_name, email, company, last_contacted_at, created_at")
+      .eq("user_id", requester)
+      .eq("id", id)
+      .single();
+
+    if (cErr || !c) return res.status(404).json({ ok: false, error: "not_found" });
+
+    res.json({
+      ok: true,
+      contact: {
+        id: c.id,
+        first_name: c.first_name ?? null,
+        last_name: c.last_name ?? null,
+        email: c.email ?? null,
+        company: c.company ?? null,
+        last_contacted_at: c.last_contacted_at ?? null,
+        created_at: c.created_at ?? null,
+      },
+    });
+  } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+  }
+});
+
+/* ---------------------------------------------
+   GET /v1/crm/contacts/:id
+   - Fetch a single contact (owned by requester)
+   - Includes linked account (if any)
+---------------------------------------------- */
+router.get("/contacts/:id", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const id = String(req.params.id);
+    if (!UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
+
+    const { data: c, error: cErr } = await supa
+      .from("crm_contacts")
+      .select("id, first_name, last_name, email, account_id, last_contacted_at")
+      .eq("user_id", requester)
+      .eq("id", id)
+      .single();
+
+    if (cErr || !c) return res.status(404).json({ ok: false, error: "not_found" });
+
+    let account: { id: string; name: string | null; domain: string | null } | null = null;
+    if ((c as any).account_id) {
+      const { data: a, error: aErr } = await supa
+        .from("crm_accounts")
+        .select("id, name, domain")
+        .eq("id", (c as any).account_id)
+        .single();
+      if (!aErr && a) account = { id: a.id, name: (a as any).name ?? null, domain: (a as any).domain ?? null };
+    }
+
+    const contact = {
+      id: c.id,
+      first_name: (c as any).first_name ?? null,
+      last_name: (c as any).last_name ?? null,
+      email: (c as any).email ?? null,
+      account_id: (c as any).account_id ?? null,
+      last_contacted_at: (c as any).last_contacted_at ?? null,
+    };
+
+    res.json({ ok: true, contact, account });
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
@@ -112,7 +194,7 @@ router.post("/link-call", async (req, res) => {
     if (domain) {
       // assumes 'accounts' has unique constraint on (user_id, domain) or (user_id, name)
       const { data: acc, error: accErr } = await supa
-        .from("accounts")
+        .from("crm_accounts")
         .upsert(
           { user_id: requester, name: null, domain },
           { onConflict: "user_id,domain" }
@@ -125,7 +207,7 @@ router.post("/link-call", async (req, res) => {
 
     // 2) Upsert contact by email for this user
     const { data: contact, error: contactErr } = await supa
-      .from("contacts")
+      .from("crm_contacts")
       .upsert(
         { user_id: requester, email, account_id: accountId },
         { onConflict: "user_id,email" }
@@ -144,7 +226,7 @@ router.post("/link-call", async (req, res) => {
     };
 
     const { data: link, error: linkErr } = await supa
-      .from("call_links")
+      .from("crm_call_links")
       .upsert(linkRow, { onConflict: "call_id" })
       .select()
       .single();
@@ -179,7 +261,7 @@ router.get("/calls/:id/link", async (req, res) => {
 
     // get link
     const { data: link, error: linkErr } = await supa
-      .from("call_links")
+      .from("crm_call_links")
       .select("contact_id, account_id")
       .eq("call_id", id)
       .single();
@@ -189,10 +271,10 @@ router.get("/calls/:id/link", async (req, res) => {
     // fetch contact/account details (optional)
     const [contact, account] = await Promise.all([
       link.contact_id
-        ? supa.from("contacts").select("id, first_name, last_name, email").eq("id", link.contact_id).single()
+        ? supa.from("crm_contacts").select("id, first_name, last_name, email").eq("id", link.contact_id).single()
         : Promise.resolve({ data: null, error: null } as any),
       link.account_id
-        ? supa.from("accounts").select("id, name, domain").eq("id", link.account_id).single()
+        ? supa.from("crm_accounts").select("id, name, domain").eq("id", link.account_id).single()
         : Promise.resolve({ data: null, error: null } as any),
     ]);
 
