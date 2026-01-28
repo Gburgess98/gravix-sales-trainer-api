@@ -18,6 +18,37 @@ function getUserIdHeader(req: any): string {
   return uid;
 }
 
+/** ----------------------------------------------------------------
+ * Demo contacts (until DB is populated)
+ * ---------------------------------------------------------------- */
+type DemoContact = {
+  id: string;
+  first_name: string;
+  last_name: string;
+  email: string;
+  company?: string | null;
+  last_contacted_at?: string | null;
+};
+
+const DEMO_CONTACTS: DemoContact[] = [
+  { id: "c_anna", first_name: "Anna", last_name: "Rivera", email: "anna@demo.co", company: "Demo Co", last_contacted_at: null },
+  { id: "c_bob", first_name: "Bob", last_name: "Trent", email: "bob@demo.co", company: "Demo Co", last_contacted_at: null },
+  { id: "c_eric", first_name: "Eric", last_name: "Cole", email: "eric@demo.co", company: "Demo Co", last_contacted_at: null },
+  { id: "c_lena", first_name: "Lena", last_name: "Yao", email: "lena@demo.co", company: "Demo Co", last_contacted_at: null },
+  { id: "c_mark", first_name: "Mark", last_name: "Patel", email: "mark@demo.co", company: "Demo Co", last_contacted_at: null },
+  { id: "c_olga", first_name: "Olga", last_name: "Smith", email: "olga@demo.co", company: "Demo Co", last_contacted_at: null },
+];
+
+function shapeDemoContact(c: DemoContact) {
+  return {
+    id: c.id,
+    name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim(),
+    email: c.email ?? null,
+    company: c.company ?? null,
+    last_contacted_at: c.last_contacted_at ?? null,
+  };
+}
+
 /* ---------------------------------------------
    GET /v1/crm/contacts?query=&limit=
    - Search contacts by name/email (case-insensitive)
@@ -31,47 +62,43 @@ router.get("/contacts", async (req, res) => {
 
     if (!query) return res.json({ ok: true, items: [] });
 
-    // Assuming a 'contacts' table with:
-    // id (uuid), first_name, last_name, email (unique per tenant), account_id (uuid, nullable), user_id (owner/tenant)
-    // Optional: an 'accounts' table with id, name, domain.
+    // 1) Try DB first (if you later populate crm_contacts)
     const { data: contacts, error } = await supa
       .from("crm_contacts")
-      .select("id, first_name, last_name, email, account_id, last_contacted_at")
+      .select("id, first_name, last_name, email, company, last_contacted_at")
       .eq("user_id", requester)
-      .or([
-        `first_name.ilike.%${query}%`,
-        `last_name.ilike.%${query}%`,
-        `email.ilike.%${query}%`,
-      ].join(","))
+      .or(
+        [
+          `first_name.ilike.%${query}%`,
+          `last_name.ilike.%${query}%`,
+          `email.ilike.%${query}%`,
+          `company.ilike.%${query}%`,
+        ].join(",")
+      )
       .order("first_name", { ascending: true })
       .limit(limit);
 
-    if (error) throw error;
-    const items = contacts ?? [];
-
-    // get account names in one query if needed
-    const accountIds = Array.from(
-      new Set(items.map(x => x.account_id).filter(Boolean) as string[])
-    );
-    let accountMap: Record<string, { name: string | null; domain: string | null }> = {};
-    if (accountIds.length) {
-      const { data: accounts, error: accErr } = await supa
-        .from("crm_accounts")
-        .select("id, name, domain")
-        .in("id", accountIds);
-      if (accErr) throw accErr;
-      accountMap = Object.fromEntries((accounts ?? []).map(a => [a.id, { name: a.name ?? null, domain: a.domain ?? null }]));
+    if (!error && (contacts?.length ?? 0) > 0) {
+      const shaped = (contacts ?? []).map((c: any) => ({
+        id: c.id,
+        name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim(),
+        email: c.email ?? null,
+        company: c.company ?? null,
+        last_contacted_at: c.last_contacted_at ?? null,
+      }));
+      return res.json({ ok: true, items: shaped });
     }
 
-    const shaped = items.map(c => ({
-      id: c.id,
-      name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim(),
-      email: (c as any).email ?? null,
-      company: c.account_id ? (accountMap[c.account_id]?.name ?? accountMap[c.account_id]?.domain ?? null) : null,
-      last_contacted_at: (c as any).last_contacted_at ?? null,
-    }));
+    // 2) Demo fallback (so the UI can ship today)
+    const q = query.toLowerCase();
+    const demo = DEMO_CONTACTS.filter((c) => {
+      const hay = `${c.first_name} ${c.last_name} ${c.email} ${c.company ?? ""}`.toLowerCase();
+      return hay.includes(q);
+    })
+      .slice(0, limit)
+      .map(shapeDemoContact);
 
-    res.json({ ok: true, items: shaped });
+    return res.json({ ok: true, items: demo });
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
@@ -80,11 +107,34 @@ router.get("/contacts", async (req, res) => {
 /* ---------------------------------------------
    GET /v1/crm/contacts/:id
    - Fetch a single contact (owned by requester)
+   - Supports demo ids (c_*) until DB is populated
 ---------------------------------------------- */
 router.get("/contacts/:id", async (req, res) => {
   try {
     const requester = getUserIdHeader(req);
     const id = String(req.params.id);
+
+    // Demo id path
+    if (id.startsWith("c_")) {
+      const found = DEMO_CONTACTS.find((c) => c.id === id);
+      if (!found) return res.status(404).json({ ok: false, error: "not_found" });
+
+      return res.json({
+        ok: true,
+        contact: {
+          id: found.id,
+          first_name: found.first_name ?? null,
+          last_name: found.last_name ?? null,
+          email: found.email ?? null,
+          company: found.company ?? null,
+          last_contacted_at: found.last_contacted_at ?? null,
+          created_at: null,
+        },
+        account: null,
+      });
+    }
+
+    // Real DB UUID path
     if (!UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
 
     const { data: c, error: cErr } = await supa
@@ -96,63 +146,19 @@ router.get("/contacts/:id", async (req, res) => {
 
     if (cErr || !c) return res.status(404).json({ ok: false, error: "not_found" });
 
-    res.json({
+    return res.json({
       ok: true,
       contact: {
         id: c.id,
-        first_name: c.first_name ?? null,
-        last_name: c.last_name ?? null,
-        email: c.email ?? null,
-        company: c.company ?? null,
-        last_contacted_at: c.last_contacted_at ?? null,
-        created_at: c.created_at ?? null,
+        first_name: (c as any).first_name ?? null,
+        last_name: (c as any).last_name ?? null,
+        email: (c as any).email ?? null,
+        company: (c as any).company ?? null,
+        last_contacted_at: (c as any).last_contacted_at ?? null,
+        created_at: (c as any).created_at ?? null,
       },
+      account: null,
     });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
-  }
-});
-
-/* ---------------------------------------------
-   GET /v1/crm/contacts/:id
-   - Fetch a single contact (owned by requester)
-   - Includes linked account (if any)
----------------------------------------------- */
-router.get("/contacts/:id", async (req, res) => {
-  try {
-    const requester = getUserIdHeader(req);
-    const id = String(req.params.id);
-    if (!UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
-
-    const { data: c, error: cErr } = await supa
-      .from("crm_contacts")
-      .select("id, first_name, last_name, email, account_id, last_contacted_at")
-      .eq("user_id", requester)
-      .eq("id", id)
-      .single();
-
-    if (cErr || !c) return res.status(404).json({ ok: false, error: "not_found" });
-
-    let account: { id: string; name: string | null; domain: string | null } | null = null;
-    if ((c as any).account_id) {
-      const { data: a, error: aErr } = await supa
-        .from("crm_accounts")
-        .select("id, name, domain")
-        .eq("id", (c as any).account_id)
-        .single();
-      if (!aErr && a) account = { id: a.id, name: (a as any).name ?? null, domain: (a as any).domain ?? null };
-    }
-
-    const contact = {
-      id: c.id,
-      first_name: (c as any).first_name ?? null,
-      last_name: (c as any).last_name ?? null,
-      email: (c as any).email ?? null,
-      account_id: (c as any).account_id ?? null,
-      last_contacted_at: (c as any).last_contacted_at ?? null,
-    };
-
-    res.json({ ok: true, contact, account });
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
@@ -163,8 +169,7 @@ router.get("/contacts/:id", async (req, res) => {
    Body: { callId: uuid, email: string }
    - Ensure the caller owns the call
    - Upsert contact by email (for this user)
-   - Upsert account by email domain (optional)
-   - Link call → contact (+account) in call_links
+   - Link call → contact in crm_call_links
 ---------------------------------------------- */
 const LinkCallSchema = z.object({
   callId: z.string().uuid(),
@@ -180,126 +185,146 @@ router.post("/link-call", async (req, res) => {
     // Verify the call belongs to the requester
     const { data: call, error: callErr } = await supa
       .from("calls")
-      .select("id, user_id, filename")
+      .select("id, user_id")
       .eq("id", callId)
       .single();
 
     if (callErr || !call) return res.status(404).json({ ok: false, error: "call_not_found" });
-    if (call.user_id !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
+    if ((call as any).user_id !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
 
-    const domain = email.split("@")[1]?.toLowerCase() ?? null;
+    // Upsert contact by email for this user (note: your crm_contacts has UNIQUE(email) currently)
+    // If email is globally unique, this will fail across users. For now, we keep it simple:
+    // - attempt insert
+    // - if conflict, select existing by email
+    const insertAttempt = await supa
+      .from("crm_contacts")
+      .insert({ user_id: requester, email })
+      .select("id")
+      .single();
 
-    // 1) Upsert account by domain (optional; skip if you don't want auto-account)
-    let accountId: string | null = null;
-    if (domain) {
-      // assumes 'accounts' has unique constraint on (user_id, domain) or (user_id, name)
-      const { data: acc, error: accErr } = await supa
-        .from("crm_accounts")
-        .upsert(
-          { user_id: requester, name: null, domain },
-          { onConflict: "user_id,domain" }
-        )
-        .select()
+    let contactId: string | null = null;
+
+    if (!insertAttempt.error && insertAttempt.data) {
+      contactId = (insertAttempt.data as any).id;
+    } else {
+      const { data: existing, error: exErr } = await supa
+        .from("crm_contacts")
+        .select("id")
+        .eq("email", email)
         .single();
-      if (accErr) throw accErr;
-      accountId = acc?.id ?? null;
+      if (exErr || !existing) throw insertAttempt.error ?? exErr;
+      contactId = (existing as any).id;
     }
 
-    // 2) Upsert contact by email for this user
-    const { data: contact, error: contactErr } = await supa
-      .from("crm_contacts")
-      .upsert(
-        { user_id: requester, email, account_id: accountId },
-        { onConflict: "user_id,email" }
-      )
-      .select()
-      .single();
-
-    if (contactErr) throw contactErr;
-
-    // 3) Link the call → contact/account (assumes call_links table with unique (call_id))
-    // call_links: id, call_id (unique), contact_id, account_id, created_at
-    const linkRow: any = {
-      call_id: callId,
-      contact_id: contact.id,
-      account_id: accountId,
-    };
-
-    const { data: link, error: linkErr } = await supa
+    const { error: linkErr } = await supa
       .from("crm_call_links")
-      .upsert(linkRow, { onConflict: "call_id" })
-      .select()
-      .single();
+      .upsert({ call_id: callId, contact_id: contactId }, { onConflict: "call_id" });
 
     if (linkErr) throw linkErr;
 
-    res.json({ ok: true, link: { contact_id: contact.id, account_id: accountId } });
+    res.json({ ok: true, link: { contact_id: contactId } });
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
 });
 
 /* ---------------------------------------------
-   GET /v1/crm/calls/:id/link
-   - Read linked contact/account for a call
+   CONTACT NOTES
+   - Simple rep notes per contact
 ---------------------------------------------- */
-router.get("/calls/:id/link", async (req, res) => {
+const NoteImportanceSchema = z.enum(["normal", "important", "critical"]);
+const CreateNoteSchema = z.object({
+  body: z.string().trim().min(1),
+  // Optional client-provided display name (denormalised). Safe because it’s just text.
+  author_name: z.string().trim().min(1).max(120).optional(),
+  importance: NoteImportanceSchema.optional(),
+});
+
+/* GET /v1/crm/contacts/:id/notes */
+router.get("/contacts/:id/notes", async (req, res) => {
   try {
     const requester = getUserIdHeader(req);
-    const id = String(req.params.id);
-    if (!UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid id" });
+    const contactId = String(req.params.id ?? "").trim();
+    if (!contactId) return res.status(400).json({ ok: false, error: "invalid_contact_id" });
 
-    // verify call ownership
-    const { data: call, error: callErr } = await supa
-      .from("calls")
-      .select("id, user_id")
-      .eq("id", id)
-      .single();
+    const { data, error } = await supa
+      .from("crm_contact_notes")
+      .select("id, body, created_at, author_id, author_name, importance")
+      .eq("contact_id", contactId)
+      .eq("user_id", requester)
+      .order("created_at", { ascending: false });
 
-    if (callErr || !call) return res.status(404).json({ ok: false, error: "call_not_found" });
-    if (call.user_id !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
+    if (error) throw error;
 
-    // get link
-    const { data: link, error: linkErr } = await supa
-      .from("crm_call_links")
-      .select("contact_id, account_id")
-      .eq("call_id", id)
-      .single();
-
-    if (linkErr || !link) return res.json({ ok: true, link: null });
-
-    // fetch contact/account details (optional)
-    const [contact, account] = await Promise.all([
-      link.contact_id
-        ? supa.from("crm_contacts").select("id, first_name, last_name, email").eq("id", link.contact_id).single()
-        : Promise.resolve({ data: null, error: null } as any),
-      link.account_id
-        ? supa.from("crm_accounts").select("id, name, domain").eq("id", link.account_id).single()
-        : Promise.resolve({ data: null, error: null } as any),
-    ]);
-
-    const shaped = {
-      contact: contact?.data
-        ? {
-          id: contact.data.id,
-          first_name: (contact.data as any).first_name ?? null,
-          last_name: (contact.data as any).last_name ?? null,
-          email: (contact.data as any).email ?? null,
-        }
-        : null,
-      account: account?.data
-        ? {
-          id: account.data.id,
-          name: (account.data as any).name ?? null,
-          domain: (account.data as any).domain ?? null,
-        }
-        : null,
-      opportunity: null, // reserved for future
-    };
-
-    res.json({ ok: true, link: shaped });
+    return res.json({ ok: true, notes: data ?? [] });
   } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+  }
+});
+
+/* POST /v1/crm/contacts/:id/notes
+   Body: { body: string, importance?: 'normal'|'important'|'critical' }
+*/
+router.post("/contacts/:id/notes", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const contactId = String(req.params.id ?? "").trim();
+    if (!contactId) return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+
+    const parsed = CreateNoteSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ ok: false, error: "invalid_body" });
+    }
+
+    const body = parsed.data.body;
+    const importance = parsed.data.importance ?? "normal";
+
+    // author (server-truth)
+    const authorId = requester;
+
+    // best-effort rep name lookup (safe if it fails)
+    let authorName: string | null = null;
+    try {
+      const { data: rep } = await supa
+        .from("reps")
+        .select("name, full_name, first_name, last_name, email, user_id, id")
+        .or(`user_id.eq.${authorId},id.eq.${authorId}`)
+        .limit(1)
+        .maybeSingle();
+
+      if (rep) {
+        authorName =
+          (rep as any).full_name ||
+          (rep as any).name ||
+          [(rep as any).first_name, (rep as any).last_name].filter(Boolean).join(" ") ||
+          (rep as any).email ||
+          null;
+      }
+    } catch {
+      // ignore lookup errors
+    }
+
+    // after the rep lookup try/catch
+    authorName = authorName ?? parsed.data.author_name ?? "Rep";
+
+    const { data, error } = await supa
+      .from("crm_contact_notes")
+      .insert({
+        contact_id: contactId,
+        user_id: requester,
+        body,
+        author_id: authorId,
+        author_name: authorName,
+        importance,
+      })
+      .select("id, body, created_at, author_id, author_name, importance")
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ ok: true, note: data });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
 });
 
