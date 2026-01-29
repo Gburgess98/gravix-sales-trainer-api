@@ -18,6 +18,50 @@ function getUserIdHeader(req: any): string {
   return uid;
 }
 
+// Helper for safe contacts query (handles last_contacted_at column missing)
+async function selectContactsSafe(args: {
+  requester: string;
+  query: string;
+  limit: number;
+}) {
+  const { requester, query, limit } = args;
+
+  const orFilter =
+    `first_name.ilike.%${query}%` +
+    `,last_name.ilike.%${query}%` +
+    `,email.ilike.%${query}%` +
+    `,company.ilike.%${query}%`;
+
+  // Try with last_contacted_at first (if column exists)
+  const attempt1 = await supa
+    .from("crm_contacts")
+    .select("id, first_name, last_name, email, company, last_contacted_at, created_at")
+    .eq("user_id", requester)
+    .or(orFilter)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (!attempt1.error) return { rows: attempt1.data ?? [], hasLastContacted: true };
+
+  // If the error is "column ... does not exist", retry without it
+  const msg = String((attempt1.error as any)?.message ?? "");
+  if (msg.toLowerCase().includes("last_contacted_at") && msg.toLowerCase().includes("does not exist")) {
+    const attempt2 = await supa
+      .from("crm_contacts")
+      .select("id, first_name, last_name, email, company, created_at")
+      .eq("user_id", requester)
+      .or(orFilter)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (attempt2.error) throw attempt2.error;
+    return { rows: attempt2.data ?? [], hasLastContacted: false };
+  }
+
+  // Any other error: surface it
+  throw attempt1.error;
+}
+
 /** ----------------------------------------------------------------
  * Demo contacts (until DB is populated)
  * ---------------------------------------------------------------- */
@@ -57,39 +101,54 @@ function shapeDemoContact(c: DemoContact) {
 router.get("/contacts", async (req, res) => {
   try {
     const requester = getUserIdHeader(req);
-    const query = String(req.query.query ?? "").trim();
+
+    // Accept a few param aliases to avoid silent empty-query bugs.
+    const raw =
+      (req.query.query as any) ??
+      (req.query.q as any) ??
+      (req.query.term as any) ??
+      (req.query.search as any) ??
+      "";
+
+    const query = String(Array.isArray(raw) ? raw[0] : raw).trim();
     const limit = Math.min(Math.max(Number(req.query.limit ?? 12), 1), 50);
 
+    // Empty query => empty list (never spam demo)
     if (!query) return res.json({ ok: true, items: [] });
 
-    // 1) Try DB first (if you later populate crm_contacts)
-    const { data: contacts, error } = await supa
-      .from("crm_contacts")
-      .select("id, first_name, last_name, email, company, last_contacted_at")
-      .eq("user_id", requester)
-      .or(
-        [
-          `first_name.ilike.%${query}%`,
-          `last_name.ilike.%${query}%`,
-          `email.ilike.%${query}%`,
-          `company.ilike.%${query}%`,
-        ].join(",")
-      )
-      .order("first_name", { ascending: true })
-      .limit(limit);
+    // --- DB search first ---
+    try {
+      const { rows, hasLastContacted } = await selectContactsSafe({ requester, query, limit });
 
-    if (!error && (contacts?.length ?? 0) > 0) {
-      const shaped = (contacts ?? []).map((c: any) => ({
-        id: c.id,
-        name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim(),
-        email: c.email ?? null,
-        company: c.company ?? null,
-        last_contacted_at: c.last_contacted_at ?? null,
-      }));
-      return res.json({ ok: true, items: shaped });
+      if (rows.length) {
+        const shaped = rows.map((c: any) => ({
+          id: c.id,
+          name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim(),
+          email: c.email ?? null,
+          company: c.company ?? null,
+          last_contacted_at: hasLastContacted ? (c.last_contacted_at ?? null) : null,
+        }));
+
+        return res.json({ ok: true, items: shaped });
+      }
+
+      // No matches — if this user has ANY real contacts, return empty (no demo pollution)
+      const { data: anyReal, error: anyErr } = await supa
+        .from("crm_contacts")
+        .select("id")
+        .eq("user_id", requester)
+        .limit(1);
+
+      if (!anyErr && (anyReal?.length ?? 0) > 0) {
+        return res.json({ ok: true, items: [] });
+      }
+      // else: user has zero real contacts => allow demo fallback below
+    } catch (err: any) {
+      // If DB query fails, fail closed (empty) rather than showing demo noise.
+      return res.status(500).json({ ok: false, error: err?.message ?? "contacts_query_failed" });
     }
 
-    // 2) Demo fallback (so the UI can ship today)
+    // --- Demo fallback ONLY when user has zero real contacts ---
     const q = query.toLowerCase();
     const demo = DEMO_CONTACTS.filter((c) => {
       const hay = `${c.first_name} ${c.last_name} ${c.email} ${c.company ?? ""}`.toLowerCase();
@@ -98,9 +157,10 @@ router.get("/contacts", async (req, res) => {
       .slice(0, limit)
       .map(shapeDemoContact);
 
+    // If demo doesn't match the query, return empty (never return all demo rows)
     return res.json({ ok: true, items: demo });
   } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
 });
 
@@ -139,14 +199,39 @@ router.get("/contacts/:id", async (req, res) => {
     // Real DB UUID path
     if (!UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
 
-    const { data: c, error: cErr } = await supa
-      .from("crm_contacts")
-      .select("id, first_name, last_name, email, company, last_contacted_at, created_at")
-      .eq("user_id", requester)
-      .eq("id", id)
-      .single();
+    let c: any = null;
 
-    if (cErr || !c) return res.status(404).json({ ok: false, error: "not_found" });
+    try {
+      const a1 = await supa
+        .from("crm_contacts")
+        .select("id, first_name, last_name, email, company, last_contacted_at, created_at")
+        .eq("user_id", requester)
+        .eq("id", id)
+        .single();
+
+      if (!a1.error && a1.data) c = a1.data;
+
+      if (a1.error) {
+        const msg = String((a1.error as any)?.message ?? "");
+        if (msg.toLowerCase().includes("last_contacted_at") && msg.toLowerCase().includes("does not exist")) {
+          const a2 = await supa
+            .from("crm_contacts")
+            .select("id, first_name, last_name, email, company, created_at")
+            .eq("user_id", requester)
+            .eq("id", id)
+            .single();
+
+          if (a2.error || !a2.data) return res.status(404).json({ ok: false, error: "not_found" });
+          c = { ...(a2.data as any), last_contacted_at: null };
+        } else {
+          return res.status(500).json({ ok: false, error: a1.error.message ?? "contact_query_failed" });
+        }
+      }
+    } catch (e: any) {
+      return res.status(500).json({ ok: false, error: e?.message ?? "contact_query_failed" });
+    }
+
+    if (!c) return res.status(404).json({ ok: false, error: "not_found" });
 
     return res.json({
       ok: true,
@@ -310,6 +395,7 @@ function fmtDateIso(d: string | null | undefined) {
   return dt.toISOString();
 }
 
+
 function relativeTimeFromIso(iso: string | null | undefined) {
   if (!iso) return "Never";
   const dt = new Date(iso);
@@ -328,6 +414,91 @@ function relativeTimeFromIso(iso: string | null | undefined) {
   if (weeks < 10) return `${weeks}w ago`;
   const months = Math.floor(days / 30);
   return `${months}mo ago`;
+}
+
+// ------------------- Contact Health Helpers -------------------
+function daysSince(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const dt = new Date(iso);
+  if (Number.isNaN(dt.getTime())) return null;
+  const ms = Date.now() - dt.getTime();
+  return Math.floor(ms / (1000 * 60 * 60 * 24));
+}
+
+type ContactHealthStatus = "hot" | "warm" | "cold" | "stale";
+
+function classifyHealth(args: {
+  lastContactedDays: number | null;
+  overdueCount: number;
+  criticalNotesCount: number;
+  importantNotesCount: number;
+  lastCallScore: number | null;
+}): { status: ContactHealthStatus; score: number; reasons: string[]; next_action: string } {
+  const { lastContactedDays, overdueCount, criticalNotesCount, importantNotesCount, lastCallScore } = args;
+
+  let score = 50;
+  const reasons: string[] = [];
+
+  if (lastContactedDays == null) {
+    score -= 10;
+    reasons.push("Never contacted");
+  } else if (lastContactedDays <= 2) {
+    score += 20;
+    reasons.push("Contacted recently");
+  } else if (lastContactedDays <= 7) {
+    score += 10;
+    reasons.push("Contacted within 7 days");
+  } else if (lastContactedDays <= 14) {
+    score -= 5;
+    reasons.push("No contact in 2 weeks");
+  } else if (lastContactedDays <= 30) {
+    score -= 15;
+    reasons.push("No contact in 30 days");
+  } else {
+    score -= 25;
+    reasons.push("No contact in 30+ days");
+  }
+
+  if (overdueCount > 0) {
+    score -= Math.min(25, overdueCount * 8);
+    reasons.push(`${overdueCount} overdue assignment${overdueCount === 1 ? "" : "s"}`);
+  }
+
+  if (criticalNotesCount > 0) {
+    score -= Math.min(20, criticalNotesCount * 10);
+    reasons.push("Critical note(s) present");
+  } else if (importantNotesCount > 0) {
+    score -= Math.min(10, importantNotesCount * 5);
+    reasons.push("Important note(s) present");
+  }
+
+  if (lastCallScore != null) {
+    if (lastCallScore >= 80) {
+      score += 10;
+      reasons.push("Strong last call score");
+    } else if (lastCallScore >= 60) {
+      score += 3;
+      reasons.push("Decent last call score");
+    } else {
+      score -= 8;
+      reasons.push("Weak last call score");
+    }
+  }
+
+  score = Math.max(0, Math.min(100, score));
+
+  let status: ContactHealthStatus = "cold";
+  if (overdueCount > 0 || (lastContactedDays != null && lastContactedDays > 14)) status = "stale";
+  if ((lastContactedDays != null && lastContactedDays <= 7) && overdueCount === 0) status = "warm";
+  if ((lastContactedDays != null && lastContactedDays <= 2) && overdueCount === 0 && criticalNotesCount === 0) status = "hot";
+
+  let next_action = "Log a next step (time + outcome) and schedule follow-up.";
+  if (overdueCount > 0) next_action = "Clear overdue assignment(s) before doing anything else.";
+  else if (lastContactedDays == null) next_action = "Send intro + 2 discovery questions + book a time.";
+  else if (lastContactedDays > 14) next_action = "Re-open with a short recap + clear next step + 2 time slots.";
+  else if (criticalNotesCount > 0) next_action = "Review critical notes before contacting.";
+
+  return { status, score, reasons, next_action };
 }
 
 function buildHeuristicBrief(args: {
@@ -769,6 +940,100 @@ router.post("/contacts/import", async (req, res) => {
     });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message ?? "server_error" });
+  }
+});
+
+// ------------------- Contact Health Route -------------------
+router.get("/contacts/:id/health", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const contactId = String(req.params.id ?? "").trim();
+    if (!contactId) return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+
+    let contact: any = null;
+
+    if (contactId.startsWith("c_")) {
+      const found = DEMO_CONTACTS.find((c) => c.id === contactId);
+      if (!found) return res.status(404).json({ ok: false, error: "not_found" });
+      contact = { id: found.id, last_contacted_at: found.last_contacted_at ?? null };
+    } else {
+      if (!UUID_RE.test(contactId)) return res.status(400).json({ ok: false, error: "invalid_id" });
+      const { data: c, error: cErr } = await supa
+        .from("crm_contacts")
+        .select("id, last_contacted_at")
+        .eq("user_id", requester)
+        .eq("id", contactId)
+        .single();
+      if (cErr || !c) return res.status(404).json({ ok: false, error: "not_found" });
+      contact = c;
+    }
+
+    const { data: notes } = await supa
+      .from("crm_contact_notes")
+      .select("importance")
+      .eq("user_id", requester)
+      .eq("contact_id", contactId);
+
+    const criticalNotesCount = (notes ?? []).filter((n: any) => n.importance === "critical").length;
+    const importantNotesCount = (notes ?? []).filter((n: any) => n.importance === "important").length;
+
+    let overdueCount = 0;
+    try {
+      const { open } = await fetchContactAssignmentsBestEffort({ requester, contactId, limit: 200 });
+      overdueCount = open.filter((x: any) => x.is_overdue).length;
+    } catch {}
+
+    let lastCallScore: number | null = null;
+    try {
+      const { data: links } = await supa
+        .from("crm_call_links")
+        .select("call_id")
+        .eq("contact_id", contactId)
+        .limit(25);
+
+      const callIds = (links ?? []).map((r: any) => r.call_id).filter(Boolean);
+      if (callIds.length) {
+        const { data: scores } = await supa
+          .from("call_scores")
+          .select("total_score")
+          .eq("user_id", requester)
+          .in("call_id", callIds)
+          .order("created_at", { ascending: false })
+          .limit(1);
+        if (scores?.length) lastCallScore = Number((scores[0] as any).total_score);
+      }
+    } catch {}
+
+    const lastContactedDays = daysSince(contact?.last_contacted_at ?? null);
+
+    const result = classifyHealth({
+      lastContactedDays,
+      overdueCount,
+      criticalNotesCount,
+      importantNotesCount,
+      lastCallScore,
+    });
+
+    return res.json({
+      ok: true,
+      health: {
+        contact_id: contactId,
+        status: result.status,
+        score: result.score,
+        reasons: result.reasons,
+        next_action: result.next_action,
+        signals: {
+          last_contacted_at: contact?.last_contacted_at ?? null,
+          last_contacted_days: lastContactedDays,
+          overdue_assignments: overdueCount,
+          critical_notes: criticalNotesCount,
+          important_notes: importantNotesCount,
+          last_call_score: lastCallScore,
+        },
+      },
+    });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
 });
 
