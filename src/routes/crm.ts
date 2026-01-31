@@ -99,56 +99,72 @@ function shapeDemoContact(c: DemoContact) {
    - Returns minimal fields for the drawer
 ---------------------------------------------- */
 router.get("/contacts", async (req, res) => {
+  // PROBE: if you don't see these headers/logs, you're not hitting this handler.
+  const marker = "contacts_handler_v4";
+  res.setHeader("x-crm-contacts-marker", marker);
+  res.setHeader("x-crm-contacts-marker-src", "routes/crm.ts");
+  console.log("[CRM] /contacts hit", { marker, q: (req.query as any)?.query ?? (req.query as any)?.q, limit: (req.query as any)?.limit });
+
   try {
     const requester = getUserIdHeader(req);
 
-    // Accept a few param aliases to avoid silent empty-query bugs.
-    const raw =
+    // Express query params can be string | string[] | undefined.
+    // Accept a few aliases to avoid silent empty-query bugs.
+    const raw: unknown =
       (req.query.query as any) ??
       (req.query.q as any) ??
       (req.query.term as any) ??
       (req.query.search as any) ??
       "";
 
-    const query = String(Array.isArray(raw) ? raw[0] : raw).trim();
+    const query =
+      typeof raw === "string"
+        ? raw.trim()
+        : Array.isArray(raw)
+          ? String(raw[0] ?? "").trim()
+          : "";
+
     const limit = Math.min(Math.max(Number(req.query.limit ?? 12), 1), 50);
 
+    // Marker so we can confirm which handler is live.
+    const marker = "contacts_handler_v4";
+
     // Empty query => empty list (never spam demo)
-    if (!query) return res.json({ ok: true, items: [] });
+    if (!query) return res.json({ ok: true, items: [], marker });
 
-    // --- DB search first ---
-    try {
-      const { rows, hasLastContacted } = await selectContactsSafe({ requester, query, limit });
+    // 1) DB search first
+    const { rows, hasLastContacted } = await selectContactsSafe({ requester, query, limit });
 
-      if (rows.length) {
-        const shaped = rows.map((c: any) => ({
-          id: c.id,
-          name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim(),
-          email: c.email ?? null,
-          company: c.company ?? null,
-          last_contacted_at: hasLastContacted ? (c.last_contacted_at ?? null) : null,
-        }));
+    if (rows.length) {
+      const shaped = rows.map((c: any) => ({
+        id: c.id,
+        name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim(),
+        email: c.email ?? null,
+        company: c.company ?? null,
+        last_contacted_at: hasLastContacted ? (c.last_contacted_at ?? null) : null,
+      }));
 
-        return res.json({ ok: true, items: shaped });
-      }
-
-      // No matches — if this user has ANY real contacts, return empty (no demo pollution)
-      const { data: anyReal, error: anyErr } = await supa
-        .from("crm_contacts")
-        .select("id")
-        .eq("user_id", requester)
-        .limit(1);
-
-      if (!anyErr && (anyReal?.length ?? 0) > 0) {
-        return res.json({ ok: true, items: [] });
-      }
-      // else: user has zero real contacts => allow demo fallback below
-    } catch (err: any) {
-      // If DB query fails, fail closed (empty) rather than showing demo noise.
-      return res.status(500).json({ ok: false, error: err?.message ?? "contacts_query_failed" });
+      return res.json({ ok: true, items: shaped, marker, source: "db" });
     }
 
-    // --- Demo fallback ONLY when user has zero real contacts ---
+    // 2) No DB matches — if this user has ANY real contacts, return empty (no demo pollution)
+    const { data: anyReal, error: anyErr } = await supa
+      .from("crm_contacts")
+      .select("id")
+      .eq("user_id", requester)
+      .limit(1);
+
+    // If this query errors, fail closed (empty) rather than showing demo noise.
+    if (anyErr) {
+      return res.status(500).json({ ok: false, error: anyErr.message ?? "contacts_count_failed", marker });
+    }
+
+    const hasRealContacts = (anyReal?.length ?? 0) > 0;
+    if (hasRealContacts) {
+      return res.json({ ok: true, items: [], marker, source: "db_empty" });
+    }
+
+    // 3) Demo fallback ONLY when user has zero real contacts
     const q = query.toLowerCase();
     const demo = DEMO_CONTACTS.filter((c) => {
       const hay = `${c.first_name} ${c.last_name} ${c.email} ${c.company ?? ""}`.toLowerCase();
@@ -157,8 +173,7 @@ router.get("/contacts", async (req, res) => {
       .slice(0, limit)
       .map(shapeDemoContact);
 
-    // If demo doesn't match the query, return empty (never return all demo rows)
-    return res.json({ ok: true, items: demo });
+    return res.json({ ok: true, items: demo, marker, source: "demo" });
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
@@ -889,6 +904,7 @@ router.post("/contacts/import", async (req, res) => {
       }
 
       if (!existing) {
+        // Insert brand new row owned by this requester
         const { error } = await supa.from("crm_contacts").insert({
           user_id: requester,
           email: r.email,
@@ -907,12 +923,38 @@ router.post("/contacts/import", async (req, res) => {
       }
 
       // Existing row
-      if ((existing as any).user_id !== requester) {
+      const existingUserId = (existing as any).user_id ?? null;
+
+      // If this is a legacy row with NULL user_id, claim it safely for this requester.
+      // (We never overwrite another user's contact.)
+      if (existingUserId === null) {
+        const { error } = await supa
+          .from("crm_contacts")
+          .update({
+            user_id: requester,
+            first_name: r.first_name ?? null,
+            last_name: r.last_name ?? null,
+            company: r.company ?? null,
+          })
+          .eq("id", (existing as any).id);
+
+        if (error) {
+          skipped++;
+          errors.push({ email: r.email, error: error.message });
+        } else {
+          updated++;
+        }
+        continue;
+      }
+
+      // If owned by someone else, skip
+      if (existingUserId !== requester) {
         skipped++;
         errors.push({ email: r.email, error: "email_owned_by_other_user" });
         continue;
       }
 
+      // Owned by requester: update fields
       const { error } = await supa
         .from("crm_contacts")
         .update({
@@ -942,6 +984,436 @@ router.post("/contacts/import", async (req, res) => {
     return res.status(500).json({ ok: false, error: e?.message ?? "server_error" });
   }
 });
+
+// ------------------- Auto-assign helpers -------------------
+async function computeContactHealthFor(args: {
+  requester: string;
+  contactId: string;
+}): Promise<{
+  contact_id: string;
+  status: ContactHealthStatus;
+  score: number;
+  reasons: string[];
+  next_action: string;
+  signals: {
+    last_contacted_at: string | null;
+    last_contacted_days: number | null;
+    overdue_assignments: number;
+    critical_notes: number;
+    important_notes: number;
+    last_call_score: number | null;
+  };
+}> {
+  const { requester, contactId } = args;
+
+  let contact: any = null;
+
+  if (contactId.startsWith("c_")) {
+    const found = DEMO_CONTACTS.find((c) => c.id === contactId);
+    if (!found) throw new Error("not_found");
+    contact = { id: found.id, last_contacted_at: found.last_contacted_at ?? null };
+  } else {
+    if (!UUID_RE.test(contactId)) throw new Error("invalid_id");
+    const { data: c, error: cErr } = await supa
+      .from("crm_contacts")
+      .select("id, last_contacted_at")
+      .eq("user_id", requester)
+      .eq("id", contactId)
+      .single();
+    if (cErr || !c) throw new Error("not_found");
+    contact = c;
+  }
+
+  const { data: notes } = await supa
+    .from("crm_contact_notes")
+    .select("importance")
+    .eq("user_id", requester)
+    .eq("contact_id", contactId);
+
+  const criticalNotesCount = (notes ?? []).filter((n: any) => n.importance === "critical").length;
+  const importantNotesCount = (notes ?? []).filter((n: any) => n.importance === "important").length;
+
+  let overdueCount = 0;
+  try {
+    const { open } = await fetchContactAssignmentsBestEffort({ requester, contactId, limit: 200 });
+    overdueCount = open.filter((x: any) => x.is_overdue).length;
+  } catch {
+    overdueCount = 0;
+  }
+
+  let lastCallScore: number | null = null;
+  try {
+    const { data: links } = await supa
+      .from("crm_call_links")
+      .select("call_id")
+      .eq("contact_id", contactId)
+      .limit(25);
+
+    const callIds = (links ?? []).map((r: any) => r.call_id).filter(Boolean);
+    if (callIds.length) {
+      const { data: scores } = await supa
+        .from("call_scores")
+        .select("total_score")
+        .eq("user_id", requester)
+        .in("call_id", callIds)
+        .order("created_at", { ascending: false })
+        .limit(1);
+      if (scores?.length) lastCallScore = Number((scores[0] as any).total_score);
+    }
+  } catch {
+    lastCallScore = null;
+  }
+
+  const lastContactedDays = daysSince(contact?.last_contacted_at ?? null);
+
+  const result = classifyHealth({
+    lastContactedDays,
+    overdueCount,
+    criticalNotesCount,
+    importantNotesCount,
+    lastCallScore,
+  });
+
+  return {
+    contact_id: contactId,
+    status: result.status,
+    score: result.score,
+    reasons: result.reasons,
+    next_action: result.next_action,
+    signals: {
+      last_contacted_at: contact?.last_contacted_at ?? null,
+      last_contacted_days: lastContactedDays,
+      overdue_assignments: overdueCount,
+      critical_notes: criticalNotesCount,
+      important_notes: importantNotesCount,
+      last_call_score: lastCallScore,
+    },
+  };
+}
+
+function buildAutoAssignSuggestion(h: {
+  status: ContactHealthStatus;
+  score: number;
+  reasons: string[];
+  next_action: string;
+}): { type: string; title: string; due_at: string; importance: "normal" | "important" | "critical"; meta: any } {
+  const now = Date.now();
+
+  // Default: 2-day due
+  let dueDays = 2;
+  let importance: "normal" | "important" | "critical" = "normal";
+
+  if (h.status === "hot") {
+    dueDays = 1;
+    importance = "important";
+  } else if (h.status === "warm") {
+    dueDays = 2;
+    importance = "normal";
+  } else if (h.status === "stale") {
+    dueDays = 0;
+    importance = "critical";
+  } else {
+    // cold
+    dueDays = 3;
+    importance = "normal";
+  }
+
+  // If critical notes mentioned, bump importance
+  if (h.reasons.some((r) => String(r).toLowerCase().includes("critical"))) {
+    importance = "critical";
+    dueDays = 0;
+  }
+
+  const due_at = new Date(now + dueDays * 24 * 60 * 60 * 1000).toISOString();
+
+  const title = h.next_action;
+
+  return {
+    type: "next_action",
+    title,
+    due_at,
+    importance,
+    meta: {
+      source: "health_auto_assign_v1",
+      score: h.score,
+      status: h.status,
+      reasons: h.reasons,
+    },
+  };
+}
+
+async function insertAssignmentBestEffort(args: {
+  requester: string;
+  contactId: string;
+  type: string;
+  title: string;
+  due_at: string;
+  importance: "normal" | "important" | "critical";
+  meta: any;
+}) {
+  const { requester, contactId, type, title, due_at, importance, meta } = args;
+
+  // We have seen multiple schema variants across projects:
+  // - assignments(contact_id, ...)
+  // - assignments(target_type, target_id, ...)
+  // - assignments(meta json with contact_id)
+  // and sometimes the table is `coach_assignments`.
+  // This function tries a small set of payload shapes in order.
+
+  // IMPORTANT: `coach_assignments` in this repo is used for call coaching and can require
+  // non-null fields like `call_id`. Auto-assign is contact-driven and must not write there.
+  // So we only write to `assignments` here.
+  const tables = ["assignments"];
+
+  const baseMeta = meta ?? {};
+
+  const payloads: any[] = [
+    // Variant A: direct contact_id + title
+    {
+      user_id: requester,
+      rep_id: requester,
+      manager_id: requester,
+      contact_id: contactId,
+      type,
+      title,
+      due_at,
+      completed_at: null,
+      importance,
+      meta: baseMeta,
+    },
+    // Variant A0: direct contact_id + assignment_type + title (some schemas use assignment_type)
+    {
+      user_id: requester,
+      rep_id: requester,
+      manager_id: requester,
+      contact_id: contactId,
+      assignment_type: type,
+      title,
+      due_at,
+      completed_at: null,
+      importance,
+      meta: baseMeta,
+    },
+    // Variant A0b: direct contact_id + assignment_type + label
+    {
+      user_id: requester,
+      rep_id: requester,
+      manager_id: requester,
+      contact_id: contactId,
+      assignment_type: type,
+      label: title,
+      due_at,
+      completed_at: null,
+      importance,
+      meta: baseMeta,
+    },
+    // Variant A2: direct contact_id + label (some schemas use label instead of title)
+    {
+      user_id: requester,
+      rep_id: requester,
+      manager_id: requester,
+      contact_id: contactId,
+      type,
+      label: title,
+      due_at,
+      completed_at: null,
+      importance,
+      meta: baseMeta,
+    },
+    // Variant B: target_type/target_id + title
+    {
+      user_id: requester,
+      rep_id: requester,
+      manager_id: requester,
+      target_type: "contact",
+      target_id: contactId,
+      type,
+      title,
+      due_at,
+      completed_at: null,
+      importance,
+      meta: baseMeta,
+    },
+    // Variant B2: target_type/target_id + label
+    {
+      user_id: requester,
+      rep_id: requester,
+      manager_id: requester,
+      target_type: "contact",
+      target_id: contactId,
+      type,
+      label: title,
+      due_at,
+      completed_at: null,
+      importance,
+      meta: baseMeta,
+    },
+    // Variant C: meta-only link (contact_id inside meta) + title
+    {
+      user_id: requester,
+      rep_id: requester,
+      manager_id: requester,
+      type,
+      title,
+      due_at,
+      completed_at: null,
+      importance,
+      meta: { ...baseMeta, contact_id: contactId },
+    },
+    // Variant C2: meta-only link + label
+    {
+      user_id: requester,
+      rep_id: requester,
+      manager_id: requester,
+      type,
+      label: title,
+      due_at,
+      completed_at: null,
+      importance,
+      meta: { ...baseMeta, contact_id: contactId },
+    },
+    // Variant D: minimal (in case importance/title/meta columns are missing)
+    {
+      user_id: requester,
+      rep_id: requester,
+      manager_id: requester,
+      type,
+      due_at,
+      completed_at: null,
+      meta: { contact_id: contactId, title },
+    },
+    // Variant E: coach_assignments minimal (no title/label/meta/contact fields)
+    {
+      user_id: requester,
+      rep_id: requester,
+      manager_id: requester,
+      assignment_type: type,
+      due_at,
+      completed_at: null,
+    },
+    // Variant E2: ultra-minimal
+    {
+      user_id: requester,
+      rep_id: requester,
+      manager_id: requester,
+      assignment_type: type,
+    },
+  ];
+
+  let lastErr: any = null;
+
+  for (const table of tables) {
+    for (const p0 of payloads) {
+      // Attempt the payload, and if a column is missing, strip it and retry a couple times.
+      let p: any = { ...p0 };
+
+      // IMPORTANT: some deployments use `coach_assignments` with a smaller column set.
+      // We normalise early AND avoid sending columns that often don't exist (e.g. meta/title/type).
+      const allowMeta = table !== "coach_assignments";
+
+      for (let i = 0; i < 3; i++) {
+        const { error } = await supa.from(table).insert(p);
+        if (!error) return;
+
+        const msg = String((error as any)?.message ?? "").toLowerCase();
+        lastErr = error;
+
+        // Table doesn't exist? break to next table.
+        if (msg.includes("does not exist") || (msg.includes("relation") && msg.includes("does not exist"))) {
+          break;
+        }
+
+        // Supabase schema cache missing column errors look like:
+        // "Could not find the 'contact_id' column of 'assignments' in the schema cache"
+        // We parse the column name and drop it.
+        const m = msg.match(/could not find the '([^']+)' column/);
+        const missingCol = m?.[1];
+        if (missingCol && missingCol in p) {
+          // If the schema uses label instead of title (or vice-versa), map across before dropping.
+          if (missingCol === "title" && (p as any).label == null && typeof title === "string") {
+            (p as any).label = title;
+          }
+          if (missingCol === "label" && (p as any).title == null && typeof title === "string") {
+            (p as any).title = title;
+          }
+
+          // Some schemas use assignment_type instead of type.
+          if (missingCol === "type") {
+            if (table === "coach_assignments") {
+              // Do not attempt to map to assignment_type (it may not exist).
+              delete (p as any).type;
+              continue;
+            }
+
+            if ((p as any).assignment_type == null) {
+              (p as any).assignment_type = type;
+            }
+
+            if (allowMeta) {
+              if ((p as any).meta && typeof (p as any).meta === "object") {
+                (p as any).meta = { ...(p as any).meta, type };
+              } else {
+                (p as any).meta = { type };
+              }
+            }
+
+            delete (p as any).type;
+            continue;
+          }
+          if (missingCol === "assignment_type") {
+            // For coach_assignments, we keep ultra-minimal and avoid adding type back in.
+            if (table !== "coach_assignments") {
+              if ((p as any).type == null) (p as any).type = type;
+            }
+          }
+
+          // Special-case: handle rep_id column missing
+          if (missingCol === "rep_id") {
+            delete (p as any).rep_id;
+            continue;
+          }
+          // Special-case: handle manager_id column missing
+          if (missingCol === "manager_id") {
+            delete (p as any).manager_id;
+            continue;
+          }
+
+          delete (p as any)[missingCol];
+          continue;
+        }
+
+        // PostgREST column missing variants
+        if (msg.includes("column") && msg.includes("does not exist")) {
+          // Best effort: drop common optional fields when any column error occurs.
+          delete p.contact_id;
+          delete p.target_type;
+          delete p.target_id;
+          delete p.type;
+          delete p.rep_id;
+          delete p.manager_id;
+
+          if (allowMeta) {
+            if (p.meta && typeof p.meta === "object") {
+              p.meta = { ...(p.meta ?? {}), contact_id: contactId };
+            } else {
+              p.meta = { contact_id: contactId };
+            }
+          } else {
+            delete p.meta;
+          }
+
+          delete p.importance;
+          continue;
+        }
+
+        // Any other error: stop retrying this payload.
+        break;
+      }
+    }
+  }
+
+  throw lastErr ?? new Error("assignment_insert_failed");
+}
 
 // ------------------- Contact Health Route -------------------
 router.get("/contacts/:id/health", async (req, res) => {
@@ -1034,6 +1506,184 @@ router.get("/contacts/:id/health", async (req, res) => {
     });
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+  }
+});
+
+// ------------------- Contact Auto-Assign Route -------------------
+// POST /v1/crm/contacts/:id/auto-assign
+// Body: { dry_run?: boolean }
+// - Uses Contact Health to suggest a single "next_action" assignment.
+// - If dry_run=true, returns suggestion only.
+router.post("/contacts/:id/auto-assign", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const contactId = String(req.params.id ?? "").trim();
+    if (!contactId) return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+
+    const dry_run = Boolean((req.body as any)?.dry_run);
+
+    // Compute health (shared logic)
+    const health = await computeContactHealthFor({ requester, contactId });
+    const suggestion = buildAutoAssignSuggestion({
+      status: health.status,
+      score: health.score,
+      reasons: health.reasons,
+      next_action: health.next_action,
+    });
+
+    if (dry_run) {
+      return res.json({ ok: true, dry_run: true, contact_id: contactId, health, suggestion });
+    }
+
+    // Insert assignment (best-effort across table variants)
+    await insertAssignmentBestEffort({
+      requester,
+      contactId,
+      type: suggestion.type,
+      title: suggestion.title,
+      due_at: suggestion.due_at,
+      importance: suggestion.importance,
+      meta: suggestion.meta,
+    });
+
+    return res.json({ ok: true, dry_run: false, contact_id: contactId, health, created: true });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "bad_request");
+    const code = msg === "not_found" ? 404 : msg === "invalid_id" ? 400 : 400;
+    return res.status(code).json({ ok: false, error: msg });
+  }
+});
+
+// ------------------- Account Health Route -------------------
+// GET /v1/crm/accounts/:id/health
+// Roll-up health across contacts linked to an account.
+router.get("/accounts/:id/health", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const accountId = String(req.params.id ?? "").trim();
+    if (!accountId) return res.status(400).json({ ok: false, error: "invalid_account_id" });
+
+    // Pull contacts linked to this account (best-effort). If your schema differs,
+    // update `account_id` to match your contact->account foreign key.
+    let contacts: Array<{ id: string; last_contacted_at: string | null }> = [];
+    try {
+      const q = await supa
+        .from("crm_contacts")
+        .select("id, last_contacted_at")
+        .eq("user_id", requester)
+        .eq("account_id", accountId)
+        .limit(200);
+
+      if (q.error) {
+        const msg = String((q.error as any)?.message ?? "");
+        // If account_id column is missing, fail closed with a clear reason.
+        if (msg.toLowerCase().includes("account_id") && msg.toLowerCase().includes("does not exist")) {
+          return res.json({
+            ok: true,
+            health: {
+              account_id: accountId,
+              status: "cold",
+              score: 0,
+              reasons: ["Account linkage not configured (crm_contacts.account_id missing)"],
+              next_action: "Add account linkage (account_id) to contacts, then re-check health.",
+              rollup: { hot: 0, warm: 0, cold: 0, stale: 0, total: 0 },
+            },
+          });
+        }
+        return res.status(500).json({ ok: false, error: q.error.message ?? "account_contacts_query_failed" });
+      }
+
+      contacts = (q.data ?? []).map((r: any) => ({
+        id: String(r.id),
+        last_contacted_at: (r.last_contacted_at as any) ?? null,
+      }));
+    } catch (e: any) {
+      return res.status(500).json({ ok: false, error: e?.message ?? "account_contacts_query_failed" });
+    }
+
+    const total = contacts.length;
+    if (!total) {
+      return res.json({
+        ok: true,
+        health: {
+          account_id: accountId,
+          status: "cold",
+          score: 0,
+          reasons: ["No contacts linked"],
+          next_action: "Link contacts to this account and start outreach.",
+          rollup: { hot: 0, warm: 0, cold: 0, stale: 0, total: 0 },
+        },
+      });
+    }
+
+    const now = Date.now();
+    const daysBetween = (iso: string | null) => {
+      if (!iso) return null;
+      const dt = new Date(iso);
+      if (Number.isNaN(dt.getTime())) return null;
+      return Math.floor((now - dt.getTime()) / 86400000);
+    };
+
+    let hot = 0;
+    let warm = 0;
+    let cold = 0;
+    let stale = 0;
+
+    for (const c of contacts) {
+      const d = daysBetween(c.last_contacted_at);
+      if (d == null) {
+        cold++;
+      } else if (d <= 2) {
+        hot++;
+      } else if (d <= 7) {
+        warm++;
+      } else if (d > 14) {
+        stale++;
+      } else {
+        cold++;
+      }
+    }
+
+    // Weighted score (simple + stable)
+    // hot=85, warm=65, cold=35, stale=20
+    const score = Math.round((hot * 85 + warm * 65 + cold * 35 + stale * 20) / total);
+
+    // Status: stale trumps; otherwise majority rule
+    let status: "hot" | "warm" | "cold" | "stale" = "cold";
+    if (stale > 0) status = "stale";
+    else if (hot >= Math.ceil(total * 0.5)) status = "hot";
+    else if (hot + warm >= Math.ceil(total * 0.5)) status = "warm";
+    else status = "cold";
+
+    const reasons: string[] = [];
+    if (stale > 0) reasons.push(`${stale} contact(s) stale (14d+)`);
+    if (cold > 0) reasons.push(`${cold} contact(s) cold/never contacted`);
+    if (!reasons.length) reasons.push("Active contact cadence");
+
+    const next_action =
+      status === "stale"
+        ? "Follow up stale contacts. Book calls and set next steps."
+        : status === "cold"
+          ? "Start outreach to primary contacts and book a first call."
+          : status === "warm"
+            ? "Send value follow-up and progress to a booked meeting."
+            : "Maintain cadence and push for next commitment.";
+
+    res.setHeader("x-crm-accounts-marker", "account_health_v1");
+
+    return res.json({
+      ok: true,
+      health: {
+        account_id: accountId,
+        status,
+        score,
+        reasons,
+        next_action,
+        rollup: { hot, warm, cold, stale, total },
+      },
+    });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message ?? "account_health_failed" });
   }
 });
 
