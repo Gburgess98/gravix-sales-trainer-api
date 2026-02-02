@@ -12,7 +12,7 @@ import { scoreWithLLM } from "./lib/scoring";
 
 import callsRouter from "./routes/calls";
 import pinsRouter from "./routes/pins";
-import crmRouter from "./routes/crm";
+import crmRouter from "./routes/crm.ts";
 import dashboardRoutes from "./routes/dashboard";
 import sparringRouter from "./routes/sparring";
 
@@ -61,6 +61,16 @@ type UploadedFile = {
 };
 
 const app = express();
+
+app.get("/__probe", (req, res) => {
+  res.setHeader("x-probe-server", "gravix-api-live");
+  return res.status(200).json({ ok: true, probe: "gravix-api-live" });
+});
+
+app.use((req, res, next) => {
+  res.setHeader("x-probe-server", "gravix-api-live");
+  next();
+});
 
 /* ------------------------------------------------
    Basic request log (helps see preflights/uploads)
@@ -790,39 +800,6 @@ app.get("/v1/calls/paged", (req, res) => {
 });
 
 // --- ADD: CRM search stub ---
-app.get("/v1/crm/contacts", (req, res) => {
-  const q = String(req.query.q || "").toLowerCase();
-  const limit = Math.min(Number(req.query.limit || 10), 25);
-  const demo = [
-    { id: "c_anna", name: "Anna Rivera", email: "anna@demo.co" },
-    { id: "c_bob", name: "Bob Trent", email: "bob@demo.co" },
-    { id: "c_eric", name: "Eric Cole", email: "eric@demo.co" },
-    { id: "c_lena", name: "Lena Yao", email: "lena@demo.co" },
-    { id: "c_mark", name: "Mark Patel", email: "mark@demo.co" },
-    { id: "c_olga", name: "Olga Smith", email: "olga@demo.co" },
-  ]
-    .filter(x => !q || x.name.toLowerCase().includes(q) || x.email.toLowerCase().includes(q))
-    .slice(0, limit);
-  res.json({ ok: true, items: demo });
-});
-
-app.post("/v1/crm/unlink", async (req, res) => {
-  const { callId, target } = req.body || {}; // "contact" | "account"
-  if (!callId || !target) return res.status(400).json({ ok: false, error: "callId,target required" });
-  const patch = target === "contact" ? { contact_id: null } : target === "account" ? { account_id: null } : null;
-  if (!patch) return res.status(400).json({ ok: false, error: "invalid target" });
-  const { error } = await supabase.from("calls").update(patch).eq("id", callId);
-  if (error) return res.status(500).json({ ok: false, error: error.message });
-  res.json({ ok: true });
-});
-
-// --- ADD: link a call to a contact stub ---
-app.post("/v1/crm/link-call", (req, res) => {
-  const { callId, contactId } = req.body || {};
-  if (!callId || !contactId) return res.status(400).json({ ok: false, error: "callId, contactId required" });
-  console.log("[crm.link]", { callId, contactId });
-  res.json({ ok: true, linked: { callId, contactId } });
-});
 
 
 /* 🔧 Admin: enqueue score job for a call (dev only) — returns jobId */
@@ -1490,6 +1467,7 @@ app.get("/v1/admin/index-hints", requireAdmin, (_req, res) => {
   res.json({ ok: true, ddl });
 });
 
+
 // --- SQL Triggers (documentation) ---
 // -- Run in Supabase SQL editor:
 //
@@ -1538,6 +1516,7 @@ app.get("/v1/admin/index-hints", requireAdmin, (_req, res) => {
 // FOR EACH ROW EXECUTE FUNCTION trg_call_scored();
 
 // --- Whisperer: offline preview (regex + silence heuristic) ---
+
 
 
 /* ------------------------
