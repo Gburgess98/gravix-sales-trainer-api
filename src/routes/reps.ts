@@ -16,14 +16,76 @@ function pct(numer: number, denom: number) {
   return numer / denom; // 0..1, frontend normalises either way
 }
 
+// ------------------------------
+// Option I — Permissions hardening (org-level)
+//
+// Contract:
+// - Requests MUST include x-user-id (requester identity)
+// - Requests MUST include x-org-id (org scope)
+// - reps table must support org_id for enforcement
+//
+// If org_id is not available in schema, we fail-closed (security > convenience)
+// ------------------------------
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function getRequesterId(req: Request) {
+  const id = String(req.header("x-user-id") || "").trim();
+  if (!id || !UUID_RE.test(id)) return null;
+  return id;
+}
+
+function getOrgId(req: Request) {
+  const id = String(req.header("x-org-id") || "").trim();
+  if (!id || !UUID_RE.test(id)) return null;
+  return id;
+}
+
+async function assertOrgScopeOr403(args: {
+  requesterId: string;
+  orgId: string;
+  repId: string;
+}) {
+  const { requesterId, orgId, repId } = args;
+
+  // We require org_id to exist for enforcement.
+  // If the column doesn't exist, Supabase will return an error — treat that as fail-closed.
+  const { data: requesterRow, error: requesterErr } = await sb
+    .from("reps")
+    .select("id,org_id")
+    .eq("id", requesterId)
+    .single();
+
+  if (requesterErr) throw new Error(`org_scope_lookup_failed:requester:${requesterErr.message}`);
+  if (!requesterRow) throw new Error("org_scope_missing_requester");
+  if (String((requesterRow as any).org_id || "") !== orgId) throw new Error("forbidden_org_scope");
+
+  const { data: targetRow, error: targetErr } = await sb
+    .from("reps")
+    .select("id,org_id")
+    .eq("id", repId)
+    .single();
+
+  if (targetErr) throw new Error(`org_scope_lookup_failed:target:${targetErr.message}`);
+  if (!targetRow) throw new Error("rep_not_found");
+  if (String((targetRow as any).org_id || "") !== orgId) throw new Error("forbidden_org_scope");
+}
+
 repsRouter.get("/:id/overview", async (req: Request, res: Response) => {
   try {
-    const repId = req.params.id;
+    const repId = String(req.params.id || "").trim();
+    if (!repId || !UUID_RE.test(repId)) return res.status(400).json({ ok: false, error: "invalid_rep_id" });
+
+    const requesterId = getRequesterId(req);
+    const orgId = getOrgId(req);
+    if (!requesterId) return res.status(401).json({ ok: false, error: "missing_requester" });
+    if (!orgId) return res.status(400).json({ ok: false, error: "missing_org" });
+
+    await assertOrgScopeOr403({ requesterId, orgId, repId });
 
     // ---- Rep basics
     const { data: repRow, error: repErr } = await sb
       .from("reps")
-      .select("id,name,email,avatar_url,xp,tier")
+      .select("id,org_id,name,email,avatar_url,xp,tier")
       .eq("id", repId)
       .single();
     if (repErr) throw repErr;
@@ -135,9 +197,15 @@ repsRouter.get("/:id/overview", async (req: Request, res: Response) => {
 
     // #5 (cache header) — we’ll set this here too:
     res.set("Cache-Control", "public, max-age=15");
-    return res.json(payload);
+    return res.json({ ok: true, ...payload });
   } catch (err: any) {
-    console.error("GET /v1/reps/:id/overview error", err);
+    const msg = String(err?.message || err);
+    console.error("GET /v1/reps/:id/overview error", msg);
+
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+    if (msg === "rep_not_found") return res.status(404).json({ ok: false, error: "rep_not_found" });
+    if (msg.startsWith("org_scope_lookup_failed:")) return res.status(500).json({ ok: false, error: "org_scope_not_supported" });
+
     return res.status(500).json({ ok: false, error: "server_error" });
   }
 });
@@ -147,8 +215,15 @@ repsRouter.get("/:id/overview", async (req: Request, res: Response) => {
 repsRouter.get("/:id/xp", async (req: Request, res: Response) => {
   res.setHeader("Cache-Control", "no-store");
   const repId = String(req.params.id || "").trim();
-  if (!repId) return res.status(400).json({ ok: false, error: "repId required" });
+  if (!repId || !UUID_RE.test(repId)) return res.status(400).json({ ok: false, error: "invalid_rep_id" });
+
+  const requesterId = getRequesterId(req);
+  const orgId = getOrgId(req);
+  if (!requesterId) return res.status(401).json({ ok: false, error: "missing_requester" });
+  if (!orgId) return res.status(400).json({ ok: false, error: "missing_org" });
+
   try {
+    await assertOrgScopeOr403({ requesterId, orgId, repId });
     const { data, error } = await sb
       .from("xp_events")
       .select("delta, amount, created_at")
@@ -176,7 +251,11 @@ repsRouter.get("/:id/xp", async (req: Request, res: Response) => {
       last_event_at: last ? new Date(last).toISOString() : null,
     });
   } catch (e: any) {
-    return res.status(500).json({ ok: false, error: e?.message || "internal_error" });
+    const msg = String(e?.message || e);
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+    if (msg === "rep_not_found") return res.status(404).json({ ok: false, error: "rep_not_found" });
+    if (msg.startsWith("org_scope_lookup_failed:")) return res.status(500).json({ ok: false, error: "org_scope_not_supported" });
+    return res.status(500).json({ ok: false, error: "internal_error" });
   }
 });
 

@@ -26,7 +26,13 @@ import adminRouter from "./routes/admin";
 import { assignmentsRoutes } from "./routes/assignments";
 import debugRouter from "./routes/debug";
 
-const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'];
+const REQUIRED_ENV = [
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  // Optional but strongly recommended for multi-tenant safety.
+  // DEFAULT_ORG_ID is used as a fallback in a few legacy routes.
+  "DEFAULT_ORG_ID",
+];
 for (const k of REQUIRED_ENV) {
   if (!process.env[k] || String(process.env[k]).trim() === '') {
     console.error(`❌ Missing required env: ${k}`);
@@ -104,7 +110,14 @@ const corsOptions: cors.CorsOptions = {
     return cb(new Error(`CORS: origin not allowed: ${origin}`));
   },
   methods: ["GET", "POST", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-user-id", "x-org-id", "x-request-id"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "x-user-id",
+    "x-org-id",
+    "x-request-id",
+    "x-cron-secret",
+  ],
   credentials: true,
   maxAge: 86400,
   optionsSuccessStatus: 204,
@@ -501,6 +514,36 @@ function requireAdmin(
 ) {
   if (process.env.ALLOW_ADMIN_ENDPOINTS === "true") return next();
   return res.status(403).json({ ok: false, error: "admin_required" });
+}
+
+function requireCron(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  const expected = String(process.env.CRON_SECRET || process.env.CRON_WEBHOOK_SECRET || "").trim();
+  if (!expected) return sendJsonError(res, 500, "cron_secret_not_configured");
+
+  const got = String(req.header("x-cron-secret") || "").trim();
+  if (!got) return sendJsonError(res, 401, "cron_unauthorised");
+
+  // Timing-safe compare (avoid leaking secret length/bytes)
+  try {
+    const a = Buffer.from(expected);
+    const b = Buffer.from(got);
+    if (a.length !== b.length) return sendJsonError(res, 401, "cron_unauthorised");
+    if (!crypto.timingSafeEqual(a, b)) return sendJsonError(res, 401, "cron_unauthorised");
+  } catch {
+    return sendJsonError(res, 401, "cron_unauthorised");
+  }
+
+  return next();
+}
+
+function requireEnvUuid(name: string): string {
+  const v = String(process.env[name] || "").trim();
+  if (!isUuid(v)) throw new Error(`missing_or_invalid_env:${name}`);
+  return v;
 }
 
 /* --- Slack summary builder (used after scoring) --- */
@@ -1517,13 +1560,93 @@ app.get("/v1/admin/index-hints", requireAdmin, (_req, res) => {
 
 // --- Whisperer: offline preview (regex + silence heuristic) ---
 
+/* ------------------------------------------
+   Cron: CRM auto-assign (server-to-server)
+   POST /v1/cron/crm/auto-assign
+   Headers: x-cron-secret
+   Body (optional): { mode?: "dry_run"|"execute", limit_reps?: number, contacts_per_rep?: number, max_total_contacts?: number }
+-------------------------------------------*/
+/* ------------------------------------------
+   Cron: CRM auto-assign (server-to-server)
 
+   POST /v1/cron/crm/auto-assign
+   Headers:
+     - x-cron-secret: <CRON_SECRET>
+
+   Env required:
+     - CRON_SECRET (or CRON_WEBHOOK_SECRET)
+     - CRON_USER_ID (UUID)
+     - CRON_ORG_ID (UUID)
+
+   Body (optional):
+     { mode?: "dry_run"|"execute", limit_reps?: number, contacts_per_rep?: number, max_total_contacts?: number }
+-------------------------------------------*/
+app.post("/v1/cron/crm/auto-assign", requireCron, async (req, res) => {
+  try {
+    const port = Number(process.env.PORT || 4000);
+    const base = `http://127.0.0.1:${port}`;
+
+    // Cron identity + org scope are explicit envs (no guessing).
+    const CRON_USER_ID = requireEnvUuid("CRON_USER_ID");
+    const CRON_ORG_ID = requireEnvUuid("CRON_ORG_ID");
+
+    // --- SAFETY RAIL: Only allow execute if explicitly enabled ---
+    const CRON_ALLOW_EXECUTE = String(process.env.CRON_ALLOW_EXECUTE || "false").toLowerCase() === "true";
+
+    // Enforce dry_run unless explicitly allowed
+    const modeRaw = String((req.body as any)?.mode || "execute").trim().toLowerCase();
+
+    const requestedMode = modeRaw === "dry_run" ? "dry_run" : "execute";
+    const mode =
+      requestedMode === "execute" && !CRON_ALLOW_EXECUTE
+        ? "dry_run"
+        : requestedMode;
+
+    const body = {
+      mode,
+      limit_reps: Math.min(50, Math.max(1, Number((req.body as any)?.limit_reps ?? 10) || 10)),
+      contacts_per_rep: Math.min(50, Math.max(1, Number((req.body as any)?.contacts_per_rep ?? 5) || 5)),
+      max_total_contacts: Math.min(500, Math.max(1, Number((req.body as any)?.max_total_contacts ?? 25) || 25)),
+    };
+
+    const rid = (req as any)?.rid || req.header("x-request-id") || randomUUID();
+
+    const r = await fetch(`${base}/v1/crm/manager/auto-assign/run`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-request-id": String(rid),
+        "x-user-id": CRON_USER_ID,
+        "x-org-id": CRON_ORG_ID,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !(j as any)?.ok) {
+      return sendJsonError(res, r.status || 500, (j as any)?.error || "crm_auto_assign_failed", {
+        upstream_status: r.status,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      cron: true,
+      mode,
+      execute_allowed: CRON_ALLOW_EXECUTE,
+      upstream: j,
+    });
+  } catch (e: any) {
+    return sendJsonError(res, 500, e?.message || "cron_failed");
+  }
+});
 
 /* ------------------------
    Mount feature routers
 ------------------------- */
 app.use("/v1/calls", callsRouter);
 app.use("/v1/pins", pinsRouter);
+// Includes protected cron endpoints (e.g. POST /v1/cron/crm/auto-assign)
 app.use("/v1/crm", crmRouter);
 app.use("/v1/coach", coachRoutes);
 app.use("/v1/team", teamRoutes);

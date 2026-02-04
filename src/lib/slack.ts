@@ -1,4 +1,23 @@
+
 // src/lib/slack.ts
+
+// ---------------------------------------------
+// Slack webhook configuration (source of truth)
+//
+// Required (at least one):
+//   - SLACK_WEBHOOK_URL        → default channel / ops alerts
+//
+// Optional:
+//   - SLACK_ASSIGN_WEBHOOK    → per-assignment / assignee notifications
+//   - SLACK_DRY_RUN=true      → log payloads instead of posting
+//
+// Resolution order:
+//   1) explicitWebhook argument (when provided)
+//   2) SLACK_ASSIGN_WEBHOOK (assignment-specific)
+//   3) SLACK_WEBHOOK_URL (global fallback)
+//
+// If no webhook is configured, Slack calls fail-open (no throw).
+// ---------------------------------------------
 
 // ---------- Block Kit types ----------
 export type SlackText =
@@ -85,6 +104,45 @@ export async function postSlackSummary(
     throw new Error(`Slack webhook failed: HTTP ${r.status} ${msg}`);
   }
   return { ok: true as const };
+}
+
+// =========================================================
+// CRM auto-assign run alerts (cron/manual)
+// =========================================================
+
+const CRM_RUN_SLACK_ALERT_ACTIONS_CREATED_THRESHOLD = 25;
+
+export async function postCrmAutoAssignRunSlack(args: {
+  run_id: string;
+  org_id: string;
+  mode: string;
+  totals: any;
+  source: "cron" | "manual";
+}) {
+  const { run_id, org_id, mode, totals, source } = args;
+
+  const errors = Number(totals?.errors ?? 0);
+  const created = Number(totals?.actions_created ?? 0);
+
+  // Only alert when there is signal
+  if (errors === 0 && created < CRM_RUN_SLACK_ALERT_ACTIONS_CREATED_THRESHOLD) return;
+
+  const icon = errors > 0 ? "⚠️" : "👀";
+
+  const text =
+    `${icon} CRM auto-assign (${source})\n` +
+    `run_id: ${run_id}\n` +
+    `mode: ${mode}\n` +
+    `org: ${org_id}\n` +
+    `reps: ${Number(totals?.reps_considered ?? 0)}, contacts: ${Number(totals?.contacts_considered ?? 0)}\n` +
+    `created: ${created}, skipped: ${Number(totals?.skipped_dedupe ?? 0)}, errors: ${errors}`;
+
+  // postSlack is fail-open when webhook is missing; do not throw here.
+  try {
+    await postSlack(text);
+  } catch (e) {
+    console.error("[slack] postCrmAutoAssignRunSlack failed", e);
+  }
 }
 
 // =========================================================

@@ -1,0 +1,131 @@
+
+
+name: CRM Auto-Assign (Cron)
+
+on:
+  # Manual trigger (useful for testing)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'dry_run or execute'
+        required: true
+        default: 'dry_run'
+      limit_reps:
+        description: 'Max reps to consider'
+        required: true
+        default: '10'
+      contacts_per_rep:
+        description: 'Max contacts per rep'
+        required: true
+        default: '5'
+      max_total_contacts:
+        description: 'Max contacts total'
+        required: true
+        default: '25'
+
+  # Scheduled run (adjust cadence once you’re happy)
+  schedule:
+    - cron: '*/10 * * * *'  # every 10 minutes
+
+jobs:
+  crm_auto_assign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for k in API_BASE_URL CRON_SECRET; do
+            if [ -z "${{ secrets[k] || '' }}" ]; then
+              echo "Missing GitHub secret: $k"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "\nAdd secrets in GitHub: Settings → Secrets and variables → Actions"
+            echo "Required: API_BASE_URL, CRON_SECRET"
+            exit 1
+          fi
+
+      - name: Build request payload
+        id: payload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # When triggered by schedule, default to dry_run (safe). You can switch to execute later.
+          MODE_INPUT='${{ github.event.inputs.mode }}'
+          if [ -z "$MODE_INPUT" ]; then
+            MODE_INPUT='dry_run'
+          fi
+
+          LIMIT_REPS='${{ github.event.inputs.limit_reps }}'
+          CONTACTS_PER_REP='${{ github.event.inputs.contacts_per_rep }}'
+          MAX_TOTAL_CONTACTS='${{ github.event.inputs.max_total_contacts }}'
+
+          if [ -z "$LIMIT_REPS" ]; then LIMIT_REPS='10'; fi
+          if [ -z "$CONTACTS_PER_REP" ]; then CONTACTS_PER_REP='5'; fi
+          if [ -z "$MAX_TOTAL_CONTACTS" ]; then MAX_TOTAL_CONTACTS='25'; fi
+
+          cat > payload.json <<JSON
+          {
+            "mode": "${MODE_INPUT}",
+            "limit_reps": ${LIMIT_REPS},
+            "contacts_per_rep": ${CONTACTS_PER_REP},
+            "max_total_contacts": ${MAX_TOTAL_CONTACTS}
+          }
+          JSON
+
+          echo "Payload:" 
+          cat payload.json
+
+      - name: Call cron endpoint
+        shell: bash
+        env:
+          API_BASE_URL: ${{ secrets.API_BASE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+
+          URL="${API_BASE_URL%/}/v1/cron/crm/auto-assign"
+          echo "POST $URL"
+
+          # Capture status + body
+          http_code=$(curl -sS -o resp.json -w "%{http_code}" \
+            -X POST "$URL" \
+            -H "content-type: application/json" \
+            -H "x-cron-secret: $CRON_SECRET" \
+            --data @payload.json)
+
+          echo "HTTP $http_code"
+          cat resp.json
+
+          # Fail the workflow on non-2xx
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "Request failed with HTTP $http_code"
+            exit 1
+          fi
+
+          # Fail if ok is not true
+          ok=$(node -e "const j=require('./resp.json'); console.log(Boolean(j.ok));")
+          if [ "$ok" != "true" ]; then
+            echo "Response ok=false"
+            exit 1
+          fi
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## CRM Auto-Assign run" >> $GITHUB_STEP_SUMMARY
+          echo "- time: $(date -u)" >> $GITHUB_STEP_SUMMARY
+          echo "- event: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- mode: ${{ github.event.inputs.mode || 'dry_run (schedule default)' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Response:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          cat resp.json >> $GITHUB_STEP_SUMMARY || true
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
