@@ -1986,21 +1986,12 @@ router.post("/manager/auto-assign/preview", async (req, res) => {
     const { limit_reps, contacts_per_rep, max_total_contacts } = parsed.data;
 
     // Reuse the existing runner logic safely via in-process call
-    // by invoking the same core path with dry_run enforced.
+    // IMPORTANT: do NOT spread `req` into a plain object (it loses req.header()).
+    // We temporarily override req.body and call the real handler with the real req instance.
     const startedAt = new Date();
 
-    const previewReq: any = {
-      ...req,
-      body: {
-        mode: "dry_run",
-        limit_reps,
-        contacts_per_rep,
-        max_total_contacts,
-      },
-    };
-
     // Call the real runner handler directly
-    // NOTE: this is safe because the runner already enforces dry_run semantics
+    // NOTE: safe because we force dry_run mode.
     const runner = (router as any).stack.find(
       (r: any) =>
         r.route &&
@@ -2012,7 +2003,158 @@ router.post("/manager/auto-assign/preview", async (req, res) => {
       return res.status(500).json({ ok: false, error: "runner_not_found" });
     }
 
-    // Fake res object to capture JSON output
+    // Capture the JSON output from the runner
+    let payload: any = null;
+    const fakeRes: any = {
+      json: (x: any) => {
+        payload = x;
+        return x;
+      },
+      status: (_c: number) => fakeRes,
+    };
+
+    const prevBody = (req as any).body;
+    try {
+      (req as any).body = {
+        mode: "dry_run",
+        limit_reps,
+        contacts_per_rep,
+        max_total_contacts,
+      };
+
+      await runner.route.stack[0].handle(req, fakeRes);
+    } finally {
+      (req as any).body = prevBody;
+    }
+
+    if (!payload?.ok) {
+      const upstreamErr = String(payload?.error ?? "preview_failed");
+      return res.status(500).json({ ok: false, error: "preview_failed", detail: upstreamErr });
+    }
+
+    // --- PATCH: Best-effort: finish preview run with label (fail-open)
+    // Best-effort: label this run as a preview in the run history (fail-open)
+    try {
+      await supa
+        .from("crm_auto_assign_runs")
+        .update({ source: "preview" })
+        .eq("run_id", payload.run_id)
+        .eq("user_id", requester);
+    } catch {
+      // fail-open
+    }
+    await logCrmAutoAssignRunBestEffort({
+      phase: "finish",
+      run_id: payload.run_id,
+      requester,
+      mode: "dry_run",
+      started_at: startedAt.toISOString(),
+      finished_at: new Date().toISOString(),
+      totals: payload.totals,
+      reps: payload.reps,
+    });
+
+    // Enrich with preview-only metadata and clear label for downstream UI
+    return res.json({
+      ok: true,
+      preview: true,
+      source: "preview",
+      generated_at: startedAt.toISOString(),
+      run_id: payload.run_id,
+      totals: payload.totals,
+      reps: payload.reps,
+      hint: "Preview only — no actions were created. Execute explicitly to apply.",
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
+      return res.status(401).json({ ok: false, error: msg });
+    }
+    if (msg.includes("forbidden_rep_scope") || msg.includes("forbidden_org_scope")) {
+      return res.status(403).json({ ok: false, error: msg });
+    }
+    return res.status(500).json({ ok: false, error: msg || "server_error", detail: msg || "server_error" });
+  }
+});
+
+// ------------------------------
+// MANAGER AUTO-ASSIGN EXECUTE FROM PREVIEW (v1)
+// POST /v1/crm/manager/auto-assign/execute-from-preview
+// Body: { preview_run_id: uuid }
+// - Executes a previously completed dry_run
+// - Fails closed if the run does not exist or was not a dry_run
+// ------------------------------
+router.post("/manager/auto-assign/execute-from-preview", async (req, res) => {
+  try {
+    const { requester, orgId } = await requireManagerOrg(req);
+
+    // Explicit org safety (defensive, even if DB schema changes)
+    if (!orgId) {
+      return res.status(500).json({ ok: false, error: "org_scope_required" });
+    }
+
+    const previewRunId = String((req.body as any)?.preview_run_id ?? "").trim();
+
+    if (!UUID_RE.test(previewRunId)) {
+      return res.status(400).json({ ok: false, error: "invalid_preview_run_id" });
+    }
+
+    // Fetch the preview run (tolerate missing source column)
+    const { data: rows, error } = await supa
+      .from("crm_auto_assign_runs")
+      .select("run_id, mode, totals")
+      .eq("user_id", requester)
+      .eq("run_id", previewRunId)
+      .limit(1);
+
+    if (error) throw error;
+
+    const row = (rows ?? [])[0];
+    if (!row) {
+      return res.status(404).json({ ok: false, error: "preview_run_not_found" });
+    }
+
+    if (String(row.mode) !== "dry_run") {
+      return res.status(409).json({ ok: false, error: "preview_run_not_dry_run" });
+    }
+
+    // Defensive: tolerate missing 'source' column; no-op if not present.
+    // (Preview validation now relies only on: run exists and mode === "dry_run")
+
+    // If preview produced zero actions, executing it is pointless; fail with a clear error.
+    const previewActionsCreated = Number((row as any)?.totals?.actions_created ?? 0);
+    if (previewActionsCreated === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "preview_has_no_actions",
+        detail: "This preview produced zero actions and cannot be executed.",
+      });
+    }
+
+    // Fail closed if this preview has already been executed
+    const { data: executedCheck } = await supa
+      .from("crm_auto_assign_runs")
+      .select("run_id, executed_from_preview_run_id")
+      .eq("executed_from_preview_run_id", previewRunId)
+      .limit(1);
+
+    if (executedCheck && executedCheck.length > 0) {
+      return res.status(409).json({ ok: false, error: "preview_already_executed" });
+    }
+
+    // Execute with the same safety defaults (no re-preview)
+    // IMPORTANT: do NOT spread `req` into a plain object (it loses req.header()).
+    const runner = (router as any).stack.find(
+      (r: any) =>
+        r.route &&
+        r.route.path === "/manager/auto-assign/run" &&
+        r.route.methods.post
+    );
+
+    if (!runner) {
+      return res.status(500).json({ ok: false, error: "runner_not_found" });
+    }
+
     let payload: any = null;
     const fakeRes = {
       json: (x: any) => {
@@ -2022,24 +2164,53 @@ router.post("/manager/auto-assign/preview", async (req, res) => {
       status: (_c: number) => fakeRes,
     };
 
-    await runner.route.stack[0].handle(previewReq, fakeRes);
-
-    if (!payload?.ok) {
-      return res.status(500).json({ ok: false, error: "preview_failed" });
+    const prevBody = (req as any).body;
+    try {
+      (req as any).body = { mode: "execute" };
+      await runner.route.stack[0].handle(req, fakeRes);
+    } finally {
+      (req as any).body = prevBody;
     }
 
-    // Enrich with preview-only metadata
+    if (!payload?.ok) {
+      return res.status(500).json({ ok: false, error: "execute_failed" });
+    }
+
+    // Best-effort audit link: mark execution as derived from preview
+    try {
+      await supa
+        .from("crm_auto_assign_runs")
+        .update({
+          executed_from_preview_run_id: previewRunId,
+          executed_by_user_id: requester,
+          executed_at: new Date().toISOString(),
+        })
+        .eq("run_id", payload.run_id)
+        .eq("user_id", requester);
+    } catch {
+      // fail-open: audit should never block execution
+    }
+
     return res.json({
       ok: true,
-      preview: true,
-      generated_at: startedAt.toISOString(),
+      executed_from_preview: previewRunId,
       run_id: payload.run_id,
       totals: payload.totals,
       reps: payload.reps,
-      hint: "Preview only — no actions were created. Execute explicitly to apply.",
     });
   } catch (e: any) {
     const msg = String(e?.message ?? "");
+    if (msg.includes("invalid_preview_run_id") || msg.includes("preview_has_no_actions")) {
+      return res.status(400).json({ ok: false, error: msg });
+    }
+    if (
+      msg.includes("preview_run_not_found") ||
+      msg.includes("preview_already_executed") ||
+      msg.includes("preview_run_not_preview") ||
+      msg.includes("preview_run_not_dry_run")
+    ) {
+      return res.status(409).json({ ok: false, error: msg });
+    }
     if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
       return res.status(401).json({ ok: false, error: msg });
     }
@@ -2118,6 +2289,9 @@ router.post("/manager/auto-assign/run", async (req, res) => {
         contacts_considered: number;
         errors_sample?: Array<{ contact_id: string; error: string }>;
         error?: string;
+        // --- Day 38 Step C: skipped reason diagnostics ---
+        skipped_by_reason?: Record<string, number>;
+        skipped_samples?: Array<{ contact_id: string; reason: string }>;
       }>;
     } = {
       ok: true,
@@ -2156,6 +2330,9 @@ router.post("/manager/auto-assign/run", async (req, res) => {
         let skipped_dedupe = 0;
         let contacts_considered = 0;
         const errors_sample: Array<{ contact_id: string; error: string }> = [];
+        // --- Step 2: skipped reason diagnostics ---
+        const skipped_by_reason: Record<string, number> = {};
+        const skipped_samples: Array<{ contact_id: string; reason: string }> = [];
 
         const remaining = Math.max(0, MAX_TOTAL_CONTACTS - totalContactsConsidered);
         const list = (contacts ?? []).slice(0, Math.min(CONTACTS_PER_REP, remaining));
@@ -2171,8 +2348,31 @@ router.post("/manager/auto-assign/run", async (req, res) => {
               dry_run,
             });
 
-            if (out?.created === true) created++;
-            if (out?.duplicate === true) skipped_dedupe++;
+            // --- Step 3: capture skip reasons ---
+            const createdFlag = out?.created === true;
+            const dupFlag = out?.duplicate === true;
+
+            // If core doesn't emit a reason but also didn't create/duplicate, record a default.
+            const reasonFromCore = (out as any)?.skipped_reason;
+            const reason = reasonFromCore ? String(reasonFromCore) : (!createdFlag && !dupFlag ? "no_rules_matched" : null);
+
+            if (dupFlag) {
+              skipped_dedupe++;
+              skipped_by_reason["dedupe_recent"] = (skipped_by_reason["dedupe_recent"] || 0) + 1;
+              if (skipped_samples.length < 5) {
+                skipped_samples.push({ contact_id: contactId, reason: "dedupe_recent" });
+              }
+            }
+
+            if (reason) {
+              skipped_by_reason[reason] = (skipped_by_reason[reason] || 0) + 1;
+              if (skipped_samples.length < 5) {
+                skipped_samples.push({ contact_id: contactId, reason });
+              }
+            }
+
+            if (createdFlag) created++;
+            // NOTE: do not increment skipped_dedupe here again, handled above.
           } catch (e: any) {
             result.totals.errors++;
             if (errors_sample.length < 3) {
@@ -2198,6 +2398,9 @@ router.post("/manager/auto-assign/run", async (req, res) => {
           skipped_dedupe,
           contacts_considered,
           errors_sample: errors_sample.length ? errors_sample : undefined,
+          // --- Step 4: attach diagnostics ---
+          skipped_by_reason: Object.keys(skipped_by_reason).length ? skipped_by_reason : undefined,
+          skipped_samples: skipped_samples.length ? skipped_samples : undefined,
         });
       } catch (e: any) {
         result.totals.errors++;
@@ -2447,7 +2650,7 @@ router.get("/manager/auto-assign/runs/latest", async (req, res) => {
       .select("run_id, mode, started_at, finished_at, totals, reps")
       .eq("user_id", requester)
       .order("started_at", { ascending: false })
-      .limit(1);
+      .limit(25);
 
     if (error) {
       const msg = String((error as any)?.message ?? "");
@@ -2457,8 +2660,15 @@ router.get("/manager/auto-assign/runs/latest", async (req, res) => {
       return res.status(400).json({ ok: false, error: msg || "query_failed" });
     }
 
-    const row = (data ?? [])[0] as any;
-    if (!row) return res.json({ ok: true, item: null });
+    const rows = (data ?? []) as any[];
+    if (!rows.length) return res.json({ ok: true, item: null });
+
+    // Pick the newest run that looks like a real UUID run_id.
+    const row = rows.find((r: any) => UUID_RE.test(String(r?.run_id ?? "").trim()));
+
+    if (!row) {
+      return res.json({ ok: true, item: null, source: "no_valid_uuid" });
+    }
 
     return res.json({
       ok: true,
@@ -3177,6 +3387,31 @@ async function runContactAutoAssignCore(args: {
   });
 
   // ---------------------------------------------------------
+  // RULES: decide if an auto-assign should be created at all
+  // - Only create actions for contacts that are "cold" or "stale".
+  // - "hot" / "warm" contacts are considered healthy and are skipped.
+  // ---------------------------------------------------------
+  const status = String((health as any)?.status ?? "").toLowerCase();
+  const shouldCreate = status === "cold" || status === "stale";
+
+  if (!shouldCreate) {
+    const skipped_reason = status === "hot" || status === "warm"
+      ? "healthy_recent"
+      : "no_rules_matched";
+
+    return {
+      ok: true,
+      dry_run,
+      contact_id: contactId,
+      health,
+      suggestion,
+      created: false,
+      duplicate: false,
+      skipped_reason,
+    };
+  }
+
+  // ---------------------------------------------------------
   // DEDUPE: prevent spamming auto-assign creations (24h window)
   // ---------------------------------------------------------
   const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -3276,7 +3511,15 @@ async function runContactAutoAssignCore(args: {
   }
 
   if (dry_run) {
-    return { ok: true, dry_run: true, contact_id: contactId, health, suggestion };
+    return {
+      ok: true,
+      dry_run: true,
+      contact_id: contactId,
+      health,
+      suggestion,
+      created: true,      // “would create” in preview
+      duplicate: false,
+    };
   }
 
   // Insert assignment (best-effort across table variants)
