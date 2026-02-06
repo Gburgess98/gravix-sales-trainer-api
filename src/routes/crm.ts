@@ -1658,12 +1658,16 @@ router.post("/manager/runner", async (req, res) => {
 
     for (const rep of reps) {
       try {
+        let fetchContactsMs = 0;
+
+        const fetchT0 = Date.now();
         const { data: contacts, error: cErr } = await supa
           .from("crm_contacts")
           .select("id")
           .eq("user_id", requester)
           .order("created_at", { ascending: false })
           .limit(CONTACTS_PER_REP);
+        fetchContactsMs = Date.now() - fetchT0;
 
         if (cErr) throw cErr;
 
@@ -1675,6 +1679,7 @@ router.post("/manager/runner", async (req, res) => {
         const remaining = Math.max(0, MAX_TOTAL_CONTACTS - totalContactsConsidered);
         const list = (contacts ?? []).slice(0, Math.min(CONTACTS_PER_REP, remaining));
 
+        const procT0 = Date.now();
         for (const c of list) {
           const contactId = String((c as any).id ?? "").trim();
           if (!contactId) continue;
@@ -2063,8 +2068,17 @@ router.post("/manager/auto-assign/preview", async (req, res) => {
       run_id: payload.run_id,
       totals: payload.totals,
       reps: payload.reps,
+      // ✅ Forward v2 meta (timings/caps). Never return null.
+      meta: {
+        ...(payload && typeof (payload as any).meta === "object" && (payload as any).meta ? (payload as any).meta : {}),
+        // Always make meta an object for consumers (never null)
+        preview: true,
+        forwarded: Boolean(payload && (payload as any).meta),
+        generated_at: startedAt.toISOString(),
+      },
       hint: "Preview only — no actions were created. Execute explicitly to apply.",
     });
+
   } catch (e: any) {
     const msg = String(e?.message ?? "");
     if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
@@ -2191,13 +2205,25 @@ router.post("/manager/auto-assign/execute-from-preview", async (req, res) => {
       // fail-open: audit should never block execution
     }
 
+    const meta =
+      payload && typeof (payload as any).meta === "object" && (payload as any).meta
+        ? (payload as any).meta
+        : {};
+
     return res.json({
       ok: true,
       executed_from_preview: previewRunId,
       run_id: payload.run_id,
       totals: payload.totals,
       reps: payload.reps,
+      // ✅ propagate v2 timings/caps when available
+      meta: {
+        ...meta,
+        executed_from_preview: true,
+        preview_run_id: previewRunId,
+      },
     });
+    
   } catch (e: any) {
     const msg = String(e?.message ?? "");
     if (msg.includes("invalid_preview_run_id") || msg.includes("preview_has_no_actions")) {
@@ -2240,6 +2266,21 @@ const ManagerAutoAssignRunSchema = z.object({
 router.post("/manager/auto-assign/run", async (req, res) => {
   try {
     const { requester, orgId } = await requireManagerOrg(req);
+
+    // ------------------------------
+    // Day 39 Step 1: Timing instrumentation
+    // ------------------------------
+    const t0 = Date.now();
+    const TIME_BUDGET_MS = 10000;
+
+    const perRepTimings: Array<{
+      rep_id: string;
+      fetch_contacts_ms: number;
+      processing_ms: number;
+      total_ms: number;
+    }> = [];
+
+    let aborted_reason: "max_contacts" | "time_budget" | null = null;
 
     const parsed = ManagerAutoAssignRunSchema.safeParse(req.body ?? {});
     if (!parsed.success) {
@@ -2316,13 +2357,28 @@ router.post("/manager/auto-assign/run", async (req, res) => {
     let totalContactsConsidered = 0;
 
     for (const rep of reps) {
+      // Global safety guards
+      if (Date.now() - t0 > TIME_BUDGET_MS) {
+        aborted_reason = "time_budget";
+        break;
+      }
+      if (totalContactsConsidered >= MAX_TOTAL_CONTACTS) {
+        aborted_reason = "max_contacts";
+        break;
+      }
+
+      const repT0 = Date.now();
+      let fetchContactsMs = 0;
+      let processingMs = 0;
       try {
+        const fetchT0 = Date.now();
         const { data: contacts, error: cErr } = await supa
           .from("crm_contacts")
           .select("id")
           .eq("user_id", requester)
           .order("created_at", { ascending: false })
           .limit(CONTACTS_PER_REP);
+        fetchContactsMs = Date.now() - fetchT0;
 
         if (cErr) throw cErr;
 
@@ -2337,6 +2393,7 @@ router.post("/manager/auto-assign/run", async (req, res) => {
         const remaining = Math.max(0, MAX_TOTAL_CONTACTS - totalContactsConsidered);
         const list = (contacts ?? []).slice(0, Math.min(CONTACTS_PER_REP, remaining));
 
+        const procT0 = Date.now();
         for (const c of list) {
           const contactId = String((c as any).id ?? "").trim();
           if (!contactId) continue;
@@ -2387,6 +2444,15 @@ router.post("/manager/auto-assign/run", async (req, res) => {
             result.totals.contacts_considered = totalContactsConsidered;
           }
         }
+        processingMs = Date.now() - procT0;
+
+        const repTotalMs = Date.now() - repT0;
+        perRepTimings.push({
+          rep_id: rep.rep_id,
+          fetch_contacts_ms: fetchContactsMs,
+          processing_ms: processingMs,
+          total_ms: repTotalMs,
+        });
 
         result.totals.actions_created += created;
         result.totals.skipped_dedupe += skipped_dedupe;
@@ -2404,6 +2470,12 @@ router.post("/manager/auto-assign/run", async (req, res) => {
         });
       } catch (e: any) {
         result.totals.errors++;
+        perRepTimings.push({
+          rep_id: rep.rep_id,
+          fetch_contacts_ms: fetchContactsMs,
+          processing_ms: processingMs,
+          total_ms: Date.now() - repT0,
+        });
         result.reps.push({
           rep_id: rep.rep_id,
           rep_name: rep.rep_name ?? null,
@@ -2505,7 +2577,26 @@ router.post("/manager/auto-assign/run", async (req, res) => {
       }
     }
 
-    return res.json(result);
+    const total_ms = Date.now() - t0;
+
+    const meta = {
+      version: "v2",
+      total_ms,
+      time_budget_ms: TIME_BUDGET_MS,
+      aborted_reason,
+      timings: {
+        per_rep: perRepTimings,
+      },
+      caps: {
+        contacts_per_rep: CONTACTS_PER_REP,
+        max_total_contacts: MAX_TOTAL_CONTACTS,
+      },
+    };
+
+    return res.json({
+      ...result,
+      meta,
+    });
   } catch (e: any) {
     const msg = String(e?.message ?? "");
     if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
@@ -3721,6 +3812,8 @@ router.post("/cron/crm/auto-assign", async (req, res) => {
         const remaining = Math.max(0, MAX_TOTAL_CONTACTS - totalContactsConsidered);
         const list = (contacts ?? []).slice(0, Math.min(CONTACTS_PER_REP, remaining));
 
+        const procT0 = Date.now();
+
         for (const c of list) {
           const contactId = String((c as any)?.id ?? "");
           if (!contactId) continue;
@@ -3795,7 +3888,19 @@ router.post("/cron/crm/auto-assign", async (req, res) => {
       reps: result.reps,
     });
 
-    return res.json(result);
+    const total_ms = Date.now() - t0;
+
+    return res.json({
+      ...result,
+      meta: {
+        total_ms,
+        time_budget_ms: TIME_BUDGET_MS,
+        aborted_reason,
+        timings: {
+          per_rep: perRepTimings,
+        },
+      },
+    });
   } catch (e: any) {
     return res.status(403).json({ ok: false, error: e?.message ?? "cron_forbidden" });
   }
