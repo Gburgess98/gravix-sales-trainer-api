@@ -2102,6 +2102,8 @@ router.post("/manager/auto-assign/execute-from-preview", async (req, res) => {
   try {
     const { requester, orgId } = await requireManagerOrg(req);
 
+    const __t0 = Date.now();
+
     // Explicit org safety (defensive, even if DB schema changes)
     if (!orgId) {
       return res.status(500).json({ ok: false, error: "org_scope_required" });
@@ -2135,13 +2137,33 @@ router.post("/manager/auto-assign/execute-from-preview", async (req, res) => {
     // Defensive: tolerate missing 'source' column; no-op if not present.
     // (Preview validation now relies only on: run exists and mode === "dry_run")
 
-    // If preview produced zero actions, executing it is pointless; fail with a clear error.
+    // If preview produced zero actions, executing it is a valid no-op.
+    // Return ok=true with meta so the Manager UI can still show timings/why nothing happened.
     const previewActionsCreated = Number((row as any)?.totals?.actions_created ?? 0);
     if (previewActionsCreated === 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "preview_has_no_actions",
-        detail: "This preview produced zero actions and cannot be executed.",
+      return res.json({
+        ok: true,
+        executed_from_preview: previewRunId,
+        run_id: null,
+        totals: {
+          reps_considered: 0,
+          contacts_considered: 0,
+          actions_created: 0,
+          skipped_dedupe: 0,
+          errors: 0,
+        },
+        reps: [],
+        meta: {
+          version: "v2",
+          total_ms: Date.now() - __t0,
+          time_budget_ms: 10000,
+          aborted_reason: "preview_has_no_actions",
+          timings: { per_rep: [] },
+          caps: { contacts_per_rep: 0, max_total_contacts: 0 },
+          executed_from_preview: true,
+          preview_run_id: previewRunId,
+        },
+        hint: "Nothing to execute — preview had no actions.",
       });
     }
 
@@ -2218,15 +2240,16 @@ router.post("/manager/auto-assign/execute-from-preview", async (req, res) => {
       reps: payload.reps,
       // ✅ propagate v2 timings/caps when available
       meta: {
+        total_ms: typeof (meta as any)?.total_ms === "number" ? (meta as any).total_ms : Date.now() - __t0,
         ...meta,
         executed_from_preview: true,
         preview_run_id: previewRunId,
       },
     });
-    
+
   } catch (e: any) {
     const msg = String(e?.message ?? "");
-    if (msg.includes("invalid_preview_run_id") || msg.includes("preview_has_no_actions")) {
+    if (msg.includes("invalid_preview_run_id")) {
       return res.status(400).json({ ok: false, error: msg });
     }
     if (
@@ -2362,6 +2385,13 @@ router.post("/manager/auto-assign/run", async (req, res) => {
         aborted_reason = "time_budget";
         break;
       }
+
+      // If we aborted early (time budget / max contacts), surface it as an error signal.
+      // This keeps the run visible in dashboards/alerts without throwing.
+      if (aborted_reason) {
+        result.totals.errors += 1;
+      }
+
       if (totalContactsConsidered >= MAX_TOTAL_CONTACTS) {
         aborted_reason = "max_contacts";
         break;
@@ -2409,27 +2439,25 @@ router.post("/manager/auto-assign/run", async (req, res) => {
             const createdFlag = out?.created === true;
             const dupFlag = out?.duplicate === true;
 
-            // If core doesn't emit a reason but also didn't create/duplicate, record a default.
-            const reasonFromCore = (out as any)?.skipped_reason;
-            const reason = reasonFromCore ? String(reasonFromCore) : (!createdFlag && !dupFlag ? "no_rules_matched" : null);
+            if (createdFlag) created++;
+            if (dupFlag) skipped_dedupe++;
 
-            if (dupFlag) {
-              skipped_dedupe++;
-              skipped_by_reason["dedupe_recent"] = (skipped_by_reason["dedupe_recent"] || 0) + 1;
-              if (skipped_samples.length < 5) {
-                skipped_samples.push({ contact_id: contactId, reason: "dedupe_recent" });
-              }
-            }
+                        // If core doesn't emit a reason but also didn't create/duplicate,
+            // count it as a skip with a best-effort reason.
+            if (!createdFlag && !dupFlag) {
+              const reasonRaw =
+                (out as any)?.skip_reason ??
+                (out as any)?.reason ??
+                (out as any)?.skipped_reason ??
+                (out as any)?.skipped ??
+                null;
 
-            if (reason) {
+              const reason = String(reasonRaw ?? "no_next_action").trim() || "no_next_action";
               skipped_by_reason[reason] = (skipped_by_reason[reason] || 0) + 1;
-              if (skipped_samples.length < 5) {
+              if (skipped_samples.length < 3) {
                 skipped_samples.push({ contact_id: contactId, reason });
               }
             }
-
-            if (createdFlag) created++;
-            // NOTE: do not increment skipped_dedupe here again, handled above.
           } catch (e: any) {
             result.totals.errors++;
             if (errors_sample.length < 3) {
@@ -2442,20 +2470,30 @@ router.post("/manager/auto-assign/run", async (req, res) => {
             contacts_considered++;
             totalContactsConsidered++;
             result.totals.contacts_considered = totalContactsConsidered;
+
+            // Time budget guard inside tight loop
+            if (Date.now() - t0 > TIME_BUDGET_MS) {
+              aborted_reason = "time_budget";
+              break;
+            }
+
+            if (totalContactsConsidered >= MAX_TOTAL_CONTACTS) {
+              aborted_reason = "max_contacts";
+              break;
+            }
           }
         }
         processingMs = Date.now() - procT0;
 
-        const repTotalMs = Date.now() - repT0;
+        result.totals.actions_created += created;
+        result.totals.skipped_dedupe += skipped_dedupe;
+
         perRepTimings.push({
           rep_id: rep.rep_id,
           fetch_contacts_ms: fetchContactsMs,
           processing_ms: processingMs,
-          total_ms: repTotalMs,
+          total_ms: Date.now() - repT0,
         });
-
-        result.totals.actions_created += created;
-        result.totals.skipped_dedupe += skipped_dedupe;
 
         result.reps.push({
           rep_id: rep.rep_id,
@@ -2464,139 +2502,76 @@ router.post("/manager/auto-assign/run", async (req, res) => {
           skipped_dedupe,
           contacts_considered,
           errors_sample: errors_sample.length ? errors_sample : undefined,
-          // --- Step 4: attach diagnostics ---
           skipped_by_reason: Object.keys(skipped_by_reason).length ? skipped_by_reason : undefined,
           skipped_samples: skipped_samples.length ? skipped_samples : undefined,
         });
       } catch (e: any) {
         result.totals.errors++;
+
         perRepTimings.push({
           rep_id: rep.rep_id,
           fetch_contacts_ms: fetchContactsMs,
           processing_ms: processingMs,
           total_ms: Date.now() - repT0,
         });
+
         result.reps.push({
           rep_id: rep.rep_id,
           rep_name: rep.rep_name ?? null,
           created: 0,
           skipped_dedupe: 0,
           contacts_considered: 0,
-          error: String(e?.message ?? "rep_auto_assign_failed"),
+          error: String(e?.message ?? "rep_runner_failed"),
         });
       }
+
+      if (aborted_reason) break;
     }
 
     result.finished_at = new Date().toISOString();
 
-    // Best-effort: update the run record with totals + per-rep summary (fail-open)
-    await logCrmAutoAssignRunBestEffort({
-      phase: "finish",
-      run_id,
-      requester,
-      mode,
-      started_at: result.started_at,
-      finished_at: result.finished_at,
-      totals: result.totals,
-      reps: result.reps,
-    });
+    // If we aborted early, surface it as a soft error signal
+    if (aborted_reason) result.totals.errors += 1;
 
-    // IMPORTANT: Slack notification is triggered AFTER run logging completes
-    // and BEFORE the API response is returned. This is fail-open and must
-    // never block the runner or UI.
-    // Step F: Slack alert on bad runs (fail-open)
-    await notifyCrmAutoAssignRunSlack({
-      run_id: result.run_id,
-      requester,
-      mode: result.mode,
-      totals: result.totals,
-      reps: result.reps,
-    });
-
-    // --- Day 37: Cron-safe persistence (best-effort, fail-open) ---
-    // If this endpoint is invoked by an internal scheduler route, we mark the run as `source=cron`.
-    // We detect this via a flag set by the scheduler route OR by presence of x-cron-secret.
-    const isCronInvoke = Boolean((req as any)?.isCron === true || (req as any)?.cron === true || req.headers["x-cron-secret"]);
-
-    if (isCronInvoke) {
-      // Try to upsert a richer run record if the schema supports it.
-      // (Some deployments only have user_id/mode/totals/reps; we strip missing columns iteratively.)
-      const seed: any = {
-        run_id: result.run_id,
-        user_id: requester,
-        org_id: orgId,
-        mode: result.mode,
-        source: "cron",
+    // Best-effort: run logging + Slack alert (fail-open)
+    try {
+      await logCrmAutoAssignRunBestEffort({
+        phase: "finish",
+        run_id,
+        requester,
+        mode,
         started_at: result.started_at,
         finished_at: result.finished_at,
         totals: result.totals,
         reps: result.reps,
-      };
+      });
+    } catch {}
 
-      const isMissingSchema = (msg: string) => {
-        const m = msg.toLowerCase();
-        return (
-          (m.includes("relation") && m.includes("does not exist")) ||
-          (m.includes("does not exist") && m.includes("crm_auto_assign_runs"))
-        );
-      };
-
-      const stripMissingCol = (msg: string, payload: any) => {
-        const lower = msg.toLowerCase();
-        const m1 = lower.match(/could not find the '([^']+)' column/);
-        const m2 = lower.match(/column crm_auto_assign_runs\.([a-zA-Z0-9_]+) does not exist/);
-        const missing = (m1?.[1] ?? m2?.[1]) as string | undefined;
-        if (missing && missing in payload) {
-          const next = { ...payload };
-          delete next[missing];
-          return next;
-        }
-        return null;
-      };
-
-      try {
-        let payload = { ...seed };
-        for (let i = 0; i < 8; i++) {
-          const { error } = await supa.from("crm_auto_assign_runs").upsert(payload, { onConflict: "run_id" });
-          if (!error) break;
-
-          const msg = String((error as any)?.message ?? "");
-          if (isMissingSchema(msg)) break;
-
-          const stripped = stripMissingCol(msg, payload);
-          if (stripped) {
-            payload = stripped;
-            continue;
-          }
-
-          // Unknown error: stop (fail-open)
-          break;
-        }
-      } catch {
-        // fail-open
-      }
-    }
-
-    const total_ms = Date.now() - t0;
+    try {
+      await notifyCrmAutoAssignRunSlack({
+        run_id,
+        requester,
+        mode,
+        totals: result.totals,
+        reps: result.reps,
+      });
+    } catch {}
 
     const meta = {
-      version: "v2",
-      total_ms,
+      version: "v2" as const,
+      total_ms: Date.now() - t0,
       time_budget_ms: TIME_BUDGET_MS,
       aborted_reason,
-      timings: {
-        per_rep: perRepTimings,
-      },
+      timings: { per_rep: perRepTimings },
       caps: {
         contacts_per_rep: CONTACTS_PER_REP,
         max_total_contacts: MAX_TOTAL_CONTACTS,
       },
+      preview: dry_run,
+      generated_at: startedAt.toISOString(),
     };
 
-    return res.json({
-      ...result,
-      meta,
-    });
+    return res.json({ ...result, meta });
   } catch (e: any) {
     const msg = String(e?.message ?? "");
     if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
@@ -2605,51 +2580,57 @@ router.post("/manager/auto-assign/run", async (req, res) => {
     if (msg.includes("forbidden_rep_scope") || msg.includes("forbidden_org_scope")) {
       return res.status(403).json({ ok: false, error: msg });
     }
-    if (msg.includes("invalid_body")) {
-      return res.status(422).json({ ok: false, error: msg });
-    }
     return res.status(500).json({ ok: false, error: msg || "server_error" });
   }
 });
 
+// ------------------------------
+// MANAGER RUN HISTORY
 // GET /v1/crm/manager/auto-assign/runs
-// Query: ?limit=10
+// ------------------------------
 router.get("/manager/auto-assign/runs", async (req, res) => {
-  const { requester } = await requireManagerOrg(req);
-
-  const isMissingTable = (msg: string) => {
-    const m = msg.toLowerCase();
-    return (
-      (m.includes("relation") && m.includes("does not exist")) ||
-      (m.includes("does not exist") && m.includes("crm_auto_assign_runs"))
-    );
-  };
-
   try {
-    const limit = Math.min(Math.max(Number((req.query as any)?.limit ?? 10), 1), 50);
+    const { requester } = await requireManagerOrg(req);
+
+    const limit = Math.min(Math.max(Number(req.query.limit ?? 10), 1), 50);
+
+    const isMissingTable = (msg: string) => {
+      const m = msg.toLowerCase();
+      return (
+        (m.includes("relation") && m.includes("does not exist")) ||
+        (m.includes("does not exist") && m.includes("crm_auto_assign_runs"))
+      );
+    };
 
     const { data, error } = await supa
       .from("crm_auto_assign_runs")
-      .select("run_id, mode, started_at, finished_at, totals")
+      .select(
+        "run_id, mode, started_at, finished_at, totals, reps, source, is_preview, executed_from_preview_run_id, executed_by_user_id, executed_at"
+      )
       .eq("user_id", requester)
       .order("started_at", { ascending: false })
       .limit(limit);
 
     if (error) {
       const msg = String((error as any)?.message ?? "");
-      if (isMissingTable(msg)) {
-        return res.json({ ok: true, items: [], source: "missing_table" });
-      }
+      if (isMissingTable(msg)) return res.json({ ok: true, items: [], source: "missing_table" });
       return res.status(400).json({ ok: false, error: msg || "query_failed" });
     }
 
-    const items = (data ?? []).map((row: any) => ({
-      run_id: String(row.run_id ?? "").trim(),
-      mode: String(row.mode ?? "").trim(),
-      started_at: row.started_at ?? null,
-      finished_at: row.finished_at ?? null,
-      totals: row.totals ?? null,
-    }));
+    const items = (data ?? [])
+      .map((row: any) => ({
+        run_id: String(row.run_id ?? "").trim(),
+        mode: row.mode ?? null,
+        source: row.source ?? null,
+        is_preview: Boolean(row.is_preview ?? row.preview ?? false),
+        executed_from_preview_run_id: row.executed_from_preview_run_id ?? null,
+        executed_by_user_id: row.executed_by_user_id ?? null,
+        executed_at: row.executed_at ?? null,
+        started_at: row.started_at ?? null,
+        finished_at: row.finished_at ?? null,
+        totals: row.totals ?? null,
+      }))
+      .filter((x: any) => x.run_id);
 
     return res.json({ ok: true, items });
   } catch (e: any) {
@@ -2666,34 +2647,88 @@ router.get("/manager/auto-assign/runs", async (req, res) => {
 
 // GET /v1/crm/manager/auto-assign/runs/:run_id
 router.get("/manager/auto-assign/runs/:run_id", async (req, res) => {
-  const { requester } = await requireManagerOrg(req);
-  const runId = String(req.params.run_id ?? "").trim();
-
-  const isMissingTable = (msg: string) => {
-    const m = msg.toLowerCase();
-    return (
-      (m.includes("relation") && m.includes("does not exist")) ||
-      (m.includes("does not exist") && m.includes("crm_auto_assign_runs"))
-    );
-  };
-
-  if (!runId || !UUID_RE.test(runId)) {
-    return res.status(400).json({ ok: false, error: "invalid_run_id" });
-  }
-
   try {
+    const { requester } = await requireManagerOrg(req);
+    const runId = String(req.params.run_id ?? "").trim();
+    if (!runId) return res.status(400).json({ ok: false, error: "invalid_run_id" });
+
+    const isMissingTable = (msg: string) => {
+      const m = msg.toLowerCase();
+      return (
+        (m.includes("relation") && m.includes("does not exist")) ||
+        (m.includes("does not exist") && m.includes("crm_auto_assign_runs"))
+      );
+    };
+
     const { data, error } = await supa
       .from("crm_auto_assign_runs")
-      .select("run_id, mode, started_at, finished_at, totals, reps")
+      .select(
+        "run_id, mode, started_at, finished_at, totals, reps, source, is_preview, executed_from_preview_run_id, executed_by_user_id, executed_at"
+      )
       .eq("user_id", requester)
       .eq("run_id", runId)
       .limit(1);
 
     if (error) {
       const msg = String((error as any)?.message ?? "");
-      if (isMissingTable(msg)) {
-        return res.json({ ok: true, item: null, source: "missing_table" });
-      }
+      if (isMissingTable(msg)) return res.json({ ok: true, item: null, source: "missing_table" });
+      return res.status(400).json({ ok: false, error: msg || "query_failed" });
+    }
+
+    const row = (data ?? [])[0] as any;
+    if (!row) return res.json({ ok: true, item: null });
+
+    return res.json({
+      ok: true,
+      item: {
+        run_id: String(row.run_id ?? "").trim(),
+        mode: row.mode ?? null,
+        source: row.source ?? null,
+        is_preview: Boolean(row.is_preview ?? row.preview ?? false),
+        executed_from_preview_run_id: row.executed_from_preview_run_id ?? null,
+        executed_by_user_id: row.executed_by_user_id ?? null,
+        executed_at: row.executed_at ?? null,
+        started_at: row.started_at ?? null,
+        finished_at: row.finished_at ?? null,
+        totals: row.totals ?? null,
+        reps: row.reps ?? null,
+      },
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
+      return res.status(401).json({ ok: false, error: msg });
+    }
+    if (msg.includes("forbidden_org_scope")) {
+      return res.status(403).json({ ok: false, error: msg });
+    }
+    return res.status(500).json({ ok: false, error: msg || "server_error" });
+  }
+});
+
+// GET /v1/crm/manager/auto-assign/runs/latest
+router.get("/manager/auto-assign/runs/latest", async (req, res) => {
+  try {
+    const { requester } = await requireManagerOrg(req);
+
+    const isMissingTable = (msg: string) => {
+      const m = msg.toLowerCase();
+      return (
+        (m.includes("relation") && m.includes("does not exist")) ||
+        (m.includes("does not exist") && m.includes("crm_auto_assign_runs"))
+      );
+    };
+
+    const { data, error } = await supa
+      .from("crm_auto_assign_runs")
+      .select("run_id, mode, started_at, finished_at, totals, reps")
+      .eq("user_id", requester)
+      .order("started_at", { ascending: false })
+      .limit(1);
+
+    if (error) {
+      const msg = String((error as any)?.message ?? "");
+      if (isMissingTable(msg)) return res.json({ ok: true, item: null, source: "missing_table" });
       return res.status(400).json({ ok: false, error: msg || "query_failed" });
     }
 
@@ -2723,1185 +2758,4 @@ router.get("/manager/auto-assign/runs/:run_id", async (req, res) => {
   }
 });
 
-// GET /v1/crm/manager/auto-assign/runs/latest
-router.get("/manager/auto-assign/runs/latest", async (req, res) => {
-  const { requester } = await requireManagerOrg(req);
-
-  const isMissingTable = (msg: string) => {
-    const m = msg.toLowerCase();
-    return (
-      (m.includes("relation") && m.includes("does not exist")) ||
-      (m.includes("does not exist") && m.includes("crm_auto_assign_runs"))
-    );
-  };
-
-  try {
-    const { data, error } = await supa
-      .from("crm_auto_assign_runs")
-      .select("run_id, mode, started_at, finished_at, totals, reps")
-      .eq("user_id", requester)
-      .order("started_at", { ascending: false })
-      .limit(25);
-
-    if (error) {
-      const msg = String((error as any)?.message ?? "");
-      if (isMissingTable(msg)) {
-        return res.json({ ok: true, item: null, source: "missing_table" });
-      }
-      return res.status(400).json({ ok: false, error: msg || "query_failed" });
-    }
-
-    const rows = (data ?? []) as any[];
-    if (!rows.length) return res.json({ ok: true, item: null });
-
-    // Pick the newest run that looks like a real UUID run_id.
-    const row = rows.find((r: any) => UUID_RE.test(String(r?.run_id ?? "").trim()));
-
-    if (!row) {
-      return res.json({ ok: true, item: null, source: "no_valid_uuid" });
-    }
-
-    return res.json({
-      ok: true,
-      item: {
-        run_id: String(row.run_id ?? "").trim(),
-        mode: String(row.mode ?? "").trim(),
-        started_at: row.started_at ?? null,
-        finished_at: row.finished_at ?? null,
-        totals: row.totals ?? null,
-        reps: row.reps ?? null,
-      },
-    });
-  } catch (e: any) {
-    const msg = String(e?.message ?? "");
-    if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
-      return res.status(401).json({ ok: false, error: msg });
-    }
-    if (msg.includes("forbidden_org_scope")) {
-      return res.status(403).json({ ok: false, error: msg });
-    }
-    return res.status(500).json({ ok: false, error: msg || "server_error" });
-  }
-});
-
-// GET /v1/crm/contacts/:id/actions
-// Stable action stream for reps (preferred over assignments when schema drifts)
-router.get("/contacts/:id/actions", async (req, res) => {
-  try {
-    const requester = getUserIdHeader(req);
-    const contactId = String(req.params.id ?? "").trim();
-    if (!contactId) return res.status(400).json({ ok: false, error: "invalid_contact_id" });
-
-    // Demo contacts: empty
-    if (contactId.startsWith("c_")) {
-      return res.json({ ok: true, open: [], completed: [] });
-    }
-
-    const limit = Math.min(Math.max(Number(req.query.limit ?? 50), 1), 200);
-    const r = await fetchCrmActionsBestEffort({ requester, contactId, limit });
-
-    if (!r.ok) {
-      // Fail-open: return empty rather than breaking reps.
-      return res.json({ ok: true, open: [], completed: [], source: "crm_actions_missing_or_unavailable" });
-    }
-
-    return res.json({ ok: true, open: r.open, completed: r.completed, source: "crm_actions" });
-  } catch (e: any) {
-    return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
-  }
-});
-
-// POST /v1/crm/actions/:id/complete
-// Marks an action as completed (idempotent). Uses crm_actions (stable fallback table).
-router.post("/actions/:id/complete", async (req, res) => {
-  try {
-    const requester = getUserIdHeader(req);
-    const id = String(req.params.id ?? "").trim();
-    if (!id) return res.status(400).json({ ok: false, error: "invalid_id" });
-
-    // Load action (owned by requester)
-    const { data: row, error: e1 } = await supa
-      .from("crm_actions")
-      .select("*")
-      .eq("user_id", requester)
-      .eq("id", id)
-      .maybeSingle();
-
-    if (e1) throw e1;
-    if (!row) return res.status(404).json({ ok: false, error: "not_found" });
-
-    // Idempotent: already completed
-    if ((row as any).completed_at || String((row as any).status ?? "").toLowerCase() === "done") {
-      return res.json({ ok: true, action: row, already_completed: true });
-    }
-
-    // Best-effort update: set completed_at + status (if columns exist)
-    const fullPatch: any = {
-      completed_at: new Date().toISOString(),
-      status: "done",
-    };
-
-    const tryUpdate = async (patch: any) => {
-      return await supa
-        .from("crm_actions")
-        .update(patch)
-        .eq("user_id", requester)
-        .eq("id", id)
-        .select("*")
-        .maybeSingle();
-    };
-
-    let updated: any = null;
-    let lastErr: any = null;
-
-    // Try up to 5 times, stripping missing columns.
-    let patch: any = { ...fullPatch };
-    for (let i = 0; i < 5; i++) {
-      const r2 = await tryUpdate(patch);
-      if (!r2.error) {
-        updated = r2.data ?? null;
-        lastErr = null;
-        break;
-      }
-
-      lastErr = r2.error;
-      const msg = String((r2.error as any)?.message ?? "");
-      const lower = msg.toLowerCase();
-
-      const m1 = lower.match(/column crm_actions\.([a-zA-Z0-9_]+) does not exist/);
-      const m2 = lower.match(/could not find the '([^']+)' column/);
-      const missingCol = (m1?.[1] ?? m2?.[1]) as string | undefined;
-
-      if (missingCol && missingCol in patch) {
-        delete patch[missingCol];
-        continue;
-      }
-
-      // Unknown error → stop.
-      break;
-    }
-
-    if (lastErr) throw lastErr;
-
-    // If select is blocked by RLS/schema, fall back to re-fetch
-    if (!updated) {
-      const r3 = await supa
-        .from("crm_actions")
-        .select("*")
-        .eq("user_id", requester)
-        .eq("id", id)
-        .maybeSingle();
-      if (r3.error) throw r3.error;
-      updated = r3.data ?? null;
-    }
-
-    return res.json({ ok: true, action: updated, already_completed: false });
-  } catch (e: any) {
-    return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
-  }
-});
-
-// ------------------- Auto-assign helpers -------------------
-async function computeContactHealthFor(args: {
-  requester: string;
-  contactId: string;
-}): Promise<{
-  contact_id: string;
-  status: ContactHealthStatus;
-  score: number;
-  reasons: string[];
-  next_action: string;
-  signals: {
-    last_contacted_at: string | null;
-    last_contacted_days: number | null;
-    overdue_assignments: number;
-    critical_notes: number;
-    important_notes: number;
-    last_call_score: number | null;
-  };
-}> {
-  const { requester, contactId } = args;
-
-  let contact: any = null;
-
-  if (contactId.startsWith("c_")) {
-    const found = DEMO_CONTACTS.find((c) => c.id === contactId);
-    if (!found) throw new Error("not_found");
-    contact = { id: found.id, last_contacted_at: found.last_contacted_at ?? null };
-  } else {
-    if (!UUID_RE.test(contactId)) throw new Error("invalid_id");
-    const { data: c, error: cErr } = await supa
-      .from("crm_contacts")
-      .select("id, last_contacted_at")
-      .eq("user_id", requester)
-      .eq("id", contactId)
-      .single();
-    if (cErr || !c) throw new Error("not_found");
-    contact = c;
-  }
-
-  const { data: notes } = await supa
-    .from("crm_contact_notes")
-    .select("importance")
-    .eq("user_id", requester)
-    .eq("contact_id", contactId);
-
-  const criticalNotesCount = (notes ?? []).filter((n: any) => n.importance === "critical").length;
-  const importantNotesCount = (notes ?? []).filter((n: any) => n.importance === "important").length;
-
-  let overdueCount = 0;
-  try {
-    const { open } = await fetchContactAssignmentsBestEffort({ requester, contactId, limit: 200 });
-    overdueCount = open.filter((x: any) => x.is_overdue).length;
-  } catch {
-    overdueCount = 0;
-  }
-
-  let lastCallScore: number | null = null;
-  try {
-    const { data: links } = await supa
-      .from("crm_call_links")
-      .select("call_id")
-      .eq("contact_id", contactId)
-      .limit(25);
-
-    const callIds = (links ?? []).map((r: any) => r.call_id).filter(Boolean);
-    if (callIds.length) {
-      const { data: scores } = await supa
-        .from("call_scores")
-        .select("total_score")
-        .eq("user_id", requester)
-        .in("call_id", callIds)
-        .order("created_at", { ascending: false })
-        .limit(1);
-      if (scores?.length) lastCallScore = Number((scores[0] as any).total_score);
-    }
-  } catch {
-    lastCallScore = null;
-  }
-
-  const lastContactedDays = daysSince(contact?.last_contacted_at ?? null);
-
-  const result = classifyHealth({
-    lastContactedDays,
-    overdueCount,
-    criticalNotesCount,
-    importantNotesCount,
-    lastCallScore,
-  });
-
-  return {
-    contact_id: contactId,
-    status: result.status,
-    score: result.score,
-    reasons: result.reasons,
-    next_action: result.next_action,
-    signals: {
-      last_contacted_at: contact?.last_contacted_at ?? null,
-      last_contacted_days: lastContactedDays,
-      overdue_assignments: overdueCount,
-      critical_notes: criticalNotesCount,
-      important_notes: importantNotesCount,
-      last_call_score: lastCallScore,
-    },
-  };
-}
-
-function buildAutoAssignSuggestion(h: {
-  status: ContactHealthStatus;
-  score: number;
-  reasons: string[];
-  next_action: string;
-}): { type: string; title: string; due_at: string; importance: "normal" | "important" | "critical"; meta: any } {
-  const now = Date.now();
-
-  // Default: 2-day due
-  let dueDays = 2;
-  let importance: "normal" | "important" | "critical" = "normal";
-
-  if (h.status === "hot") {
-    dueDays = 1;
-    importance = "important";
-  } else if (h.status === "warm") {
-    dueDays = 2;
-    importance = "normal";
-  } else if (h.status === "stale") {
-    dueDays = 0;
-    importance = "critical";
-  } else {
-    // cold
-    dueDays = 3;
-    importance = "normal";
-  }
-
-  // If critical notes mentioned, bump importance
-  if (h.reasons.some((r) => String(r).toLowerCase().includes("critical"))) {
-    importance = "critical";
-    dueDays = 0;
-  }
-
-  const due_at = new Date(now + dueDays * 24 * 60 * 60 * 1000).toISOString();
-
-  const title = h.next_action;
-
-  return {
-    // IMPORTANT: `assignments.type` is constrained by `assignments_type_check`.
-    // Use a safe, common value and keep intent in meta.
-    type: "follow_up",
-    title,
-    due_at,
-    importance,
-    meta: {
-      source: "health_auto_assign_v1",
-      score: h.score,
-      status: h.status,
-      reasons: h.reasons,
-      intent: "next_action",
-    },
-  };
-}
-
-async function insertAssignmentBestEffort(args: {
-  requester: string;
-  contactId: string;
-  type: string;
-  title: string;
-  due_at: string;
-  importance: "normal" | "important" | "critical";
-  meta: any;
-}) {
-  const { requester, contactId, type, title, due_at, importance, meta } = args;
-
-  // We have seen multiple schema variants across projects:
-  // - assignments(contact_id, ...)
-  // - assignments(target_type, target_id, ...)
-  // - assignments(meta json with contact_id)
-  // and sometimes the table is `coach_assignments`.
-  // This function tries a small set of payload shapes in order.
-
-  // IMPORTANT: `coach_assignments` in this repo is used for call coaching and can require
-  // non-null fields like `call_id`. Auto-assign is contact-driven and must not write there.
-  // So we only write to `assignments` here.
-  const tables = ["assignments"];
-
-  const baseMeta = meta ?? {};
-
-  const payloads: any[] = [
-    // Variant A: direct contact_id + title
-    {
-      user_id: requester,
-      rep_id: requester,
-      manager_id: requester,
-      contact_id: contactId,
-      type,
-      title,
-      due_at,
-      completed_at: null,
-      importance,
-      meta: baseMeta,
-    },
-    // Variant A0: direct contact_id + assignment_type + title (some schemas use assignment_type)
-    {
-      user_id: requester,
-      rep_id: requester,
-      manager_id: requester,
-      contact_id: contactId,
-      assignment_type: type,
-      title,
-      due_at,
-      completed_at: null,
-      importance,
-      meta: baseMeta,
-    },
-    // Variant A0b: direct contact_id + assignment_type + label
-    {
-      user_id: requester,
-      rep_id: requester,
-      manager_id: requester,
-      contact_id: contactId,
-      assignment_type: type,
-      label: title,
-      due_at,
-      completed_at: null,
-      importance,
-      meta: baseMeta,
-    },
-    // Variant A2: direct contact_id + label (some schemas use label instead of title)
-    {
-      user_id: requester,
-      rep_id: requester,
-      manager_id: requester,
-      contact_id: contactId,
-      type,
-      label: title,
-      due_at,
-      completed_at: null,
-      importance,
-      meta: baseMeta,
-    },
-    // Variant B: target_type/target_id + title
-    {
-      user_id: requester,
-      rep_id: requester,
-      manager_id: requester,
-      target_type: "contact",
-      target_id: contactId,
-      type,
-      title,
-      due_at,
-      completed_at: null,
-      importance,
-      meta: baseMeta,
-    },
-    // Variant B2: target_type/target_id + label
-    {
-      user_id: requester,
-      rep_id: requester,
-      manager_id: requester,
-      target_type: "contact",
-      target_id: contactId,
-      type,
-      label: title,
-      due_at,
-      completed_at: null,
-      importance,
-      meta: baseMeta,
-    },
-    // Variant C: meta-only link (contact_id inside meta) + title
-    {
-      user_id: requester,
-      rep_id: requester,
-      manager_id: requester,
-      type,
-      title,
-      due_at,
-      completed_at: null,
-      importance,
-      meta: { ...baseMeta, contact_id: contactId },
-    },
-    // Variant C2: meta-only link + label
-    {
-      user_id: requester,
-      rep_id: requester,
-      manager_id: requester,
-      type,
-      label: title,
-      due_at,
-      completed_at: null,
-      importance,
-      meta: { ...baseMeta, contact_id: contactId },
-    },
-    // Variant D: minimal (in case importance/title/meta columns are missing)
-    {
-      user_id: requester,
-      rep_id: requester,
-      manager_id: requester,
-      type,
-      due_at,
-      completed_at: null,
-      meta: { contact_id: contactId, title },
-    },
-    // Variant E: coach_assignments minimal (no title/label/meta/contact fields)
-    {
-      user_id: requester,
-      rep_id: requester,
-      manager_id: requester,
-      assignment_type: type,
-      due_at,
-      completed_at: null,
-    },
-    // Variant E2: ultra-minimal
-    {
-      user_id: requester,
-      rep_id: requester,
-      manager_id: requester,
-      assignment_type: type,
-    },
-  ];
-
-  let lastErr: any = null;
-
-  for (const table of tables) {
-    for (const p0 of payloads) {
-      // Attempt the payload, and if a column is missing, strip it and retry a couple times.
-      let p: any = { ...p0 };
-
-      // IMPORTANT: some deployments use `coach_assignments` with a smaller column set.
-      // We normalise early AND avoid sending columns that often don't exist (e.g. meta/title/type).
-      const allowMeta = table !== "coach_assignments";
-
-      for (let i = 0; i < 3; i++) {
-        const { error } = await supa.from(table).insert(p);
-        if (!error) return;
-
-        const msg = String((error as any)?.message ?? "").toLowerCase();
-        lastErr = error;
-
-        // If we hit the `assignments_type_check`, fall back to other allowed-ish types.
-        // We don't know the exact enum across deployments, so try a small safe set.
-        if (table === "assignments" && msg.includes("violates check constraint") && msg.includes("assignments_type_check")) {
-          const fallbacks = ["follow_up", "task", "todo", "action", "crm_follow_up"];
-          const cur = String((p as any).type ?? (p as any).assignment_type ?? "");
-          for (const t of fallbacks) {
-            if (!t || t === cur) continue;
-            const p2: any = { ...p };
-            if ("type" in p2) p2.type = t;
-            if ("assignment_type" in p2) p2.assignment_type = t;
-            if (p2.meta && typeof p2.meta === "object") p2.meta = { ...p2.meta, type_fallback_from: cur, type_fallback_to: t };
-            const { error: e2 } = await supa.from(table).insert(p2);
-            if (!e2) return;
-          }
-        }
-
-        // Table doesn't exist? break to next table.
-        if (msg.includes("does not exist") || (msg.includes("relation") && msg.includes("does not exist"))) {
-          break;
-        }
-
-        // Supabase schema cache missing column errors look like:
-        // "Could not find the 'contact_id' column of 'assignments' in the schema cache"
-        // We parse the column name and drop it.
-        const m = msg.match(/could not find the '([^']+)' column/);
-        const missingCol = m?.[1];
-        if (missingCol && missingCol in p) {
-          // If the schema uses label instead of title (or vice-versa), map across before dropping.
-          if (missingCol === "title" && (p as any).label == null && typeof title === "string") {
-            (p as any).label = title;
-          }
-          if (missingCol === "label" && (p as any).title == null && typeof title === "string") {
-            (p as any).title = title;
-          }
-
-          // Some schemas use assignment_type instead of type.
-          if (missingCol === "type") {
-            if (table === "coach_assignments") {
-              // Do not attempt to map to assignment_type (it may not exist).
-              delete (p as any).type;
-              continue;
-            }
-
-            if ((p as any).assignment_type == null) {
-              (p as any).assignment_type = type;
-            }
-
-            if (allowMeta) {
-              if ((p as any).meta && typeof (p as any).meta === "object") {
-                (p as any).meta = { ...(p as any).meta, type };
-              } else {
-                (p as any).meta = { type };
-              }
-            }
-
-            delete (p as any).type;
-            continue;
-          }
-          if (missingCol === "assignment_type") {
-            // For coach_assignments, we keep ultra-minimal and avoid adding type back in.
-            if (table !== "coach_assignments") {
-              if ((p as any).type == null) (p as any).type = type;
-            }
-          }
-
-          // Special-case: handle rep_id column missing
-          if (missingCol === "rep_id") {
-            delete (p as any).rep_id;
-            continue;
-          }
-          // Special-case: handle manager_id column missing
-          if (missingCol === "manager_id") {
-            delete (p as any).manager_id;
-            continue;
-          }
-
-          delete (p as any)[missingCol];
-          continue;
-        }
-
-        // PostgREST column missing variants
-        if (msg.includes("column") && msg.includes("does not exist")) {
-          // Best effort: drop common optional fields when any column error occurs.
-          delete p.contact_id;
-          delete p.target_type;
-          delete p.target_id;
-          delete p.type;
-          delete p.rep_id;
-          delete p.manager_id;
-
-          if (allowMeta) {
-            if (p.meta && typeof p.meta === "object") {
-              p.meta = { ...(p.meta ?? {}), contact_id: contactId };
-            } else {
-              p.meta = { contact_id: contactId };
-            }
-          } else {
-            delete p.meta;
-          }
-
-          delete p.importance;
-          continue;
-        }
-
-        // Any other error: stop retrying this payload.
-        break;
-      }
-    }
-  }
-
-  throw lastErr ?? new Error("assignment_insert_failed");
-}
-
-// ------------------- Contact Health Route -------------------
-router.get("/contacts/:id/health", async (req, res) => {
-  try {
-    const requester = getUserIdHeader(req);
-    const contactId = String(req.params.id ?? "").trim();
-    if (!contactId) return res.status(400).json({ ok: false, error: "invalid_contact_id" });
-
-    let contact: any = null;
-
-    if (contactId.startsWith("c_")) {
-      const found = DEMO_CONTACTS.find((c) => c.id === contactId);
-      if (!found) return res.status(404).json({ ok: false, error: "not_found" });
-      contact = { id: found.id, last_contacted_at: found.last_contacted_at ?? null };
-    } else {
-      if (!UUID_RE.test(contactId)) return res.status(400).json({ ok: false, error: "invalid_id" });
-      const { data: c, error: cErr } = await supa
-        .from("crm_contacts")
-        .select("id, last_contacted_at")
-        .eq("user_id", requester)
-        .eq("id", contactId)
-        .single();
-      if (cErr || !c) return res.status(404).json({ ok: false, error: "not_found" });
-      contact = c;
-    }
-
-    const { data: notes } = await supa
-      .from("crm_contact_notes")
-      .select("importance")
-      .eq("user_id", requester)
-      .eq("contact_id", contactId);
-
-    const criticalNotesCount = (notes ?? []).filter((n: any) => n.importance === "critical").length;
-    const importantNotesCount = (notes ?? []).filter((n: any) => n.importance === "important").length;
-
-    let overdueCount = 0;
-    try {
-      const { open } = await fetchContactAssignmentsBestEffort({ requester, contactId, limit: 200 });
-      overdueCount = open.filter((x: any) => x.is_overdue).length;
-    } catch { }
-
-    let lastCallScore: number | null = null;
-    try {
-      const { data: links } = await supa
-        .from("crm_call_links")
-        .select("call_id")
-        .eq("contact_id", contactId)
-        .limit(25);
-
-      const callIds = (links ?? []).map((r: any) => r.call_id).filter(Boolean);
-      if (callIds.length) {
-        const { data: scores } = await supa
-          .from("call_scores")
-          .select("total_score")
-          .eq("user_id", requester)
-          .in("call_id", callIds)
-          .order("created_at", { ascending: false })
-          .limit(1);
-        if (scores?.length) lastCallScore = Number((scores[0] as any).total_score);
-      }
-    } catch { }
-
-    const lastContactedDays = daysSince(contact?.last_contacted_at ?? null);
-
-    const result = classifyHealth({
-      lastContactedDays,
-      overdueCount,
-      criticalNotesCount,
-      importantNotesCount,
-      lastCallScore,
-    });
-
-    return res.json({
-      ok: true,
-      health: {
-        contact_id: contactId,
-        status: result.status,
-        score: result.score,
-        reasons: result.reasons,
-        next_action: result.next_action,
-        signals: {
-          last_contacted_at: contact?.last_contacted_at ?? null,
-          last_contacted_days: lastContactedDays,
-          overdue_assignments: overdueCount,
-          critical_notes: criticalNotesCount,
-          important_notes: importantNotesCount,
-          last_call_score: lastCallScore,
-        },
-      },
-    });
-  } catch (e: any) {
-    return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
-  }
-});
-
-// Body schema for contact auto-assign
-const ContactAutoAssignBodySchema = z.object({
-  dry_run: z
-    .preprocess((v) => {
-      if (v === true || v === "true") return true;
-      if (v === false || v === "false") return false;
-      return undefined;
-    }, z.boolean().optional())
-    .default(false),
-});
-
-// POST /v1/crm/contacts/:id/auto-assign (core)
-// Body: { dry_run?: boolean }
-// - Uses Contact Health to suggest a single "next_action" action.
-// - Dedupe within 24h to avoid spam.
-// - Writes to assignments if possible; always falls back to crm_actions; final fallback is an AUTO note.
-async function runContactAutoAssignCore(args: {
-  requester: string;
-  repId?: string | null;
-  contactId: string;
-  dry_run: boolean;
-}) {
-  const { requester, repId, contactId, dry_run } = args;
-
-  // Compute health (shared logic)
-  const health = await computeContactHealthFor({ requester, contactId });
-  const suggestion = buildAutoAssignSuggestion({
-    status: health.status,
-    score: health.score,
-    reasons: health.reasons,
-    next_action: health.next_action,
-  });
-
-  // ---------------------------------------------------------
-  // RULES: decide if an auto-assign should be created at all
-  // - Only create actions for contacts that are "cold" or "stale".
-  // - "hot" / "warm" contacts are considered healthy and are skipped.
-  // ---------------------------------------------------------
-  const status = String((health as any)?.status ?? "").toLowerCase();
-  const shouldCreate = status === "cold" || status === "stale";
-
-  if (!shouldCreate) {
-    const skipped_reason = status === "hot" || status === "warm"
-      ? "healthy_recent"
-      : "no_rules_matched";
-
-    return {
-      ok: true,
-      dry_run,
-      contact_id: contactId,
-      health,
-      suggestion,
-      created: false,
-      duplicate: false,
-      skipped_reason,
-    };
-  }
-
-  // ---------------------------------------------------------
-  // DEDUPE: prevent spamming auto-assign creations (24h window)
-  // ---------------------------------------------------------
-  const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-
-  // 1) Notes dedupe (reliable table)
-  try {
-    const { data: recentNotes, error: nErr } = await supa
-      .from("crm_contact_notes")
-      .select("id, created_at, body")
-      .eq("user_id", requester)
-      .eq("contact_id", contactId)
-      .gte("created_at", sinceIso)
-      .order("created_at", { ascending: false })
-      .limit(25);
-
-    if (!nErr && (recentNotes?.length ?? 0) > 0) {
-      const hit = (recentNotes ?? []).find((n: any) => {
-        const body = String(n?.body ?? "");
-        return body.includes("[AUTO]") && body.includes("health_auto_assign_v1");
-      });
-
-      if (hit) {
-        return {
-          ok: true,
-          dry_run,
-          contact_id: contactId,
-          health,
-          created: false,
-          duplicate: true,
-          created_via: "dedupe_recent_auto_note",
-        };
-      }
-    }
-  } catch {
-    // fail-open
-  }
-
-  // 1b) CRM Actions dedupe (stable fallback table)
-  try {
-    const r = await fetchCrmActionsBestEffort({ requester, contactId, limit: 50 });
-    if (r.ok) {
-      const dup = (r.open ?? []).some((a: any) => {
-        const ca = a?.created_at ? new Date(String(a.created_at)).toISOString() : null;
-        const isRecent = ca ? ca >= sinceIso : false;
-        const meta = a?.meta ?? {};
-        return (
-          isRecent &&
-          (String(a?.type ?? "").includes("health_auto_assign_v1") ||
-            String(meta?.source ?? "").includes("health_auto_assign_v1"))
-        );
-      });
-
-      if (dup) {
-        return {
-          ok: true,
-          dry_run,
-          contact_id: contactId,
-          health,
-          created: false,
-          duplicate: true,
-          created_via: "dedupe_recent_crm_action",
-        };
-      }
-    }
-  } catch {
-    // ignore
-  }
-
-  // 2) Assignments dedupe (best-effort)
-  try {
-    const { open } = await fetchContactAssignmentsBestEffort({
-      requester,
-      contactId,
-      limit: 50,
-    });
-
-    const dup = (open ?? []).some((a: any) => {
-      const ca = a?.created_at ? new Date(String(a.created_at)).toISOString() : null;
-      const isRecent = ca ? ca >= sinceIso : false;
-      const meta = a?.meta ?? {};
-      return isRecent && String(meta?.source ?? "").includes("health_auto_assign_v1");
-    });
-
-    if (dup) {
-      return {
-        ok: true,
-        dry_run,
-        contact_id: contactId,
-        health,
-        created: false,
-        duplicate: true,
-        created_via: "dedupe_recent_assignment",
-      };
-    }
-  } catch {
-    // ignore
-  }
-
-  if (dry_run) {
-    return {
-      ok: true,
-      dry_run: true,
-      contact_id: contactId,
-      health,
-      suggestion,
-      created: true,      // “would create” in preview
-      duplicate: false,
-    };
-  }
-
-  // Insert assignment (best-effort across table variants)
-  try {
-    await insertAssignmentBestEffort({
-      requester,
-      repId,
-      contactId,
-      type: suggestion.type,
-      title: suggestion.title,
-      due_at: suggestion.due_at,
-      importance: suggestion.importance,
-      meta: suggestion.meta,
-    });
-
-    // ALSO write to CRM Actions best-effort so reps always see it in a stable list.
-    // This must never block success.
-    await insertCrmActionBestEffort({
-      requester,
-      repId,
-      contactId,
-      type: suggestion.type,
-      title: suggestion.title,
-      due_at: suggestion.due_at,
-      importance: suggestion.importance,
-      meta: suggestion.meta,
-    });
-
-    return {
-      ok: true,
-      dry_run,
-      contact_id: contactId,
-      health,
-      created: true,
-      created_via: "assignments",
-    };
-  } catch {
-    // If assignments insert fails for ANY reason, fall back to CRM Actions.
-    const r = await insertCrmActionBestEffort({
-      requester,
-      repId,
-      contactId,
-      type: suggestion.type,
-      title: suggestion.title,
-      due_at: suggestion.due_at,
-      importance: suggestion.importance,
-      meta: suggestion.meta,
-    });
-
-    if (r.ok) {
-      return {
-        ok: true,
-        dry_run,
-        contact_id: contactId,
-        health,
-        created: true,
-        created_via: "crm_actions_fallback",
-      };
-    }
-
-    // Final fallback: write an AUTO note so the endpoint never blocks.
-    const importance =
-      suggestion.importance === "critical"
-        ? "critical"
-        : suggestion.importance === "important"
-          ? "important"
-          : "normal";
-
-    const noteBody =
-      `[AUTO] Next action: ${suggestion.title}\n` +
-      `Due: ${suggestion.due_at}\n` +
-      `Health: ${health.status} (${health.score})\n` +
-      `Reasons: ${(health.reasons ?? []).join("; ")}`;
-
-    const { error: nErr } = await supa.from("crm_contact_notes").insert({
-      user_id: requester,
-      contact_id: contactId,
-      body: noteBody,
-      author_id: requester,
-      author_name: "System",
-      importance,
-    });
-
-    if (nErr) {
-      throw new Error(`assignment_blocked_and_fallback_failed: ${nErr.message}`);
-    }
-
-    return {
-      ok: true,
-      dry_run,
-      contact_id: contactId,
-      health,
-      created: true,
-      created_via: "crm_contact_notes_fallback",
-    };
-  }
-}
-
-
-router.post("/contacts/:id/auto-assign", async (req, res) => {
-  try {
-    const requester = getUserIdHeader(req);
-    const contactId = String(req.params.id ?? "").trim();
-    if (!contactId) return res.status(400).json({ ok: false, error: "invalid_contact_id" });
-
-    const parsedBody = ContactAutoAssignBodySchema.safeParse(req.body ?? {});
-    if (!parsedBody.success) {
-      return res.status(400).json({ ok: false, error: "invalid_body" });
-    }
-    const dry_run = parsedBody.data.dry_run;
-
-    const out = await runContactAutoAssignCore({ requester, repId: requester, contactId, dry_run });
-    return res.json(out);
-  } catch (e: any) {
-    return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
-  }
-});
-
 export default router;
-// ------------------------------
-// CRON: Auto-assign runner (v2)
-// POST /v1/cron/crm/auto-assign
-// Headers:
-//   x-cron-secret: <CRON_SECRET>
-// Body (optional):
-//   { limit_reps?, contacts_per_rep?, max_total_contacts? }
-// ------------------------------
-router.post("/cron/crm/auto-assign", async (req, res) => {
-  try {
-    // Auth: shared secret only (no user context)
-    requireCronAuth(req);
-
-    // SYSTEM runner identity (non-human)
-    const requester = String(process.env.CRON_RUNNER_USER_ID || "").trim();
-    if (!requester || !UUID_RE.test(requester)) {
-      return res.status(500).json({ ok: false, error: "invalid_cron_runner_user" });
-    }
-
-    const body = req.body ?? {};
-
-    // Force execute mode for cron
-    const mode: "execute" = "execute";
-
-    const limit_reps = typeof body.limit_reps === "number" ? body.limit_reps : undefined;
-    const contacts_per_rep = typeof body.contacts_per_rep === "number" ? body.contacts_per_rep : undefined;
-    const max_total_contacts = typeof body.max_total_contacts === "number" ? body.max_total_contacts : undefined;
-
-    // Reuse v2 runner logic by calling it directly
-    const startedAt = new Date();
-    const run_id = (globalThis.crypto as any)?.randomUUID?.() ?? `cron_${Date.now()}`;
-
-    // Best-effort: log start
-    await logCrmAutoAssignRunBestEffort({
-      phase: "start",
-      run_id,
-      requester,
-      mode,
-      started_at: startedAt.toISOString(),
-    });
-
-    // Resolve reps (manager scope of the cron runner user)
-    let reps = await resolveManagerScopedReps(requester);
-    if (typeof limit_reps === "number") reps = reps.slice(0, limit_reps);
-
-    const result = {
-      ok: true as const,
-      run_id,
-      mode,
-      started_at: startedAt.toISOString(),
-      finished_at: "",
-      totals: {
-        reps_considered: reps.length,
-        contacts_considered: 0,
-        actions_created: 0,
-        skipped_dedupe: 0,
-        errors: 0,
-      },
-      reps: [] as any[],
-    };
-
-    const CONTACTS_PER_REP = contacts_per_rep ?? 50;
-    const MAX_TOTAL_CONTACTS = max_total_contacts ?? 200;
-    let totalContactsConsidered = 0;
-
-    for (const rep of reps) {
-      try {
-        const { data: contacts } = await supa
-          .from("crm_contacts")
-          .select("id")
-          .eq("user_id", requester)
-          .order("created_at", { ascending: false })
-          .limit(CONTACTS_PER_REP);
-
-        let created = 0;
-        let skipped_dedupe = 0;
-        let contacts_considered = 0;
-        const errors_sample: any[] = [];
-
-        const remaining = Math.max(0, MAX_TOTAL_CONTACTS - totalContactsConsidered);
-        const list = (contacts ?? []).slice(0, Math.min(CONTACTS_PER_REP, remaining));
-
-        const procT0 = Date.now();
-
-        for (const c of list) {
-          const contactId = String((c as any)?.id ?? "");
-          if (!contactId) continue;
-
-          try {
-            const out = await runContactAutoAssignCore({
-              requester,
-              repId: rep.rep_id,
-              contactId,
-              dry_run: false,
-            });
-
-            if (out?.created) created++;
-            if (out?.duplicate) skipped_dedupe++;
-          } catch (e: any) {
-            result.totals.errors++;
-            if (errors_sample.length < 3) {
-              errors_sample.push({ contact_id: contactId, error: String(e?.message ?? "auto_assign_failed") });
-            }
-          } finally {
-            contacts_considered++;
-            totalContactsConsidered++;
-            result.totals.contacts_considered = totalContactsConsidered;
-          }
-        }
-
-        result.totals.actions_created += created;
-        result.totals.skipped_dedupe += skipped_dedupe;
-
-        result.reps.push({
-          rep_id: rep.rep_id,
-          rep_name: rep.rep_name ?? null,
-          created,
-          skipped_dedupe,
-          contacts_considered,
-          errors_sample: errors_sample.length ? errors_sample : undefined,
-        });
-      } catch (e: any) {
-        result.totals.errors++;
-        result.reps.push({
-          rep_id: rep.rep_id,
-          rep_name: rep.rep_name ?? null,
-          created: 0,
-          skipped_dedupe: 0,
-          contacts_considered: 0,
-          error: String(e?.message ?? "cron_rep_failed"),
-        });
-      }
-
-      if (totalContactsConsidered >= MAX_TOTAL_CONTACTS) break;
-    }
-
-    result.finished_at = new Date().toISOString();
-
-    await logCrmAutoAssignRunBestEffort({
-      phase: "finish",
-      run_id,
-      requester,
-      mode,
-      started_at: result.started_at,
-      finished_at: result.finished_at,
-      totals: result.totals,
-      reps: result.reps,
-    });
-
-    // Slack alert if needed (reuse Step F)
-    await notifyCrmAutoAssignRunSlack({
-      run_id,
-      requester,
-      mode,
-      totals: result.totals,
-      reps: result.reps,
-    });
-
-    const total_ms = Date.now() - t0;
-
-    return res.json({
-      ...result,
-      meta: {
-        total_ms,
-        time_budget_ms: TIME_BUDGET_MS,
-        aborted_reason,
-        timings: {
-          per_rep: perRepTimings,
-        },
-      },
-    });
-  } catch (e: any) {
-    return res.status(403).json({ ok: false, error: e?.message ?? "cron_forbidden" });
-  }
-});
