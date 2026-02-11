@@ -1367,6 +1367,8 @@ router.get("/actions/today", async (req, res) => {
     }
   }
 });
+
+
 // ------------------------------
 // MANAGER OVERVIEW (v1)
 // GET /v1/crm/manager/overview
@@ -1432,6 +1434,9 @@ router.get("/manager/overview", async (req, res) => {
         },
         meta: {
           mode: hasRepId ? "rep_id" : "user_only",
+          has_rep_id: hasRepId,
+          scoped_by: hasRepId ? "rep_id" : "user_id",
+          start_of_day: startIso,
         },
       });
     }
@@ -1459,6 +1464,85 @@ router.get("/manager/overview", async (req, res) => {
     return res.status(500).json({ ok: false, error: msg || "server_error" });
   }
 });
+
+// ------------------------------------------------------------
+// Auto-Assign core (shared by v1/v2 preview + execute loops)
+// NOTE: This was referenced in two places but missing, causing runtime:
+//   "runContactAutoAssignCore is not defined"
+// ------------------------------------------------------------
+type ContactAutoAssignCoreOut = {
+  created?: boolean;
+  duplicate?: boolean;
+  skip_reason?: string;
+};
+
+async function runContactAutoAssignCore(args: {
+  requester: string;
+  repId: string;
+  contactId: string;
+  dry_run: boolean;
+}): Promise<ContactAutoAssignCoreOut> {
+  const { requester, repId, contactId, dry_run } = args;
+
+  // 1) Dedupe: if there is any open-ish CRM action for this contact created recently, skip.
+  // Use best-effort helper (schema tolerant). If it fails, we fail-open (allow creation).
+  try {
+    const r = await fetchCrmActionsBestEffort({ requester, contactId, limit: 25 });
+    if (r.ok) {
+      const open = (r.open ?? []).filter(Boolean);
+      const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+
+      const hasRecentOpen = open.some((a: any) => {
+        const createdAt = a?.created_at ? new Date(String(a.created_at)).getTime() : NaN;
+        const completedAt = a?.completed_at ? new Date(String(a.completed_at)).getTime() : NaN;
+        const status = String(a?.status ?? "open").toLowerCase();
+
+        const isOpen = !Number.isFinite(completedAt) && status !== "done" && status !== "completed";
+        const isRecent = !Number.isFinite(createdAt) ? false : createdAt >= sevenDaysAgo;
+        return isOpen && isRecent;
+      });
+
+      if (hasRecentOpen) {
+        return { created: false, duplicate: true, skip_reason: "dedupe_recent" };
+      }
+    }
+  } catch {
+    // fail-open
+  }
+
+  // 2) Decide next action (MVP): always create a follow-up due tomorrow.
+  const dueAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+  // 3) Dry-run: report what we would do, without inserting.
+  if (dry_run) {
+    return { created: true, duplicate: false };
+  }
+
+  // 4) Execute: best-effort insert into crm_actions (schema-tolerant).
+  const ins = await insertCrmActionBestEffort({
+    requester,
+    repId,
+    contactId,
+    type: "follow_up",
+    title: "Follow up",
+    due_at: dueAt,
+    importance: "normal",
+    meta: {
+      source: "auto_assign_v2",
+      rep_id: repId,
+    },
+  });
+
+  if (ins.ok) return { created: true, duplicate: false };
+
+  // If actions table is missing, treat as a non-fatal skip so the run doesn't explode.
+  const msg = String((ins as any)?.error?.message ?? "").toLowerCase();
+  if (msg.includes("relation") && msg.includes("does not exist")) {
+    return { created: false, duplicate: false, skip_reason: "missing_table" };
+  }
+
+  return { created: false, duplicate: false, skip_reason: "insert_failed" };
+}
 
 // ------------------------------
 // Helper: Resolve manager-scoped reps (fail-closed, schema-tolerant)
@@ -1848,8 +1932,9 @@ async function logCrmAutoAssignRunBestEffort(args: {
   finished_at?: string;
   totals?: any;
   reps?: any;
+  meta?: any;
 }) {
-  const { phase, run_id, requester, mode, started_at, finished_at, totals, reps } = args;
+  const { phase, run_id, requester, mode, started_at, finished_at, totals, reps, meta } = args;
 
   // Common payload shapes across possible schemas.
   const baseInsertCandidates: any[] = [
@@ -1862,6 +1947,7 @@ async function logCrmAutoAssignRunBestEffort(args: {
       finished_at: finished_at ?? null,
       totals: totals ?? null,
       reps: reps ?? null,
+      meta: meta ?? null,
     },
     {
       run_id,
@@ -1871,6 +1957,7 @@ async function logCrmAutoAssignRunBestEffort(args: {
       finished_at: finished_at ?? null,
       totals: totals ?? null,
       reps: reps ?? null,
+      meta: meta ?? null,
     },
     {
       run_id,
@@ -1885,6 +1972,12 @@ async function logCrmAutoAssignRunBestEffort(args: {
       finished_at: finished_at ?? new Date().toISOString(),
       totals: totals ?? null,
       reps: reps ?? null,
+      meta: meta ?? null,
+    },
+    {
+      finished_at: finished_at ?? new Date().toISOString(),
+      totals: totals ?? null,
+      meta: meta ?? null,
     },
     {
       finished_at: finished_at ?? new Date().toISOString(),
@@ -1944,11 +2037,32 @@ async function logCrmAutoAssignRunBestEffort(args: {
     for (const patch0 of baseUpdateCandidates) {
       let patch = { ...patch0 };
       for (let i = 0; i < 6; i++) {
-        const { error } = await supa
-          .from("crm_auto_assign_runs")
-          .update(patch)
-          .eq("run_id", run_id)
-          .eq("user_id", requester);
+        // Try both ownership columns across deployments.
+        let error: any = null;
+        {
+          const r1 = await supa
+            .from("crm_auto_assign_runs")
+            .update(patch)
+            .eq("run_id", run_id)
+            .eq("user_id", requester);
+          error = r1.error;
+        }
+
+        if (error) {
+          const msg0 = String((error as any)?.message ?? "").toLowerCase();
+          const missingUserId =
+            (msg0.includes("could not find") && msg0.includes("user_id")) ||
+            (msg0.includes("column") && msg0.includes("user_id") && msg0.includes("does not exist"));
+
+          if (missingUserId) {
+            const r2 = await supa
+              .from("crm_auto_assign_runs")
+              .update(patch)
+              .eq("run_id", run_id)
+              .eq("requester_id", requester);
+            error = r2.error;
+          }
+        }
 
         if (!error) return;
 
@@ -2037,6 +2151,15 @@ router.post("/manager/auto-assign/preview", async (req, res) => {
       return res.status(500).json({ ok: false, error: "preview_failed", detail: upstreamErr });
     }
 
+    // 🔒 HARD FAIL: preview MUST return meta (this is the source of truth)
+    if (!payload.meta || typeof payload.meta !== "object") {
+      return res.status(500).json({
+        ok: false,
+        error: "preview_missing_meta",
+        detail: "Auto-assign preview did not return meta; timings unavailable",
+      });
+    }
+
     // --- PATCH: Best-effort: finish preview run with label (fail-open)
     // Best-effort: label this run as a preview in the run history (fail-open)
     try {
@@ -2057,7 +2180,18 @@ router.post("/manager/auto-assign/preview", async (req, res) => {
       finished_at: new Date().toISOString(),
       totals: payload.totals,
       reps: payload.reps,
+      meta: (payload as any)?.meta ?? null,
     });
+
+    // --- Preview warnings (non-blocking) ---
+    const actionsCreated = Number(payload?.totals?.actions_created ?? 0);
+    const contactsConsidered = Number(payload?.totals?.contacts_considered ?? 0);
+    const density = contactsConsidered > 0 ? actionsCreated / contactsConsidered : 0;
+
+    const warnings: string[] = [];
+    if (density > 0.6) {
+      warnings.push("High action density — reps may be overloaded");
+    }
 
     // Enrich with preview-only metadata and clear label for downstream UI
     return res.json({
@@ -2076,6 +2210,7 @@ router.post("/manager/auto-assign/preview", async (req, res) => {
         forwarded: Boolean(payload && (payload as any).meta),
         generated_at: startedAt.toISOString(),
       },
+      warnings,
       hint: "Preview only — no actions were created. Execute explicitly to apply.",
     });
 
@@ -2116,16 +2251,45 @@ router.post("/manager/auto-assign/execute-from-preview", async (req, res) => {
     }
 
     // Fetch the preview run (tolerate missing source column)
-    const { data: rows, error } = await supa
-      .from("crm_auto_assign_runs")
-      .select("run_id, mode, totals")
-      .eq("user_id", requester)
-      .eq("run_id", previewRunId)
-      .limit(1);
+    let rows: any[] | null = null;
 
-    if (error) throw error;
+    // Attempt user_id first
+    {
+      const r1 = await supa
+        .from("crm_auto_assign_runs")
+        .select("run_id, mode, totals")
+        .eq("user_id", requester)
+        .eq("run_id", previewRunId)
+        .limit(1);
 
-    const row = (rows ?? [])[0];
+      if (!r1.error) rows = r1.data ?? [];
+      else {
+        const msg = String((r1.error as any)?.message ?? "").toLowerCase();
+        if (
+          msg.includes("user_id") &&
+          (msg.includes("does not exist") || msg.includes("could not find"))
+        ) {
+          // fallback handled below
+        } else {
+          throw r1.error;
+        }
+      }
+    }
+
+    // Fallback to requester_id
+    if (!rows || rows.length === 0) {
+      const r2 = await supa
+        .from("crm_auto_assign_runs")
+        .select("run_id, mode, totals")
+        .eq("requester_id", requester)
+        .eq("run_id", previewRunId)
+        .limit(1);
+
+      if (r2.error) throw r2.error;
+      rows = r2.data ?? [];
+    }
+
+    const row = rows[0];
     if (!row) {
       return res.status(404).json({ ok: false, error: "preview_run_not_found" });
     }
@@ -2442,7 +2606,7 @@ router.post("/manager/auto-assign/run", async (req, res) => {
             if (createdFlag) created++;
             if (dupFlag) skipped_dedupe++;
 
-                        // If core doesn't emit a reason but also didn't create/duplicate,
+            // If core doesn't emit a reason but also didn't create/duplicate,
             // count it as a skip with a best-effort reason.
             if (!createdFlag && !dupFlag) {
               const reasonRaw =
@@ -2544,8 +2708,9 @@ router.post("/manager/auto-assign/run", async (req, res) => {
         finished_at: result.finished_at,
         totals: result.totals,
         reps: result.reps,
+        meta,
       });
-    } catch {}
+    } catch { }
 
     try {
       await notifyCrmAutoAssignRunSlack({
@@ -2555,7 +2720,7 @@ router.post("/manager/auto-assign/run", async (req, res) => {
         totals: result.totals,
         reps: result.reps,
       });
-    } catch {}
+    } catch { }
 
     const meta = {
       version: "v2" as const,
@@ -2591,7 +2756,6 @@ router.post("/manager/auto-assign/run", async (req, res) => {
 router.get("/manager/auto-assign/runs", async (req, res) => {
   try {
     const { requester } = await requireManagerOrg(req);
-
     const limit = Math.min(Math.max(Number(req.query.limit ?? 10), 1), 50);
 
     const isMissingTable = (msg: string) => {
@@ -2602,98 +2766,98 @@ router.get("/manager/auto-assign/runs", async (req, res) => {
       );
     };
 
-    const { data, error } = await supa
-      .from("crm_auto_assign_runs")
-      .select(
-        "run_id, mode, started_at, finished_at, totals, reps, source, is_preview, executed_from_preview_run_id, executed_by_user_id, executed_at"
-      )
-      .eq("user_id", requester)
-      .order("started_at", { ascending: false })
-      .limit(limit);
+    const isMissingCol = (msg: string) => {
+      const m = msg.toLowerCase();
+      return (
+        (m.includes("could not find") && m.includes("column")) ||
+        (m.includes("could not find the") && m.includes("column")) ||
+        (m.includes("column") && m.includes("does not exist"))
+      );
+    };
 
-    if (error) {
-      const msg = String((error as any)?.message ?? "");
-      if (isMissingTable(msg)) return res.json({ ok: true, items: [], source: "missing_table" });
+    // Schema-tolerant select: try rich columns first, then fall back to a minimal set.
+    const selectCandidates = [
+      "run_id, mode, started_at, finished_at, totals, reps, meta, source, is_preview, executed_from_preview_run_id, executed_by_user_id, executed_at",
+      "run_id, mode, started_at, finished_at, totals, reps, meta",
+      "run_id, mode, started_at, finished_at, totals, meta",
+      "run_id, mode, started_at, finished_at, meta",
+      "run_id, mode, started_at, finished_at, totals, reps",
+      "run_id, mode, started_at, finished_at, totals",
+      "run_id, mode, started_at, finished_at",
+      "run_id, mode, started_at",
+      "run_id, mode",
+      "run_id",
+    ];
+
+    // Ownership column differs across deployments.
+    const ownerCols: Array<"user_id" | "requester_id"> = ["user_id", "requester_id"];
+
+    let data: any[] | null = null;
+    let lastErr: any = null;
+
+    outer: for (const sel of selectCandidates) {
+      for (const ownerCol of ownerCols) {
+        const r = await supa
+          .from("crm_auto_assign_runs")
+          .select(sel)
+          .eq(ownerCol, requester)
+          .order("started_at", { ascending: false })
+          .limit(limit);
+
+        if (!r.error) {
+          const rows = (r.data as any[]) ?? [];
+
+          // If this owner column returned no rows, try the next owner column.
+          if (rows.length === 0 && ownerCol !== ownerCols[ownerCols.length - 1]) {
+            continue;
+          }
+
+          data = rows;
+          lastErr = null;
+          break outer;
+        }
+
+        const msg = String((r.error as any)?.message ?? "");
+        if (isMissingTable(msg)) {
+          return res.json({ ok: true, items: [], source: "missing_table" });
+        }
+
+        // Missing columns are expected; keep trying.
+        if (isMissingCol(msg)) {
+          lastErr = r.error;
+          continue;
+        }
+
+        // Unknown error: stop.
+        lastErr = r.error;
+        break outer;
+      }
+    }
+
+    if (lastErr) {
+      const msg = String((lastErr as any)?.message ?? "");
       return res.status(400).json({ ok: false, error: msg || "query_failed" });
     }
 
     const items = (data ?? [])
       .map((row: any) => ({
         run_id: String(row.run_id ?? "").trim(),
-        mode: row.mode ?? null,
-        source: row.source ?? null,
-        is_preview: Boolean(row.is_preview ?? row.preview ?? false),
-        executed_from_preview_run_id: row.executed_from_preview_run_id ?? null,
-        executed_by_user_id: row.executed_by_user_id ?? null,
-        executed_at: row.executed_at ?? null,
-        started_at: row.started_at ?? null,
-        finished_at: row.finished_at ?? null,
-        totals: row.totals ?? null,
+        mode: (row as any).mode ?? null,
+        started_at: (row as any).started_at ?? null,
+        finished_at: (row as any).finished_at ?? null,
+        totals: (row as any).totals ?? null,
+        meta: (row as any).meta && typeof (row as any).meta === "object" ? (row as any).meta : {},
+        // optional
+        reps: (row as any).reps ?? null,
+        source: (row as any).source ?? null,
+        is_preview: Boolean((row as any).is_preview ?? (row as any).preview ?? false),
+        executed_from_preview_run_id: (row as any).executed_from_preview_run_id ?? null,
+        executed_by_user_id: (row as any).executed_by_user_id ?? null,
+        executed_at: (row as any).executed_at ?? null,
       }))
       .filter((x: any) => x.run_id);
 
     return res.json({ ok: true, items });
-  } catch (e: any) {
-    const msg = String(e?.message ?? "");
-    if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
-      return res.status(401).json({ ok: false, error: msg });
-    }
-    if (msg.includes("forbidden_org_scope")) {
-      return res.status(403).json({ ok: false, error: msg });
-    }
-    return res.status(500).json({ ok: false, error: msg || "server_error" });
-  }
-});
-
-// GET /v1/crm/manager/auto-assign/runs/:run_id
-router.get("/manager/auto-assign/runs/:run_id", async (req, res) => {
-  try {
-    const { requester } = await requireManagerOrg(req);
-    const runId = String(req.params.run_id ?? "").trim();
-    if (!runId) return res.status(400).json({ ok: false, error: "invalid_run_id" });
-
-    const isMissingTable = (msg: string) => {
-      const m = msg.toLowerCase();
-      return (
-        (m.includes("relation") && m.includes("does not exist")) ||
-        (m.includes("does not exist") && m.includes("crm_auto_assign_runs"))
-      );
-    };
-
-    const { data, error } = await supa
-      .from("crm_auto_assign_runs")
-      .select(
-        "run_id, mode, started_at, finished_at, totals, reps, source, is_preview, executed_from_preview_run_id, executed_by_user_id, executed_at"
-      )
-      .eq("user_id", requester)
-      .eq("run_id", runId)
-      .limit(1);
-
-    if (error) {
-      const msg = String((error as any)?.message ?? "");
-      if (isMissingTable(msg)) return res.json({ ok: true, item: null, source: "missing_table" });
-      return res.status(400).json({ ok: false, error: msg || "query_failed" });
-    }
-
-    const row = (data ?? [])[0] as any;
-    if (!row) return res.json({ ok: true, item: null });
-
-    return res.json({
-      ok: true,
-      item: {
-        run_id: String(row.run_id ?? "").trim(),
-        mode: row.mode ?? null,
-        source: row.source ?? null,
-        is_preview: Boolean(row.is_preview ?? row.preview ?? false),
-        executed_from_preview_run_id: row.executed_from_preview_run_id ?? null,
-        executed_by_user_id: row.executed_by_user_id ?? null,
-        executed_at: row.executed_at ?? null,
-        started_at: row.started_at ?? null,
-        finished_at: row.finished_at ?? null,
-        totals: row.totals ?? null,
-        reps: row.reps ?? null,
-      },
-    });
   } catch (e: any) {
     const msg = String(e?.message ?? "");
     if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
@@ -2719,31 +2883,209 @@ router.get("/manager/auto-assign/runs/latest", async (req, res) => {
       );
     };
 
-    const { data, error } = await supa
-      .from("crm_auto_assign_runs")
-      .select("run_id, mode, started_at, finished_at, totals, reps")
-      .eq("user_id", requester)
-      .order("started_at", { ascending: false })
-      .limit(1);
+    const isMissingCol = (msg: string) => {
+      const m = msg.toLowerCase();
+      return m.includes("could not find") || (m.includes("column") && m.includes("does not exist"));
+    };
 
-    if (error) {
-      const msg = String((error as any)?.message ?? "");
+    const ownerCols: Array<"user_id" | "requester_id"> = ["user_id", "requester_id"];
+
+    const selectCandidates = [
+      "run_id, mode, started_at, finished_at, totals, reps, meta, source, is_preview, executed_from_preview_run_id, executed_by_user_id, executed_at",
+      "run_id, mode, started_at, finished_at, totals, reps, meta",
+      "run_id, mode, started_at, finished_at, totals, meta",
+      "run_id, mode, started_at, finished_at, meta",
+      "run_id, mode, started_at, finished_at, totals, reps",
+      "run_id, mode, started_at, finished_at, totals",
+      "run_id, mode, started_at, finished_at",
+      "run_id, mode, started_at",
+      "run_id, mode",
+      "run_id",
+    ];
+
+    let row: any = null;
+    let lastErr: any = null;
+
+    outer: for (const sel of selectCandidates) {
+      for (const ownerCol of ownerCols) {
+        const r = await supa
+          .from("crm_auto_assign_runs")
+          .select(sel)
+          .eq(ownerCol, requester)
+          .order("started_at", { ascending: false })
+          .limit(1);
+
+        if (!r.error) {
+          const rows = (r.data as any[]) ?? [];
+          const first = rows[0] ?? null;
+
+          // If this owner column returned no rows, try the next owner column.
+          if (!first) {
+            if (ownerCol === ownerCols[ownerCols.length - 1]) {
+              row = null;
+              lastErr = null;
+              break outer;
+            }
+            continue;
+          }
+
+          row = first;
+          lastErr = null;
+          break outer;
+        }
+
+        const msg = String((r.error as any)?.message ?? "");
+        if (isMissingTable(msg)) {
+          return res.json({
+            ok: true,
+            item: {
+              run_id: null,
+              meta: {},
+            },
+            source: "missing_table",
+          });
+        }
+        if (isMissingCol(msg)) {
+          lastErr = r.error;
+          continue;
+        }
+        lastErr = r.error;
+        break outer;
+      }
+    }
+
+    if (lastErr && !row) {
+      const msg = String((lastErr as any)?.message ?? "");
       if (isMissingTable(msg)) return res.json({ ok: true, item: null, source: "missing_table" });
       return res.status(400).json({ ok: false, error: msg || "query_failed" });
     }
 
-    const row = (data ?? [])[0] as any;
+    if (!row) return res.json({ ok: true, item: null });
+
+    res.setHeader("x-runs-latest-marker", "runs_latest_vX");
+
+    return res.json({
+      ok: true,
+      item: {
+        run_id: String(row.run_id ?? "").trim(),
+        mode: String((row as any).mode ?? "").trim(),
+        started_at: (row as any).started_at ?? null,
+        finished_at: (row as any).finished_at ?? null,
+        totals: (row as any).totals ?? null,
+        meta: (row as any).meta && typeof (row as any).meta === "object" ? (row as any).meta : {},
+        meta__marker: "runs_latest_vX",
+        // optional
+        reps: (row as any).reps ?? null,
+        source: (row as any).source ?? null,
+        is_preview: Boolean((row as any).is_preview ?? (row as any).preview ?? false),
+        executed_from_preview_run_id: (row as any).executed_from_preview_run_id ?? null,
+        executed_by_user_id: (row as any).executed_by_user_id ?? null,
+        executed_at: (row as any).executed_at ?? null,
+      },
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
+      return res.status(401).json({ ok: false, error: msg });
+    }
+    if (msg.includes("forbidden_org_scope")) {
+      return res.status(403).json({ ok: false, error: msg });
+    }
+    return res.status(500).json({ ok: false, error: msg || "server_error" });
+  }
+});
+
+// GET /v1/crm/manager/auto-assign/runs/:run_id
+router.get("/manager/auto-assign/runs/:run_id", async (req, res) => {
+  try {
+    const { requester } = await requireManagerOrg(req);
+
+    const runId = String(req.params.run_id ?? "").trim();
+    if (!UUID_RE.test(runId)) return res.status(400).json({ ok: false, error: "invalid_run_id" });
+
+    const isMissingTable = (msg: string) => {
+      const m = msg.toLowerCase();
+      return (
+        (m.includes("relation") && m.includes("does not exist")) ||
+        (m.includes("does not exist") && m.includes("crm_auto_assign_runs"))
+      );
+    };
+
+    const isMissingCol = (msg: string) => {
+      const m = msg.toLowerCase();
+      return m.includes("could not find") || (m.includes("column") && m.includes("does not exist"));
+    };
+
+    const ownerCols: Array<"user_id" | "requester_id"> = ["user_id", "requester_id"];
+
+    const selectCandidates = [
+      "run_id, mode, started_at, finished_at, totals, reps, meta, source, is_preview, executed_from_preview_run_id, executed_by_user_id, executed_at",
+      "run_id, mode, started_at, finished_at, totals, reps, meta",
+      "run_id, mode, started_at, finished_at, totals, meta",
+      "run_id, mode, started_at, finished_at, meta",
+      "run_id, mode, started_at, finished_at, totals, reps",
+      "run_id, mode, started_at, finished_at, totals",
+      "run_id, mode, started_at, finished_at",
+      "run_id, mode, started_at",
+      "run_id, mode",
+      "run_id",
+    ];
+
+    let row: any = null;
+    let lastErr: any = null;
+
+    outer: for (const sel of selectCandidates) {
+      for (const ownerCol of ownerCols) {
+        const r = await supa
+          .from("crm_auto_assign_runs")
+          .select(sel)
+          .eq(ownerCol, requester)
+          .eq("run_id", runId)
+          .limit(1);
+
+        if (!r.error) {
+          row = ((r.data as any[]) ?? [])[0] ?? null;
+          lastErr = null;
+          break outer;
+        }
+
+        const msg = String((r.error as any)?.message ?? "");
+        if (isMissingTable(msg)) {
+          return res.json({ ok: true, item: null, source: "missing_table" });
+        }
+        if (isMissingCol(msg)) {
+          lastErr = r.error;
+          continue;
+        }
+        lastErr = r.error;
+        break outer;
+      }
+    }
+
+    if (lastErr && !row) {
+      const msg = String((lastErr as any)?.message ?? "");
+      if (isMissingTable(msg)) return res.json({ ok: true, item: null, source: "missing_table" });
+      return res.status(400).json({ ok: false, error: msg || "query_failed" });
+    }
+
     if (!row) return res.json({ ok: true, item: null });
 
     return res.json({
       ok: true,
       item: {
         run_id: String(row.run_id ?? "").trim(),
-        mode: String(row.mode ?? "").trim(),
-        started_at: row.started_at ?? null,
-        finished_at: row.finished_at ?? null,
-        totals: row.totals ?? null,
-        reps: row.reps ?? null,
+        mode: String((row as any).mode ?? "").trim(),
+        started_at: (row as any).started_at ?? null,
+        finished_at: (row as any).finished_at ?? null,
+        totals: (row as any).totals ?? null,
+        reps: (row as any).reps ?? null,
+        meta: (row as any).meta && typeof (row as any).meta === "object" ? (row as any).meta : {},
+        // optional
+        source: (row as any).source ?? null,
+        is_preview: Boolean((row as any).is_preview ?? (row as any).preview ?? false),
+        executed_from_preview_run_id: (row as any).executed_from_preview_run_id ?? null,
+        executed_by_user_id: (row as any).executed_by_user_id ?? null,
+        executed_at: (row as any).executed_at ?? null,
       },
     });
   } catch (e: any) {
