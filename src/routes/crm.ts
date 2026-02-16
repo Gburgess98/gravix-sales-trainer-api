@@ -289,7 +289,7 @@ router.get("/contacts/:id", async (req, res) => {
         .select("id, first_name, last_name, email, company, last_contacted_at, created_at")
         .eq("user_id", requester)
         .eq("id", id)
-        .single();
+        .maybeSingle();
 
       if (!a1.error && a1.data) c = a1.data;
 
@@ -301,7 +301,7 @@ router.get("/contacts/:id", async (req, res) => {
             .select("id, first_name, last_name, email, company, created_at")
             .eq("user_id", requester)
             .eq("id", id)
-            .single();
+            .maybeSingle();
 
           if (a2.error || !a2.data) return res.status(404).json({ ok: false, error: "not_found" });
           c = { ...(a2.data as any), last_contacted_at: null };
@@ -663,8 +663,12 @@ router.get("/contacts/:id/ai-brief", async (req, res) => {
         .select("id, first_name, last_name, email, company, last_contacted_at")
         .eq("user_id", requester)
         .eq("id", contactId)
-        .single();
-      if (cErr || !c) return res.status(404).json({ ok: false, error: "not_found" });
+        .maybeSingle();
+
+      // Safe: maybeSingle() returns `data: null` when no rows match.
+      if (cErr) return res.status(500).json({ ok: false, error: cErr.message ?? "contact_query_failed" });
+      if (!c) return res.status(404).json({ ok: false, error: "not_found" });
+
       contact = c;
     }
 
@@ -1083,16 +1087,20 @@ async function selectCrmActionsSafe(args: {
     "meta",
   ];
 
+  // Schema-tolerant status filter
+  let statusFilterOn = true;
+
   // Build a query factory so we can re-run after stripping columns/filters.
   const run = async (useRepFilter: boolean, selectCols: string[]) => {
     let q = supa.from("crm_actions").select(selectCols.join(", ")).eq("user_id", requester);
 
     if (useRepFilter && repId) q = q.eq("rep_id", repId);
     if (contactId) q = q.eq("contact_id", contactId);
-    if (status) q = q.eq("status", status);
+
+    // Schema-tolerant status filter
+    if (status && statusFilterOn) q = q.eq("status", status);
 
     if (orderByDue) {
-      // If due_at column doesn't exist, we'll strip it and retry.
       q = q.order("due_at", { ascending: true });
     } else {
       q = q.order("created_at", { ascending: false });
@@ -1123,6 +1131,17 @@ async function selectCrmActionsSafe(args: {
 
       const msg = String((r.error as any)?.message ?? "");
       const lower = msg.toLowerCase();
+
+      // If status column is missing, disable status filter AND remove it from select list, then retry.
+      // (Otherwise we'll keep failing if the SELECT includes `status`.)
+      if (
+        (lower.includes("crm_actions.status") || (lower.includes("status") && (lower.includes("column") || lower.includes("could not find")))) &&
+        (lower.includes("does not exist") || lower.includes("could not find"))
+      ) {
+        statusFilterOn = false;
+        if (selectCols.includes("status")) selectCols = selectCols.filter((c) => c !== "status");
+        continue;
+      }
 
       // Table missing → fail fast.
       if (lower.includes("relation") && lower.includes("does not exist")) {
@@ -1365,6 +1384,91 @@ router.get("/actions/today", async (req, res) => {
       console.error("[crm/actions/today]", err);
       return res.status(500).json({ ok: false, error: err.message || "actions_today_failed" });
     }
+  }
+});
+
+// GET /v1/crm/actions
+// Stable actions list for manager/rep filtering screens.
+// Supports best-effort repId + status filtering without requiring crm_actions.status to exist.
+router.get("/actions", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    const repIdRaw = String((req.query as any).repId ?? (req.query as any).rep_id ?? "").trim();
+    const repId = repIdRaw || null;
+
+    const statusRaw = String((req.query as any).status ?? "").trim().toLowerCase();
+    const status = statusRaw || null; // open | completed | overdue | (null)
+
+    const limit = Math.min(Math.max(Number((req.query as any).limit ?? 200), 1), 500);
+
+    // Pull a broad set (best-effort, schema tolerant) then filter in-process.
+    const r = await selectCrmActionsSafe({
+      requester,
+      repId,
+      contactId: null,
+      status: null,
+      limit,
+      orderByDue: true,
+    });
+
+    if (!r.ok) {
+      const err = (r as any).error;
+      const msg = String((err as any)?.message ?? err ?? "actions_list_failed");
+      const lower = msg.toLowerCase();
+
+      // Missing table => return empty list (fail-open for UI)
+      if (lower.includes("relation") && lower.includes("does not exist")) {
+        return res.json({ ok: true, actions: [], source: "missing_table" });
+      }
+
+      console.error("[crm/actions]", msg);
+      return res.status(500).json({ ok: false, error: msg });
+    }
+
+    const now = Date.now();
+
+    const shaped = (r.data ?? []).map((row: any) => {
+      const title = row.title ?? row.label ?? null;
+      const completedAt = row.completed_at ?? null;
+      const dueAt = row.due_at ?? null;
+
+      const dueMs = dueAt ? new Date(String(dueAt)).getTime() : NaN;
+      const isOverdue = !completedAt && Number.isFinite(dueMs) ? dueMs < now : false;
+
+      return {
+        id: row.id,
+        contact_id: row.contact_id ?? null,
+        rep_id: row.rep_id ?? null,
+        type: row.type ?? row.source ?? "crm_action",
+        title,
+        due_at: dueAt,
+        created_at: row.created_at ?? null,
+        completed_at: completedAt,
+        importance: row.importance ?? null,
+        status: row.status ?? null,
+        meta: row.meta ?? null,
+        is_overdue: isOverdue,
+      };
+    });
+
+
+    const filtered = (() => {
+      if (status === "completed") return shaped.filter((x) => !!x.completed_at);
+      if (status === "overdue") return shaped.filter((x) => x.is_overdue === true);
+      if (status === "open") return shaped.filter((x) => !x.completed_at);
+      return shaped;
+    })();
+
+    return res.json({
+      ok: true,
+      actions: filtered,
+      source: r.usedRepFilter ? "crm_actions_rep_id" : "crm_actions_user_only",
+      select_cols: r.selectCols,
+    });
+  } catch (err: any) {
+    console.error("[crm/actions]", err);
+    return res.status(500).json({ ok: false, error: err.message || "actions_list_failed" });
   }
 });
 
@@ -2289,6 +2393,11 @@ router.post("/manager/auto-assign/execute-from-preview", async (req, res) => {
       rows = r2.data ?? [];
     }
 
+    // Defensive: ensure rows is a valid array before accessing index 0
+    if (!rows || !Array.isArray(rows) || rows.length === 0) {
+      return res.status(404).json({ ok: false, error: "preview_run_not_found" });
+    }
+
     const row = rows[0];
     if (!row) {
       return res.status(404).json({ ok: false, error: "preview_run_not_found" });
@@ -3101,3 +3210,91 @@ router.get("/manager/auto-assign/runs/:run_id", async (req, res) => {
 });
 
 export default router;
+// POST /v1/crm/actions/:action_id/complete
+// Marks an action complete in a schema-tolerant way (rep_id/status columns may not exist yet).
+router.post("/actions/:action_id/complete", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    const actionId = String((req.params as any)?.action_id ?? "").trim();
+    if (!actionId) return res.status(400).json({ ok: false, error: "missing_action_id" });
+
+    const now = new Date().toISOString();
+
+    // Best-effort updates (columns may vary by migration state)
+    const candidates: Array<Record<string, any>> = [
+      { completed_at: now, status: "completed" },
+      { completed_at: now },
+      { status: "completed" },
+    ];
+
+    // Best-effort select (rep_id/status may not exist)
+    const baseSelectCols = ["id", "contact_id", "rep_id", "status", "completed_at"]; 
+
+    const stripMissingCol = (msg: string): string | null => {
+      const m1 = msg.match(/column crm_actions\.([a-zA-Z0-9_]+) does not exist/i);
+      if (m1?.[1]) return m1[1];
+      const m2 = msg.match(/could not find the '([^']+)' column/i);
+      if (m2?.[1]) return m2[1];
+      return null;
+    };
+
+    let lastErr: any = null;
+
+    for (const patch of candidates) {
+      let selectCols = [...baseSelectCols];
+
+      for (let i = 0; i < 8; i++) {
+        const r = await supa
+          .from("crm_actions")
+          .update(patch)
+          .eq("user_id", requester)
+          .eq("id", actionId)
+          .select(selectCols.join(", "))
+          .limit(1);
+
+        if (!r.error) {
+          const item = (Array.isArray(r.data) ? r.data[0] : null) ?? null;
+          if (!item) return res.status(404).json({ ok: false, error: "not_found" });
+          return res.json({ ok: true, item });
+        }
+
+        lastErr = r.error;
+        const msg = String((r.error as any)?.message ?? "");
+        const lower = msg.toLowerCase();
+
+        // Missing table -> surface a clear error
+        if (lower.includes("relation") && lower.includes("does not exist")) {
+          return res.status(400).json({ ok: false, error: msg || "missing_table" });
+        }
+
+        // If SELECT includes a missing column (e.g. rep_id/status), strip it and retry.
+        const bad = stripMissingCol(msg);
+        if (bad && selectCols.includes(bad)) {
+          selectCols = selectCols.filter((c) => c !== bad);
+          continue;
+        }
+
+        // If the patch references a missing column, try the next patch candidate.
+        if (lower.includes("column") && lower.includes("does not exist")) {
+          break;
+        }
+
+        // Unknown error -> stop retrying
+        break;
+      }
+    }
+
+    const msg = String((lastErr as any)?.message ?? "update_failed");
+    return res.status(400).json({ ok: false, error: msg || "update_failed" });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
+      return res.status(401).json({ ok: false, error: msg });
+    }
+    if (msg.includes("forbidden_org_scope")) {
+      return res.status(403).json({ ok: false, error: msg });
+    }
+    return res.status(500).json({ ok: false, error: msg || "server_error" });
+  }
+});
