@@ -26,6 +26,77 @@ function getOrgIdHeader(req: any): string {
   return oid;
 }
 
+// ------------------- Contact Health Score (v1) -------------------
+function healthClamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function healthDaysSince(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  if (!Number.isFinite(t)) return null;
+  const diffMs = Date.now() - t;
+  return diffMs < 0 ? 0 : Math.floor(diffMs / (1000 * 60 * 60 * 24));
+}
+
+function computeContactHealthV1(args: {
+  last_contacted_at?: string | null;
+  open_actions: number;
+  overdue_actions: number;
+  has_notes?: boolean;
+  has_recent_call?: boolean;
+}) {
+  const reasons: string[] = [];
+  let score = 100;
+
+  const ds = healthDaysSince(args.last_contacted_at);
+  if (ds !== null && ds >= 14) {
+    score -= 30;
+    reasons.push(`No contact in ${ds} days`);
+  }
+
+  if ((args.overdue_actions ?? 0) > 0) {
+    score -= 20;
+    reasons.push(`${args.overdue_actions} overdue action${args.overdue_actions === 1 ? "" : "s"}`);
+  }
+
+  const openOver3 = Math.max(0, (args.open_actions ?? 0) - 3);
+  if (openOver3 > 0) {
+    score -= 10 * openOver3;
+    reasons.push(`${args.open_actions} open actions`);
+  }
+
+  // Activity awareness (best-effort signals)
+  if (args.has_recent_call) {
+    score += 10;
+    reasons.push("Recent call activity");
+  }
+
+  if (args.has_notes) {
+    score += 5;
+    reasons.push("Notes present");
+  }
+
+  score = healthClamp(score, 0, 100);
+
+  let band: "healthy" | "watch" | "at_risk" = "healthy";
+  if (score < 50) band = "at_risk";
+  else if (score < 75) band = "watch";
+
+  return {
+    score,
+    band,
+    reasons,
+    stats: {
+      open_actions: args.open_actions ?? 0,
+      overdue_actions: args.overdue_actions ?? 0,
+      last_contacted_days: ds,
+      has_notes: Boolean(args.has_notes),
+      has_recent_call: Boolean(args.has_recent_call),
+    },
+  };
+}
+
 // Org-scope guard (fail-closed)
 // Requires a `reps.org_id` column. If missing, fail closed (500) so we don't leak cross-org.
 async function assertRequesterInOrg(args: { requester: string; orgId: string }) {
@@ -263,6 +334,14 @@ router.get("/contacts/:id", async (req, res) => {
       const found = DEMO_CONTACTS.find((c) => c.id === id);
       if (!found) return res.status(404).json({ ok: false, error: "not_found" });
 
+      const health = computeContactHealthV1({
+        last_contacted_at: found.last_contacted_at ?? null,
+        open_actions: 0,
+        overdue_actions: 0,
+        has_notes: false,
+        has_recent_call: false,
+      });
+
       return res.json({
         ok: true,
         contact: {
@@ -275,6 +354,7 @@ router.get("/contacts/:id", async (req, res) => {
           created_at: null,
         },
         account: null,
+        health,
       });
     }
 
@@ -315,6 +395,161 @@ router.get("/contacts/:id", async (req, res) => {
 
     if (!c) return res.status(404).json({ ok: false, error: "not_found" });
 
+    // ---- Contact health (best-effort; schema tolerant)
+    let open_actions = 0;
+    let overdue_actions = 0;
+
+    // ---- Activity awareness (best-effort): notes + recent calls
+    let has_notes = false;
+    let has_recent_call = false;
+    let activityLastIso: string | null = null;
+
+    const pickMaxIso = (a: string | null, b: string | null) => {
+      if (!a) return b;
+      if (!b) return a;
+      const ta = new Date(a).getTime();
+      const tb = new Date(b).getTime();
+      if (!Number.isFinite(ta)) return b;
+      if (!Number.isFinite(tb)) return a;
+      return tb > ta ? b : a;
+    };
+
+    // Notes: crm_contact_notes(created_at)
+    try {
+      const rn = await supa
+        .from("crm_contact_notes")
+        .select("created_at")
+        .eq("user_id", requester)
+        .eq("contact_id", id)
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (!rn.error) {
+        const row = (rn.data as any[])?.[0] ?? null;
+        const iso = row?.created_at ? String(row.created_at) : null;
+        if (iso) {
+          has_notes = true;
+          activityLastIso = pickMaxIso(activityLastIso, iso);
+        }
+      } else {
+        const msg = String((rn.error as any)?.message ?? "").toLowerCase();
+        if (!(msg.includes("relation") && msg.includes("does not exist")) && !(msg.includes("does not exist") && msg.includes("column"))) {
+          // ignore other errors (fail-soft)
+        }
+      }
+    } catch {
+      // fail-soft
+    }
+
+    // Calls: crm_call_links(contact_id -> call_id) + calls(created_at)
+    try {
+      // Link table may not exist
+      const links = await supa
+        .from("crm_call_links")
+        .select("call_id")
+        .eq("contact_id", id)
+        .limit(25);
+
+      if (!links.error) {
+        const callIds = ((links.data as any[]) ?? []).map((r) => r?.call_id).filter(Boolean);
+        if (callIds.length) {
+          const rc = await supa
+            .from("calls")
+            .select("id, created_at")
+            .eq("user_id", requester)
+            .in("id", callIds)
+            .order("created_at", { ascending: false })
+            .limit(1);
+
+          if (!rc.error) {
+            const row = (rc.data as any[])?.[0] ?? null;
+            const iso = row?.created_at ? String(row.created_at) : null;
+            if (iso) {
+              activityLastIso = pickMaxIso(activityLastIso, iso);
+              const ds = healthDaysSince(iso);
+              has_recent_call = ds !== null ? ds <= 14 : false;
+            }
+          }
+        }
+      } else {
+        const msg = String((links.error as any)?.message ?? "").toLowerCase();
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+          // ignore
+        }
+      }
+    } catch {
+      // fail-soft
+    }
+
+    try {
+      const nowMs = Date.now();
+
+      const selCandidates = [
+        "id, due_at, completed_at, created_at",
+        "id, due_at, completed_at",
+        "id, due_at, created_at",
+        "id, due_at",
+        "id, completed_at",
+        "id",
+      ];
+
+      let actions: any[] = [];
+
+      for (const sel of selCandidates) {
+        const r = await supa
+          .from("crm_actions")
+          .select(sel)
+          .eq("user_id", requester)
+          .eq("contact_id", id)
+          .order("created_at", { ascending: false })
+          .limit(200);
+
+        if (!r.error) {
+          actions = (r.data as any[]) ?? [];
+          break;
+        }
+
+        const msg = String((r.error as any)?.message ?? "").toLowerCase();
+
+        // Missing columns -> try next select
+        if (msg.includes("column") && msg.includes("does not exist")) continue;
+
+        // Missing table -> treat as no actions
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+          actions = [];
+          break;
+        }
+
+        // Unknown error -> stop trying
+        break;
+      }
+
+      for (const a of actions) {
+        const completedAt = (a as any)?.completed_at ?? null;
+        const dueAt = (a as any)?.due_at ?? null;
+
+        const isCompleted = !!completedAt;
+        if (!isCompleted) open_actions++;
+
+        if (!isCompleted && dueAt) {
+          const dueMs = new Date(String(dueAt)).getTime();
+          if (Number.isFinite(dueMs) && dueMs < nowMs) overdue_actions++;
+        }
+      }
+    } catch {
+      // fail-soft
+    }
+
+    const effectiveLastContactedAt = (c as any)?.last_contacted_at ?? activityLastIso ?? null;
+
+    const health = computeContactHealthV1({
+      last_contacted_at: effectiveLastContactedAt,
+      open_actions,
+      overdue_actions,
+      has_notes,
+      has_recent_call,
+    });
+
     return res.json({
       ok: true,
       contact: {
@@ -327,6 +562,7 @@ router.get("/contacts/:id", async (req, res) => {
         created_at: (c as any).created_at ?? null,
       },
       account: null,
+      health,
     });
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
@@ -452,6 +688,44 @@ router.get("/contacts/:id/assignments", async (req, res) => {
     const { open, completed } = await fetchContactAssignmentsBestEffort({ requester, contactId, limit });
 
     return res.json({ ok: true, open, completed });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+  }
+});
+
+// ----------------------------------------------------------------
+// Contact Actions (crm_actions-backed)
+// GET /v1/crm/contacts/:id/actions
+// - This is what the WEB calls.
+// - Best-effort: uses crm_actions if it exists; otherwise returns empty.
+// ----------------------------------------------------------------
+router.get("/contacts/:id/actions", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const contactId = String(req.params.id ?? "").trim();
+    if (!contactId) return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+
+    // Demo contacts: no real actions yet
+    if (contactId.startsWith("c_")) {
+      return res.json({ ok: true, open: [], completed: [] });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query.limit ?? 50), 1), 200);
+
+    // Prefer crm_actions stream (this is our stable action source of truth)
+    const r = await fetchCrmActionsBestEffort({ requester, contactId, limit });
+
+    // If crm_actions is missing or fails, fail-open with empties (don’t break contact page)
+    if (!r.ok) {
+      const msg = String((r as any)?.error?.message ?? "").toLowerCase();
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.json({ ok: true, open: [], completed: [] });
+      }
+      // unknown error: still fail-open for UI
+      return res.json({ ok: true, open: [], completed: [] });
+    }
+
+    return res.json({ ok: true, open: r.open ?? [], completed: r.completed ?? [] });
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
@@ -3229,7 +3503,7 @@ router.post("/actions/:action_id/complete", async (req, res) => {
     ];
 
     // Best-effort select (rep_id/status may not exist)
-    const baseSelectCols = ["id", "contact_id", "rep_id", "status", "completed_at"]; 
+    const baseSelectCols = ["id", "contact_id", "rep_id", "status", "completed_at"];
 
     const stripMissingCol = (msg: string): string | null => {
       const m1 = msg.match(/column crm_actions\.([a-zA-Z0-9_]+) does not exist/i);
