@@ -83,7 +83,7 @@ function computeContactHealthV1(args: {
   if (score < 50) band = "at_risk";
   else if (score < 75) band = "watch";
 
-  return {
+  const health = {
     score,
     band,
     reasons,
@@ -94,6 +94,60 @@ function computeContactHealthV1(args: {
       has_notes: Boolean(args.has_notes),
       has_recent_call: Boolean(args.has_recent_call),
     },
+  };
+
+  const next_action = deriveNextAction(health);
+
+  return {
+    ...health,
+    next_action,
+  };
+}
+
+function deriveNextAction(health: {
+  score: number;
+  band: "healthy" | "watch" | "at_risk";
+  reasons: string[];
+  stats: {
+    open_actions: number;
+    overdue_actions: number;
+    last_contacted_days: number | null;
+    has_notes: boolean;
+    has_recent_call: boolean;
+  };
+}) {
+  const overdue = health?.stats?.overdue_actions ?? 0;
+  const open = health?.stats?.open_actions ?? 0;
+  const days = health?.stats?.last_contacted_days;
+
+  if (overdue > 0) {
+    return {
+      type: "resolve_overdue" as const,
+      label: "Resolve overdue actions",
+      severity: "high" as const,
+    };
+  }
+
+  if (typeof days === "number" && days > 14) {
+    return {
+      type: "follow_up" as const,
+      label: "Schedule follow-up",
+      severity: "medium" as const,
+    };
+  }
+
+  if (open === 0) {
+    return {
+      type: "log_next_step" as const,
+      label: "Log next step",
+      severity: "low" as const,
+    };
+  }
+
+  return {
+    type: "none" as const,
+    label: "Contact healthy",
+    severity: "none" as const,
   };
 }
 
@@ -726,6 +780,38 @@ router.get("/contacts/:id/actions", async (req, res) => {
     }
 
     return res.json({ ok: true, open: r.open ?? [], completed: r.completed ?? [] });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+  }
+});
+
+// ----------------------------------------------------------------
+// GET /v1/crm/contacts/:id/activity
+// Unified timeline feed (notes + actions + calls)
+// ----------------------------------------------------------------
+router.get("/contacts/:id/activity", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const contactId = String(req.params.id ?? "").trim();
+
+    if (!contactId) {
+      return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query.limit ?? 50), 1), 200);
+
+    // Demo contacts
+    if (contactId.startsWith("c_")) {
+      return res.json({ ok: true, items: [] });
+    }
+
+    const items = await fetchContactActivityBestEffort({
+      requester,
+      contactId,
+      limit,
+    });
+
+    return res.json({ ok: true, items });
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
@@ -1612,6 +1698,8 @@ async function fetchCrmActionsBestEffort(args: { requester: string; contactId: s
       };
     });
 
+    // (fetchContactActivityBestEffort moved to top-level scope)
+
     const open = rows.filter((x) => !x.completed_at && String(x.status ?? "open").toLowerCase() !== "done");
     const completed = rows.filter((x) => !!x.completed_at || String(x.status ?? "").toLowerCase() === "done");
 
@@ -1619,6 +1707,116 @@ async function fetchCrmActionsBestEffort(args: { requester: string; contactId: s
   } catch (e: any) {
     return { ok: false as const, open: [], completed: [], error: e };
   }
+}
+
+// ----------------------------------------------------------------
+// Contact Activity (Timeline Feed)
+// Best-effort merge: notes + crm_actions + calls
+// ----------------------------------------------------------------
+async function fetchContactActivityBestEffort(args: {
+  requester: string;
+  contactId: string;
+  limit: number;
+}) {
+  const { requester, contactId, limit } = args;
+
+  const items: any[] = [];
+
+  // ---- NOTES ----
+  try {
+    const { data } = await supa
+      .from("crm_contact_notes")
+      .select("id, body, created_at, importance, author_name")
+      .eq("user_id", requester)
+      .eq("contact_id", contactId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    for (const n of data ?? []) {
+      items.push({
+        id: `note_${(n as any).id}`,
+        type: "note",
+        created_at: (n as any).created_at,
+        title: (n as any).body?.slice(0, 120) ?? "Note",
+        importance: (n as any).importance ?? "normal",
+        meta: {
+          author: (n as any).author_name ?? null,
+        },
+      });
+    }
+  } catch {
+    // fail-soft
+  }
+
+  // ---- ACTIONS ----
+  try {
+    const r = await fetchCrmActionsBestEffort({ requester, contactId, limit });
+
+    if (r.ok) {
+      const all = [...((r as any).open ?? []), ...((r as any).completed ?? [])];
+
+      for (const a of all) {
+        items.push({
+          id: `action_${(a as any).id}`,
+          type: "action",
+          created_at: (a as any).created_at ?? (a as any).due_at ?? null,
+          title: (a as any).title ?? "CRM Action",
+          importance: (a as any).importance ?? null,
+          meta: {
+            completed: !!(a as any).completed_at,
+            due_at: (a as any).due_at ?? null,
+          },
+        });
+      }
+    }
+  } catch {
+    // fail-soft
+  }
+
+  // ---- CALLS ----
+  try {
+    const { data: links } = await supa
+      .from("crm_call_links")
+      .select("call_id")
+      .eq("contact_id", contactId)
+      .limit(limit);
+
+    const callIds = (links ?? []).map((l: any) => l.call_id).filter(Boolean);
+
+    if (callIds.length) {
+      const { data: calls } = await supa
+        .from("calls")
+        .select("id, created_at, summary, duration_ms")
+        .eq("user_id", requester)
+        .in("id", callIds)
+        .order("created_at", { ascending: false })
+        .limit(limit);
+
+      for (const c of calls ?? []) {
+        items.push({
+          id: `call_${(c as any).id}`,
+          type: "call",
+          created_at: (c as any).created_at,
+          title: (c as any).summary ?? "Sales Call",
+          importance: null,
+          meta: {
+            duration_ms: (c as any).duration_ms ?? null,
+          },
+        });
+      }
+    }
+  } catch {
+    // fail-soft
+  }
+
+  // ---- SORT newest first ----
+  items.sort((a, b) => {
+    const ta = new Date(a.created_at ?? 0).getTime();
+    const tb = new Date(b.created_at ?? 0).getTime();
+    return tb - ta;
+  });
+
+  return items.slice(0, limit);
 }
 
 // GET /v1/crm/actions/today
@@ -1747,6 +1945,201 @@ router.get("/actions", async (req, res) => {
 });
 
 
+// ------------------------------
+// ------------------------------
+// MANAGER CONTACTS (v1)
+// GET /v1/crm/manager/contacts?filter=at-risk&limit=50
+// - Org-scoped (fail-closed via requireManagerOrg)
+// - Returns a list of contacts enriched with health + action counts
+// - Schema tolerant: crm_contacts may lack last_contacted_at; ownership may be user_id or requester_id
+// ------------------------------
+router.get("/manager/contacts", async (req, res) => {
+  try {
+    const { requester } = await requireManagerOrg(req);
+
+    const rawFilter = String((req.query as any)?.filter ?? "").trim().toLowerCase();
+    const filter = rawFilter || null; // 'at-risk' | null
+
+    const limit = Math.min(Math.max(Number((req.query as any)?.limit ?? 50), 1), 200);
+
+    // ------------------------------
+    // Contacts fetch (schema tolerant)
+    // ------------------------------
+    const selectContactsBestEffort = async () => {
+      // Ownership key candidates
+      const ownerCols: Array<"user_id" | "requester_id"> = ["user_id", "requester_id"];
+
+      // Select candidates (prefer last_contacted_at if present)
+      const selectColsCandidates = [
+        "id, first_name, last_name, email, company, last_contacted_at, created_at",
+        "id, first_name, last_name, email, company, created_at",
+      ];
+
+      for (const ownerCol of ownerCols) {
+        for (const sel of selectColsCandidates) {
+          const r = await supa
+            .from("crm_contacts")
+            .select(sel)
+            // @ts-ignore - dynamic column name
+            .eq(ownerCol, requester)
+            .order("created_at", { ascending: false })
+            .limit(limit);
+
+          if (!r.error) {
+            const rows = (r.data as any[]) ?? [];
+            const hasLastContacted = sel.includes("last_contacted_at");
+            return { rows, hasLastContacted };
+          }
+
+          const msg = String((r.error as any)?.message ?? "").toLowerCase();
+
+          // Missing table -> return empty
+          if (msg.includes("relation") && msg.includes("does not exist")) {
+            return { rows: [] as any[], hasLastContacted: false };
+          }
+
+          // Missing column -> try next candidate
+          if ((msg.includes("column") && msg.includes("does not exist")) || msg.includes("could not find")) {
+            continue;
+          }
+
+          // Unknown error -> surface
+          throw r.error;
+        }
+      }
+
+      return { rows: [] as any[], hasLastContacted: false };
+    };
+
+    const { rows, hasLastContacted } = await selectContactsBestEffort();
+
+    // ------------------------------
+    // Enrich per contact (best-effort)
+    // ------------------------------
+    const nowMs = Date.now();
+
+    const enriched = await Promise.all(
+      (rows ?? []).map(async (c: any) => {
+        const contactId = String(c?.id ?? "");
+
+        // Action counts (best-effort)
+        let open = 0;
+        let completed = 0;
+        let overdue = 0;
+
+        try {
+          const r = await fetchCrmActionsBestEffort({ requester, contactId, limit: 250 });
+          if (r.ok) {
+            const openItems = (r.open ?? []) as any[];
+            const completedItems = (r.completed ?? []) as any[];
+
+            open = openItems.length;
+            completed = completedItems.length;
+
+            overdue = openItems.reduce((acc, a) => {
+              const dueAt = (a as any)?.due_at ?? null;
+              if (!dueAt) return acc;
+              const dueMs = new Date(String(dueAt)).getTime();
+              if (Number.isFinite(dueMs) && dueMs < nowMs) return acc + 1;
+              return acc;
+            }, 0);
+          }
+        } catch {
+          // fail-soft
+        }
+
+        // Health (best-effort)
+        const lastContactedAt = hasLastContacted ? (c?.last_contacted_at ?? null) : null;
+        const health = computeContactHealthV1({
+          last_contacted_at: lastContactedAt,
+          open_actions: open,
+          overdue_actions: overdue,
+          has_notes: false,
+          has_recent_call: false,
+        });
+
+        return {
+          id: contactId,
+          first_name: c?.first_name ?? null,
+          last_name: c?.last_name ?? null,
+          email: c?.email ?? null,
+          company: c?.company ?? null,
+          last_contacted_at: hasLastContacted ? (c?.last_contacted_at ?? null) : null,
+          created_at: c?.created_at ?? null,
+          health,
+          action_counts: {
+            open,
+            overdue,
+            completed,
+          },
+        };
+      })
+    );
+
+    // ------------------------------
+    // Filtering + sorting
+    // ------------------------------
+    const isAtRisk = (x: any) => {
+      const overdue = Number(x?.action_counts?.overdue ?? 0);
+      const score = Number(x?.health?.score ?? 0);
+      const band = String(x?.health?.band ?? "");
+      const days = x?.health?.stats?.last_contacted_days;
+
+      // 1) Any overdue action = automatically at risk
+      if (overdue > 0) return true;
+
+      // 2) Health band explicitly marked at_risk
+      if (band === "at_risk") return true;
+
+      // 3) Very low health score
+      if (score < 50) return true;
+
+      // 4) No contact for >21 days (hard stale)
+      if (typeof days === "number" && days > 21) return true;
+
+      return false;
+    };
+
+    let items = enriched;
+    if (filter === "at-risk" || filter === "at_risk") {
+      items = items.filter(isAtRisk);
+    }
+
+    items.sort((a: any, b: any) => {
+      const ao = Number(a?.action_counts?.overdue ?? 0);
+      const bo = Number(b?.action_counts?.overdue ?? 0);
+      if (bo !== ao) return bo - ao;
+
+      const aopen = Number(a?.action_counts?.open ?? 0);
+      const bopen = Number(b?.action_counts?.open ?? 0);
+      if (bopen !== aopen) return bopen - aopen;
+
+      const as = Number(a?.health?.score ?? 0);
+      const bs = Number(b?.health?.score ?? 0);
+      if (as !== bs) return as - bs;
+
+      // newest first
+      const at = new Date(String(a?.created_at ?? 0)).getTime();
+      const bt = new Date(String(b?.created_at ?? 0)).getTime();
+      return bt - at;
+    });
+
+    return res.json({
+      ok: true,
+      items,
+      filter,
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    if (msg.includes("Missing or invalid x-user-id") || msg.includes("Missing or invalid x-org-id")) {
+      return res.status(401).json({ ok: false, error: msg });
+    }
+    if (msg.includes("forbidden_org_scope")) {
+      return res.status(403).json({ ok: false, error: msg });
+    }
+    return res.status(500).json({ ok: false, error: msg || "server_error" });
+  }
+});
 // ------------------------------
 // MANAGER OVERVIEW (v1)
 // GET /v1/crm/manager/overview
