@@ -623,6 +623,132 @@ router.get("/contacts/:id", async (req, res) => {
   }
 });
 
+// Best-effort contact touch helper (fail-soft)
+// Reusable across notes, actions, etc.
+//
+// Behaviour:
+// - Prefer ownership by `crm_contacts.user_id` (current canonical)
+// - If that column is missing, fall back to `crm_contacts.requester_id`
+// - Never throws; callers may ignore failures
+async function touchContactBestEffort(opts: { requester: string; contactId: string }) {
+  const { requester, contactId } = opts;
+  const nowIso = new Date().toISOString();
+
+  // Helper to detect "missing column" errors from PostgREST
+  const isMissingCol = (msg: string, col: string) =>
+    (msg.includes(col) && msg.includes("does not exist")) ||
+    (msg.includes(col) && msg.includes("could not find"));
+
+  const tryUpdate = async (ownerCol: "user_id" | "requester_id") => {
+    // @ts-ignore dynamic column
+    const r = await supa
+      .from("crm_contacts")
+      .update({ last_contacted_at: nowIso })
+      .eq("id", contactId)
+      // @ts-ignore dynamic column
+      .eq(ownerCol, requester)
+      .select("id")
+      .maybeSingle();
+
+    // Success when a row matched.
+    if (!r.error && r.data) return { ok: true as const, last_contacted_at: nowIso };
+
+    // No row matched (owned by someone else or not found)
+    if (!r.error && !r.data) return { ok: false as const, reason: "not_found_or_not_owned" };
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+
+    // Missing ownership column
+    if (isMissingCol(msg, ownerCol)) return { ok: false as const, reason: "owner_col_missing" };
+
+    // Missing last_contacted_at column
+    if (isMissingCol(msg, "last_contacted_at")) return { ok: false as const, reason: "last_contacted_at_missing" };
+
+    // Missing table
+    if (msg.includes("relation") && msg.includes("does not exist")) {
+      return { ok: false as const, reason: "crm_contacts_table_missing" };
+    }
+
+    return { ok: false as const, reason: "touch_failed", detail: msg };
+  };
+
+  // 1) Canonical: user_id
+  const r1 = await tryUpdate("user_id");
+  if (r1.ok) return r1;
+
+  // If user_id column exists (i.e. failure wasn't "owner_col_missing"), don't bother trying requester_id.
+  // This avoids noisy errors like "column crm_contacts.requester_id does not exist" in modern schemas.
+  if (r1.reason !== "owner_col_missing") return r1;
+
+  // 2) Legacy fallback: requester_id
+  const r2 = await tryUpdate("requester_id");
+  if (r2.ok) return r2;
+
+  // If requester_id is also missing, just fail-soft.
+  return r2.reason === "owner_col_missing" ? { ok: false as const, reason: "not_supported" } : r2;
+}
+
+// POST /v1/crm/contacts/:id/mark-contacted
+// Sets crm_contacts.last_contacted_at to now (schema-tolerant ownership key).
+router.post("/contacts/:id/mark-contacted", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const contactId = String((req.params as any)?.id ?? "").trim();
+
+    if (!contactId) {
+      return res.status(400).json({ ok: false, error: "contact_id_required" });
+    }
+
+    // Demo contacts: just return ok (no DB write)
+    if (contactId.startsWith("c_")) {
+      return res.json({
+        ok: true,
+        contact_id: contactId,
+        last_contacted_at: new Date().toISOString(),
+        source: "demo",
+      });
+    }
+
+    const UUID_RE =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+    if (!UUID_RE.test(contactId)) {
+      return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+    }
+
+    // Use shared touch helper (fail-hard only for truly invalid ids)
+    const touched = await touchContactBestEffort({ requester, contactId });
+
+    if (touched.ok) {
+      return res.json({
+        ok: true,
+        contact_id: contactId,
+        last_contacted_at: touched.last_contacted_at,
+      });
+    }
+
+    // If schema doesn't support this, surface a clear error (this endpoint is meant to be a hard signal)
+    if (touched.reason === "last_contacted_at_missing") {
+      return res.status(500).json({ ok: false, error: "crm_contacts_last_contacted_at_missing" });
+    }
+
+    if (touched.reason === "crm_contacts_table_missing") {
+      return res.status(500).json({ ok: false, error: "crm_contacts_table_missing" });
+    }
+
+    return res.status(404).json({
+      ok: false,
+      error: "contact_not_found_or_not_owned",
+      detail: (touched as any).detail ?? touched.reason,
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "mark_contacted_failed",
+    });
+  }
+});
+
 /** ----------------------------------------------------------------
  * Contact Assignments (read-only)
  * GET /v1/crm/contacts/:id/assignments
@@ -1160,6 +1286,13 @@ router.post("/link-call", async (req, res) => {
 
     if (linkErr) throw linkErr;
 
+    // best-effort: linking a call is a "touch"
+    try {
+      await touchContactBestEffort({ requester, contactId });
+    } catch {
+      // fail-soft
+    }
+
     res.json({ ok: true, link: { contact_id: contactId } });
   } catch (e: any) {
     res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
@@ -1242,8 +1375,6 @@ router.post("/contacts/:id/notes", async (req, res) => {
       // ignore lookup errors
     }
 
-
-
     // after the rep lookup try/catch
     authorName = authorName ?? parsed.data.author_name ?? "Rep";
 
@@ -1261,6 +1392,13 @@ router.post("/contacts/:id/notes", async (req, res) => {
       .single();
 
     if (error) throw error;
+
+    // best-effort: touching contact improves health accuracy; never block note creation
+    try {
+      await touchContactBestEffort({ requester, contactId });
+    } catch {
+      // fail-soft
+    }
 
     return res.json({ ok: true, note: data });
   } catch (e: any) {
@@ -1925,6 +2063,7 @@ router.get("/actions", async (req, res) => {
     });
 
 
+
     const filtered = (() => {
       if (status === "completed") return shaped.filter((x) => !!x.completed_at);
       if (status === "overdue") return shaped.filter((x) => x.is_overdue === true);
@@ -1944,6 +2083,180 @@ router.get("/actions", async (req, res) => {
   }
 });
 
+// POST /v1/crm/actions
+// Create a CRM action (manager/rep use). Schema-tolerant insert.
+// Body: { contact_id, type?, title?, due_at?, importance?, meta?, rep_id? }
+router.post("/actions", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    const body = (req.body ?? {}) as any;
+
+    const contactIdRaw = String(body.contact_id ?? body.contactId ?? "").trim();
+    if (!contactIdRaw) {
+      return res.status(400).json({ ok: false, error: "contact_id_required" });
+    }
+
+    const type = String(body.type ?? "follow_up").trim() || "follow_up";
+    const title = String(body.title ?? "Follow up").trim() || "Follow up";
+
+    const dueAt = body.due_at ?? body.dueAt ?? null;
+    const importance = String(body.importance ?? "normal").trim() || "normal";
+    const meta = body.meta ?? { source: "manager_contacts_table" };
+
+    // Optional: allow passing rep_id (future manager flows). Default to requester.
+    const repId = String(body.rep_id ?? body.repId ?? requester).trim() || requester;
+
+    // We’ll try a “full” insert first, then retry if optional columns don’t exist.
+    const basePayload: any = {
+      user_id: requester,      // OWNER (always requester)
+      rep_id: repId,           // ASSIGNEE (optional)
+      contact_id: contactIdRaw,
+      type,
+      title,
+      due_at: dueAt,
+      importance,
+      meta,
+      status: "open",
+    };
+
+    const tryInsert = async (payload: any) => {
+      return await supa.from("crm_actions").insert(payload).select("*").single();
+    };
+
+    // Retry ladder for schema tolerance (missing columns)
+    const attempts: any[] = [
+      { ...basePayload },
+      (() => {
+        const p = { ...basePayload };
+        delete p.status;
+        return p;
+      })(),
+      (() => {
+        const p = { ...basePayload };
+        delete p.importance;
+        return p;
+      })(),
+      (() => {
+        const p = { ...basePayload };
+        delete p.meta;
+        return p;
+      })(),
+      (() => {
+        const p = { ...basePayload };
+        delete p.due_at;
+        return p;
+      })(),
+      (() => {
+        const p = { ...basePayload };
+        delete p.status;
+        delete p.importance;
+        delete p.meta;
+        delete p.due_at;
+        return p;
+      })(),
+      // absolute minimum
+      { user_id: repId, contact_id: contactIdRaw, type, title },
+    ];
+
+    let lastErr: any = null;
+
+    for (const payload of attempts) {
+      const r = await tryInsert(payload);
+      if (!r.error) {
+        // best-effort: creating an action indicates contact engagement
+        try {
+          await touchContactBestEffort({ requester, contactId: contactIdRaw });
+        } catch {
+          // fail-soft
+        }
+
+        return res.json({ ok: true, action: r.data });
+      }
+
+      lastErr = r.error;
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
+
+      // Missing table should be loud (not silent), because manager ops depend on it
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        console.error("[crm/actions/create] missing_table", r.error);
+        return res.status(500).json({ ok: false, error: "crm_actions_table_missing" });
+      }
+
+      // If it’s a missing column error, continue retry ladder
+      const isMissingCol =
+        (msg.includes("column") && msg.includes("does not exist")) ||
+        msg.includes("could not find") ||
+        msg.includes("unknown column");
+
+      if (isMissingCol) continue;
+
+      // Unknown error -> fail closed
+      console.error("[crm/actions/create]", r.error);
+      return res
+        .status(500)
+        .json({ ok: false, error: (r.error as any)?.message ?? "actions_create_failed" });
+    }
+
+    console.error("[crm/actions/create] exhausted_attempts", lastErr);
+    return res
+      .status(500)
+      .json({ ok: false, error: (lastErr as any)?.message ?? "actions_create_failed" });
+  } catch (err: any) {
+    console.error("[crm/actions/create]", err);
+    return res
+      .status(500)
+      .json({ ok: false, error: err.message || "actions_create_failed" });
+  }
+});
+
+// POST /v1/crm/actions/:id/complete
+router.post("/actions/:id/complete", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const actionId = String(req.params.id ?? "").trim();
+    if (!actionId) {
+      return res.status(400).json({ ok: false, error: "action_id_required" });
+    }
+
+    const nowIso = new Date().toISOString();
+
+    const { data, error } = await supa
+      .from("crm_actions")
+      .update({
+        completed_at: nowIso,
+        status: "done",
+      })
+      .eq("id", actionId)
+      .eq("user_id", requester)
+      .select("id, contact_id")
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({ ok: false, error: "action_not_found" });
+    }
+
+    // 🔥 Touch the related contact so health stays honest (fail-soft)
+    try {
+      const contactId = (data as any)?.contact_id;
+      if (contactId) {
+        await touchContactBestEffort({
+          requester,
+          contactId,
+        });
+      }
+    } catch (err) {
+      console.error("touch_on_action_complete_failed", err);
+    }
+
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "action_complete_failed",
+    });
+  }
+});
 
 // ------------------------------
 // ------------------------------
@@ -3894,6 +4207,13 @@ router.post("/actions/:action_id/complete", async (req, res) => {
       { completed_at: now },
       { status: "completed" },
     ];
+
+    const contactId = (updated as any)?.contact_id ?? null;
+    if (contactId) {
+      try {
+        await touchContactBestEffort({ requester, contactId: String(contactId) });
+      } catch { }
+    }
 
     // Best-effort select (rep_id/status may not exist)
     const baseSelectCols = ["id", "contact_id", "rep_id", "status", "completed_at"];
