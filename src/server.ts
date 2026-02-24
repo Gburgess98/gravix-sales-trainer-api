@@ -12,7 +12,7 @@ import { scoreWithLLM } from "./lib/scoring";
 
 import callsRouter from "./routes/calls";
 import pinsRouter from "./routes/pins";
-import crmRouter from "./routes/crm.ts";
+import crmRouter from "./routes/crm";
 import dashboardRoutes from "./routes/dashboard";
 import sparringRouter from "./routes/sparring";
 
@@ -210,10 +210,6 @@ app.get('/', (_req, res) => {
   const ts = new Date().toISOString();
   const version = process.env.GIT_SHA || 'dev';
   res.status(200).send(`🚀 Gravix API v1 — Up and Running\nTime: ${ts}\nCommit: ${version}`);
-});
-
-app.get('/v1/health', (_req, res) => {
-  res.json({ ok: true, ts: new Date().toISOString() });
 });
 
 app.get('/index.html', (_req, res) => {
