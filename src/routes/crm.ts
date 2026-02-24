@@ -2135,9 +2135,12 @@ router.post("/actions", async (req, res) => {
     const repId = String(body.rep_id ?? body.repId ?? requester).trim() || requester;
 
     // We’ll try a “full” insert first, then retry if optional columns don’t exist.
+    // IMPORTANT:
+    // - user_id is ALWAYS the owner (requester)
+    // - rep_id is the assignee (may equal requester)
     const basePayload: any = {
-      user_id: requester,      // OWNER (always requester)
-      rep_id: repId,           // ASSIGNEE (optional)
+      user_id: requester,        // OWNER (always requester)
+      rep_id: repId,             // ASSIGNEE
       contact_id: contactIdRaw,
       type,
       title,
@@ -2145,6 +2148,7 @@ router.post("/actions", async (req, res) => {
       importance,
       meta,
       status: "open",
+      source: "manager_inline_create_v1",
     };
 
     const tryInsert = async (payload: any) => {
@@ -2153,37 +2157,56 @@ router.post("/actions", async (req, res) => {
 
     // Retry ladder for schema tolerance (missing columns)
     const attempts: any[] = [
+      // Full payload
       { ...basePayload },
+
+      // Strip optional columns progressively
       (() => {
         const p = { ...basePayload };
         delete p.status;
         return p;
       })(),
+
       (() => {
         const p = { ...basePayload };
         delete p.importance;
         return p;
       })(),
+
       (() => {
         const p = { ...basePayload };
         delete p.meta;
         return p;
       })(),
+
+      (() => {
+        const p = { ...basePayload };
+        delete p.source;
+        return p;
+      })(),
+
       (() => {
         const p = { ...basePayload };
         delete p.due_at;
         return p;
       })(),
-      (() => {
-        const p = { ...basePayload };
-        delete p.status;
-        delete p.importance;
-        delete p.meta;
-        delete p.due_at;
-        return p;
-      })(),
-      // absolute minimum
-      { user_id: repId, contact_id: contactIdRaw, type, title },
+
+      // Minimal but still correctly owned
+      {
+        user_id: requester,       // NEVER repId (owner must stay requester)
+        rep_id: repId,
+        contact_id: contactIdRaw,
+        type,
+        title,
+      },
+
+      // Absolute minimum fallback
+      {
+        user_id: requester,
+        contact_id: contactIdRaw,
+        type,
+        title,
+      },
     ];
 
     let lastErr: any = null;
@@ -2655,6 +2678,261 @@ router.get("/manager/nudges", async (req, res) => {
     });
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e?.message ?? "bad_request", nudges: [] });
+  }
+});
+
+// ------------------------------
+// MANAGER CONTROL CENTRE (v1)
+// GET /v1/crm/manager/control-centre?days=7&limit=20
+// - Org-scoped by default via requireManagerOrg
+// - Best-effort analytics: never crash if tables/cols are missing
+// - Returns: reps_at_risk + headline counts to power the Manager dashboard
+// ------------------------------
+router.get("/manager/control-centre", async (req, res) => {
+  try {
+    const { requester, orgId, bypassed } = await requireManagerOrg(req);
+
+    const days = Math.min(Math.max(Number((req.query as any)?.days ?? 7), 1), 90);
+    const limit = Math.min(Math.max(Number((req.query as any)?.limit ?? 20), 1), 200);
+
+    const nowMs = Date.now();
+    const sinceIso = new Date(nowMs - days * 24 * 60 * 60 * 1000).toISOString();
+
+    // ------------------------------
+    // 1) Load reps (org-scoped when possible)
+    // ------------------------------
+    const reps: Array<{ id: string; name: string | null; email: string | null }> = [];
+
+    const tryFetchReps = async () => {
+      // Prefer org-scoped reps when org_id exists.
+      const selCandidates = [
+        "id, org_id, name, full_name, email",
+        "id, org_id, name, email",
+        "id, name, full_name, email",
+        "id, name, email",
+        "id, email",
+        "id",
+      ];
+
+      for (const sel of selCandidates) {
+        // 1) org-scoped attempt
+        try {
+          const r1 = await supa
+            .from("reps")
+            .select(sel)
+            .eq("org_id", orgId)
+            .order("created_at", { ascending: false })
+            .limit(200);
+
+          if (!r1.error) {
+            const rows = (r1.data as any[]) ?? [];
+            for (const row of rows) {
+              const id = String((row as any)?.id ?? "").trim();
+              if (!id) continue;
+              const nm = (row as any)?.full_name ?? (row as any)?.name ?? null;
+              reps.push({ id, name: nm ? String(nm) : null, email: (row as any)?.email ?? null });
+            }
+            return;
+          }
+
+          const msg = String((r1.error as any)?.message ?? "").toLowerCase();
+          if (
+            (msg.includes("column") && msg.includes("org_id") && msg.includes("does not exist")) ||
+            msg.includes("could not find")
+          ) {
+            // fall through to non-org select
+          } else if (msg.includes("relation") && msg.includes("does not exist")) {
+            // reps table missing
+            return;
+          }
+        } catch {
+          // fall through
+        }
+
+        // 2) non-org attempt (dev/local bypass mode)
+        try {
+          const r2 = await supa
+            .from("reps")
+            .select(sel)
+            .or(`id.eq.${requester},user_id.eq.${requester}`)
+            .limit(1);
+
+          if (!r2.error) {
+            const row = ((r2.data as any[]) ?? [])[0] ?? null;
+            if (row) {
+              const id = String((row as any)?.id ?? requester).trim() || requester;
+              const nm = (row as any)?.full_name ?? (row as any)?.name ?? null;
+              reps.push({ id, name: nm ? String(nm) : null, email: (row as any)?.email ?? null });
+            } else {
+              reps.push({ id: requester, name: null, email: null });
+            }
+            return;
+          }
+
+          const msg = String((r2.error as any)?.message ?? "").toLowerCase();
+          if (msg.includes("relation") && msg.includes("does not exist")) return;
+        } catch {
+          // ignore
+        }
+      }
+
+      // Absolute fallback
+      reps.push({ id: requester, name: null, email: null });
+    };
+
+    await tryFetchReps();
+
+    // ------------------------------
+    // 2) Per-rep action stats (best-effort)
+    // ------------------------------
+    const repStats: Array<{
+      rep_id: string;
+      name: string | null;
+      email: string | null;
+      open_actions: number;
+      overdue_actions: number;
+      completed_actions: number;
+      last_action_at: string | null;
+      risk_score: number;
+      risk_band: "healthy" | "watch" | "at_risk";
+      reason: string;
+    }> = [];
+
+    const safeNum = (v: any) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : 0;
+    };
+
+    const riskBandFromScore = (s: number): "healthy" | "watch" | "at_risk" => {
+      if (s >= 300) return "at_risk";
+      if (s >= 120) return "watch";
+      return "healthy";
+    };
+
+    for (const rep of reps) {
+      let open = 0;
+      let overdue = 0;
+      let completed = 0;
+      let lastActionAt: string | null = null;
+
+      // Pull actions for the rep if possible. If `rep_id` column is missing, selectCrmActionsSafe will degrade.
+      try {
+        const r = await selectCrmActionsSafe({
+          requester,
+          repId: rep.id,
+          contactId: null,
+          status: null,
+          limit: 500,
+          orderByDue: false,
+        });
+
+        if ((r as any).ok) {
+          const rows = ((r as any).data ?? []) as any[];
+          const now = Date.now();
+
+          for (const a of rows) {
+            const completedAt = (a as any)?.completed_at ?? null;
+            const dueAt = (a as any)?.due_at ?? null;
+
+            const createdAt = (a as any)?.created_at ?? null;
+            if (createdAt) {
+              if (!lastActionAt) lastActionAt = String(createdAt);
+              else {
+                const t0 = new Date(lastActionAt).getTime();
+                const t1 = new Date(String(createdAt)).getTime();
+                if (Number.isFinite(t1) && (!Number.isFinite(t0) || t1 > t0)) lastActionAt = String(createdAt);
+              }
+            }
+
+            const isDone = !!completedAt || String((a as any)?.status ?? "").toLowerCase() === "done";
+            if (isDone) {
+              completed++;
+              continue;
+            }
+
+            open++;
+
+            if (dueAt) {
+              const dueMs = new Date(String(dueAt)).getTime();
+              if (Number.isFinite(dueMs) && dueMs < now) overdue++;
+            }
+          }
+        }
+      } catch {
+        // fail-soft
+      }
+
+      // Risk score (simple, tuned for manager urgency)
+      // - Overdue dominates
+      // - Backlog matters after 5 open
+      // - No recent activity is a warning
+      const daysSinceLast = (() => {
+        if (!lastActionAt) return null;
+        const t = new Date(lastActionAt).getTime();
+        if (!Number.isFinite(t)) return null;
+        const d = Math.floor((Date.now() - t) / (1000 * 60 * 60 * 24));
+        return d < 0 ? 0 : d;
+      })();
+
+      const backlogOver5 = Math.max(0, open - 5);
+      const staleW = daysSinceLast === null ? 80 : daysSinceLast >= 7 ? 120 : daysSinceLast >= 3 ? 40 : 0;
+
+      const riskScore = overdue * 180 + backlogOver5 * 20 + staleW;
+      const band = riskBandFromScore(riskScore);
+
+      const reasonParts: string[] = [];
+      if (overdue > 0) reasonParts.push(`${overdue} overdue`);
+      if (open > 0) reasonParts.push(`${open} open`);
+      if (daysSinceLast === null) reasonParts.push("no recent activity");
+      else if (daysSinceLast >= 7) reasonParts.push(`${daysSinceLast}d since last action`);
+
+      repStats.push({
+        rep_id: rep.id,
+        name: rep.name,
+        email: rep.email,
+        open_actions: safeNum(open),
+        overdue_actions: safeNum(overdue),
+        completed_actions: safeNum(completed),
+        last_action_at: lastActionAt,
+        risk_score: safeNum(riskScore),
+        risk_band: band,
+        reason: reasonParts.join(" · ") || "healthy",
+      });
+    }
+
+    // Sort full list by risk (highest first) so UI always has something meaningful
+    const reps_all = repStats
+      .slice()
+      .sort((a, b) => b.risk_score - a.risk_score)
+      .slice(0, limit);
+
+    const reps_at_risk = reps_all.filter((r) => r.risk_band === "at_risk");
+    const reps_watch = reps_all.filter((r) => r.risk_band === "watch");
+    const reps_ok = reps_all.filter((r) => r.risk_band === "healthy");
+
+    const headline = {
+      reps_total: repStats.length,
+      reps_at_risk: repStats.filter((r) => r.risk_band === "at_risk").length,
+      reps_watch: repStats.filter((r) => r.risk_band === "watch").length,
+      overdue_actions_total: repStats.reduce((acc, r) => acc + r.overdue_actions, 0),
+      open_actions_total: repStats.reduce((acc, r) => acc + r.open_actions, 0),
+      window_days: days,
+      since: sinceIso,
+    };
+
+    return res.json({
+      ok: true,
+      org: { id: orgId, bypassed },
+      headline,
+      reps_at_risk,
+      reps_watch,
+      reps_ok,
+      reps_all,
+      weakest_skill: null,
+      recurring_objection: null,
+    });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
   }
 });
 
