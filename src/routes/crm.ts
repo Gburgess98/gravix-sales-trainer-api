@@ -281,6 +281,872 @@ router.get("/health", async (_req, res) => {
   return res.json({ ok: true, service: "gravix-crm", ts: new Date().toISOString() });
 });
 
+/* ---------------------------------------------
+   OPPORTUNITIES PIPELINE (Kanban v1)
+
+   GET /v1/crm/opportunities/pipeline
+   - Returns opportunities grouped by stage for the current requester
+   - Schema tolerant: if crm_opportunities.stage missing, defaults to "new"
+
+   PATCH /v1/crm/opportunities/:id/stage
+   Body: { stage: string }
+   - Updates the stage for a single opportunity owned by requester
+   - Schema tolerant: if stage column missing, returns a clear error
+---------------------------------------------- */
+
+const PIPELINE_STAGES_DEFAULT = [
+  "new",
+  "qualified",
+  "proposal",
+  "negotiation",
+  "won",
+  "lost",
+];
+
+const MANAGER_ROLES = new Set(["Manager", "Owner"]);
+
+async function isManagerUser(userId: string) {
+  try {
+    const { data, error } = await supa
+      .from("reps")
+      .select("tier")
+      .eq("id", userId)
+      .limit(1)
+      .maybeSingle();
+
+    if (error) return false;
+    const tier = String((data as any)?.tier || "");
+    return MANAGER_ROLES.has(tier);
+  } catch {
+    return false;
+  }
+}
+
+async function listOrgRepIdsBestEffort(args: { orgId: string }) {
+  const { orgId } = args;
+  try {
+    const { data, error } = await supa
+      .from("reps")
+      .select("id")
+      .eq("org_id", orgId)
+      .limit(500);
+
+    if (error) return [];
+    return ((data as any[]) ?? []).map((r) => String((r as any).id)).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+type PipelineOpp = {
+  id: string;
+  name: string | null;
+  stage: string;
+  amount: number | null;
+  close_date: string | null;
+  contact_id: string | null;
+  account_id: string | null;
+  updated_at: string | null;
+  created_at: string | null;
+};
+
+function normaliseStage(s: any) {
+  const v = String(s ?? "").trim().toLowerCase();
+  return v || "new";
+}
+
+router.get("/opportunities/pipeline", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    const qAny = req.query as any;
+    const limit = Math.min(Math.max(Number(qAny?.limit ?? 300), 1), 1000);
+
+    // scope:
+    // - mine (default): only my opps
+    // - team: manager view across org (optionally filtered by repId)
+    const scope = String(qAny?.scope ?? "mine").trim().toLowerCase();
+    const repIdRaw = String(qAny?.repId ?? qAny?.rep_id ?? "").trim();
+
+    const wantTeam = scope === "team";
+
+    // Resolve allowed user_ids for query
+    // - mine: use requester
+    // - team: use repId (if provided) OR all reps in org
+    let userIds: string[] | null = null; // null => use requester
+
+    if (wantTeam) {
+      const { orgId, bypassed } = await requireManagerOrg(req);
+
+      // Require manager tier to view team pipeline
+      const okManager = await isManagerUser(requester);
+      if (!okManager) {
+        return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+      }
+
+      // If a repId is provided, ensure it's a UUID and (when not bypassed) belongs to the org.
+      if (repIdRaw) {
+        if (!UUID_RE.test(repIdRaw)) {
+          return res.status(400).json({ ok: false, error: "invalid_rep_id" });
+        }
+
+        if (!bypassed) {
+          // Confirm the target rep is in the same org (fail-closed)
+          const { data: repRow, error: repErr } = await supa
+            .from("reps")
+            .select("id, org_id")
+            .eq("id", repIdRaw)
+            .limit(1)
+            .maybeSingle();
+
+          if (repErr) return res.status(500).json({ ok: false, error: repErr.message ?? "rep_lookup_failed" });
+          if (!repRow) return res.status(404).json({ ok: false, error: "rep_not_found" });
+          if (String((repRow as any).org_id ?? "") !== orgId) {
+            return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+          }
+        }
+
+        userIds = [repIdRaw];
+      } else {
+        // Team-wide: pull rep ids for org (when possible). If we can't, fail closed.
+        if (!bypassed) {
+          const ids = await listOrgRepIdsBestEffort({ orgId });
+          if (!ids.length) {
+            return res.status(500).json({ ok: false, error: "org_scope_not_supported" });
+          }
+          userIds = ids;
+        } else {
+          // Dev bypass: fall back to requester only to avoid leaking cross-tenant data.
+          userIds = [requester];
+        }
+      }
+    }
+
+    // Try a rich select first; strip missing columns if needed.
+    const selectCandidates = [
+      "id, name, stage, amount, close_date, contact_id, account_id, updated_at, created_at, user_id",
+      "id, name, stage, amount, close_date, contact_id, account_id, created_at, user_id",
+      "id, name, stage, amount, close_date, contact_id, account_id, created_at",
+      "id, name, stage, amount, close_date, contact_id, account_id",
+      "id, name, stage, created_at",
+      "id, name, stage",
+      "id, name",
+      "id",
+    ];
+
+    let rows: any[] = [];
+    let lastErr: any = null;
+
+    for (const sel of selectCandidates) {
+      let r;
+      if (wantTeam) {
+        r = await supa
+          .from("crm_opportunities")
+          .select(sel)
+          .in("user_id", userIds ?? [requester])
+          .order("created_at", { ascending: false })
+          .limit(limit);
+      } else {
+        r = await supa
+          .from("crm_opportunities")
+          .select(sel)
+          .eq("user_id", requester)
+          .order("created_at", { ascending: false })
+          .limit(limit);
+      }
+
+      if (!r.error) {
+        rows = (r.data as any[]) ?? [];
+        lastErr = null;
+        break;
+      }
+
+      lastErr = r.error;
+
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
+      // Missing table / schema-cache miss => fail-open with empty pipeline
+      if (
+        (msg.includes("relation") && msg.includes("does not exist")) ||
+        (msg.includes("could not find the table") && msg.includes("crm_opportunities")) ||
+        (msg.includes("schema cache") && msg.includes("crm_opportunities"))
+      ) {
+        return res.json({ ok: true, stages: PIPELINE_STAGES_DEFAULT, columns: {}, items: [] });
+      }
+
+      // Missing column => try next candidate
+      if (msg.includes("column") && msg.includes("does not exist")) continue;
+
+      // Unknown error => stop
+      break;
+    }
+
+    if (lastErr) {
+      return res
+        .status(500)
+        .json({ ok: false, error: (lastErr as any)?.message ?? "pipeline_fetch_failed" });
+    }
+
+    const items: PipelineOpp[] = rows.map((r: any) => {
+      const stage = normaliseStage(r.stage);
+      return {
+        id: String(r.id),
+        name: (r as any).name ?? null,
+        stage,
+        amount: (r as any).amount ?? null,
+        close_date: (r as any).close_date ?? null,
+        contact_id: (r as any).contact_id ?? null,
+        account_id: (r as any).account_id ?? null,
+        updated_at: (r as any).updated_at ?? null,
+        created_at: (r as any).created_at ?? null,
+      };
+    });
+
+    // Derive stage list (stable default + any custom stages found)
+    const foundStages = new Set<string>();
+    for (const it of items) foundStages.add(normaliseStage(it.stage));
+
+    const stages = Array.from(
+      new Set([
+        ...PIPELINE_STAGES_DEFAULT,
+        ...Array.from(foundStages).filter(Boolean),
+      ])
+    );
+
+    // Build columns map
+    const columns: Record<string, string[]> = {};
+    for (const s of stages) columns[s] = [];
+    for (const it of items) {
+      const s = normaliseStage(it.stage);
+      if (!columns[s]) columns[s] = [];
+      columns[s].push(it.id);
+    }
+
+    return res.json({ ok: true, stages, columns, items });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+/* ---------------------------------------------
+   GET /v1/crm/opportunities/pipeline/summary?scope=&repId=&limit=
+   - Returns server-computed metrics for the Kanban summary bar.
+   - Uses the SAME scope rules as /opportunities/pipeline:
+     - scope=mine (default): only requester
+     - scope=team: manager-only; optional repId filter; otherwise all reps in org
+   - Schema-tolerant: if crm_opportunities table missing, returns empty summary.
+---------------------------------------------- */
+router.get("/opportunities/pipeline/summary", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    const qAny = req.query as any;
+    const limit = Math.min(Math.max(Number(qAny?.limit ?? 2000), 1), 5000);
+
+    const scope = String(qAny?.scope ?? "mine").trim().toLowerCase();
+    const repIdRaw = String(qAny?.repId ?? qAny?.rep_id ?? "").trim();
+    const wantTeam = scope === "team";
+
+    // Resolve allowed user_ids for query
+    let userIds: string[] | null = null; // null => requester only
+
+    if (wantTeam) {
+      const { orgId, bypassed } = await requireManagerOrg(req);
+
+      const okManager = await isManagerUser(requester);
+      if (!okManager) {
+        return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+      }
+
+      if (repIdRaw) {
+        if (!UUID_RE.test(repIdRaw)) {
+          return res.status(400).json({ ok: false, error: "invalid_rep_id" });
+        }
+
+        if (!bypassed) {
+          const { data: repRow, error: repErr } = await supa
+            .from("reps")
+            .select("id, org_id")
+            .eq("id", repIdRaw)
+            .limit(1)
+            .maybeSingle();
+
+          if (repErr) return res.status(500).json({ ok: false, error: repErr.message ?? "rep_lookup_failed" });
+          if (!repRow) return res.status(404).json({ ok: false, error: "rep_not_found" });
+          if (String((repRow as any).org_id ?? "") !== orgId) {
+            return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+          }
+        }
+
+        userIds = [repIdRaw];
+      } else {
+        if (!bypassed) {
+          const ids = await listOrgRepIdsBestEffort({ orgId });
+          if (!ids.length) {
+            return res.status(500).json({ ok: false, error: "org_scope_not_supported" });
+          }
+          userIds = ids;
+        } else {
+          // Dev bypass: safest behaviour is to scope to requester only.
+          userIds = [requester];
+        }
+      }
+    }
+
+    // Schema-tolerant selects
+    const selectCandidates = [
+      "id, stage, amount, value, currency, close_date, updated_at, created_at, user_id",
+      "id, stage, amount, value, close_date, updated_at, created_at, user_id",
+      "id, stage, amount, value, close_date, created_at, user_id",
+      "id, stage, amount, close_date, created_at, user_id",
+      "id, stage, amount, close_date, created_at",
+      "id, stage, amount, created_at",
+      "id, stage",
+      "id",
+    ];
+
+    let rows: any[] = [];
+    let lastErr: any = null;
+
+    for (const sel of selectCandidates) {
+      let r;
+      if (wantTeam) {
+        r = await supa
+          .from("crm_opportunities")
+          .select(sel)
+          .in("user_id", userIds ?? [requester])
+          .order("created_at", { ascending: false })
+          .limit(limit);
+      } else {
+        r = await supa
+          .from("crm_opportunities")
+          .select(sel)
+          .eq("user_id", requester)
+          .order("created_at", { ascending: false })
+          .limit(limit);
+      }
+
+      if (!r.error) {
+        rows = (r.data as any[]) ?? [];
+        lastErr = null;
+        break;
+      }
+
+      lastErr = r.error;
+
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
+      // Missing table / schema-cache miss => return empty summary (fail-open)
+      if (
+        (msg.includes("relation") && msg.includes("does not exist")) ||
+        (msg.includes("could not find the table") && msg.includes("crm_opportunities")) ||
+        (msg.includes("schema cache") && msg.includes("crm_opportunities"))
+      ) {
+        return res.json({
+          ok: true,
+          scope: wantTeam ? "team" : "mine",
+          rep_id: wantTeam ? (repIdRaw || null) : null,
+          stages: PIPELINE_STAGES_DEFAULT,
+          counts_by_stage: Object.fromEntries(PIPELINE_STAGES_DEFAULT.map((s) => [s, 0])),
+          total_count: 0,
+          total_amount: 0,
+          currency: null,
+          forecast_amount: 0,
+          forecast_count: 0,
+        });
+      }
+
+      // Missing column => try next candidate
+      if (msg.includes("column") && msg.includes("does not exist")) continue;
+
+      break;
+    }
+
+    if (lastErr) {
+      return res.status(500).json({ ok: false, error: (lastErr as any)?.message ?? "pipeline_summary_failed" });
+    }
+
+    const counts: Record<string, number> = {};
+    for (const s of PIPELINE_STAGES_DEFAULT) counts[s] = 0;
+
+    let total = 0;
+    let forecastAmount = 0;
+    let forecastCount = 0;
+
+    for (const r of rows) {
+      const stage = normaliseStage((r as any).stage);
+      if (counts[stage] == null) counts[stage] = 0;
+      counts[stage] += 1;
+
+      const amtRaw = (r as any).amount ?? (r as any).value ?? null;
+      const amt = typeof amtRaw === "number" ? amtRaw : Number(amtRaw);
+
+      if (Number.isFinite(amt)) {
+        total += amt;
+
+        // MVP forecast = proposal + negotiation only (server-calculated)
+        if (stage === "proposal" || stage === "negotiation") {
+          forecastAmount += amt;
+          forecastCount += 1;
+        }
+      } else {
+        // still count forecast items even if amount missing
+        if (stage === "proposal" || stage === "negotiation") {
+          forecastCount += 1;
+        }
+      }
+    }
+
+    // Include any non-default stages that exist
+    const stages = Array.from(new Set([...PIPELINE_STAGES_DEFAULT, ...Object.keys(counts)])).filter(Boolean);
+
+    // Currency is not reliable when mixed; keep null for now.
+    return res.json({
+      ok: true,
+      scope: wantTeam ? "team" : "mine",
+      rep_id: wantTeam ? (repIdRaw || null) : null,
+      stages,
+      counts_by_stage: counts,
+      total_count: rows.length,
+      total_amount: total,
+      forecast_amount: forecastAmount,
+      forecast_count: forecastCount,
+      currency: null,
+    });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+const UpdateOpportunityStageSchema = z.object({
+  stage: z.string().trim().min(1).max(60),
+});
+
+router.patch("/opportunities/:id/stage", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const id = String((req.params as any)?.id ?? "").trim();
+    if (!id) return res.status(400).json({ ok: false, error: "id_required" });
+
+    if (!UUID_RE.test(id)) {
+      return res.status(400).json({ ok: false, error: "invalid_id" });
+    }
+
+    const body = UpdateOpportunityStageSchema.parse(req.body ?? {});
+    const stage = normaliseStage(body.stage);
+
+    // Default: only update my opp
+    // Manager option: allow team update via ?scope=team&repId=... (or team-wide if omitted)
+    const qAny = req.query as any;
+    const scope = String(qAny?.scope ?? "mine").trim().toLowerCase();
+    const wantTeam = scope === "team";
+    const repIdRaw = String(qAny?.repId ?? qAny?.rep_id ?? "").trim();
+
+    let repIdsForUpdate: string[] | null = null;
+
+    if (wantTeam) {
+      const { orgId, bypassed } = await requireManagerOrg(req);
+
+      const okManager = await isManagerUser(requester);
+      if (!okManager) {
+        return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+      }
+
+      if (repIdRaw) {
+        if (!UUID_RE.test(repIdRaw)) {
+          return res.status(400).json({ ok: false, error: "invalid_rep_id" });
+        }
+
+        if (!bypassed) {
+          const { data: repRow, error: repErr } = await supa
+            .from("reps")
+            .select("id, org_id")
+            .eq("id", repIdRaw)
+            .limit(1)
+            .maybeSingle();
+
+          if (repErr) return res.status(500).json({ ok: false, error: repErr.message ?? "rep_lookup_failed" });
+          if (!repRow) return res.status(404).json({ ok: false, error: "rep_not_found" });
+          if (String((repRow as any).org_id ?? "") !== orgId) {
+            return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+          }
+        }
+
+        repIdsForUpdate = [repIdRaw];
+      } else {
+        if (!bypassed) {
+          const ids = await listOrgRepIdsBestEffort({ orgId });
+          if (!ids.length) {
+            return res.status(500).json({ ok: false, error: "org_scope_not_supported" });
+          }
+          repIdsForUpdate = ids;
+        } else {
+          repIdsForUpdate = [requester];
+        }
+      }
+    }
+
+    // Try update; if stage column missing, return clear error.
+    let r;
+
+    if (wantTeam && repIdsForUpdate) {
+      r = await supa
+        .from("crm_opportunities")
+        .update({ stage })
+        .eq("id", id)
+        .in("user_id", repIdsForUpdate)
+        .select("id, stage")
+        .maybeSingle();
+    } else {
+      r = await supa
+        .from("crm_opportunities")
+        .update({ stage })
+        .eq("id", id)
+        .eq("user_id", requester)
+        .select("id, stage")
+        .maybeSingle();
+    }
+
+    if (r.error) {
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+      }
+      if (msg.includes("column") && msg.includes("stage") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_opportunities_stage_missing" });
+      }
+      return res
+        .status(500)
+        .json({ ok: false, error: (r.error as any)?.message ?? "opportunity_stage_update_failed" });
+    }
+
+    if (!r.data) {
+      return res.status(404).json({ ok: false, error: "not_found" });
+    }
+
+    return res.json({ ok: true, opportunity: { id, stage: (r.data as any).stage ?? stage } });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+/* ---------------------------------------------
+   OPPORTUNITY DETAIL (Drawer v1)
+
+   GET /v1/crm/opportunities/:id
+   - Returns a single opportunity (scoped like pipeline)
+
+   PATCH /v1/crm/opportunities/:id
+   - Allows editing: name, stage, amount, currency, close_date
+---------------------------------------------- */
+
+function parseScopeParams(qAny: any) {
+  const scope = String(qAny?.scope ?? "mine").trim().toLowerCase();
+  const repIdRaw = String(qAny?.repId ?? qAny?.rep_id ?? "").trim();
+  const wantTeam = scope === "team";
+  return { scope, repIdRaw, wantTeam };
+}
+
+async function resolveTeamUserIdsOrThrow(args: {
+  req: any;
+  requester: string;
+  repIdRaw: string;
+}): Promise<string[]> {
+  const { req, requester, repIdRaw } = args;
+
+  const { orgId, bypassed } = await requireManagerOrg(req);
+
+  const okManager = await isManagerUser(requester);
+  if (!okManager) {
+    throw new Error("forbidden_not_manager");
+  }
+
+  if (repIdRaw) {
+    if (!UUID_RE.test(repIdRaw)) {
+      throw new Error("invalid_rep_id");
+    }
+
+    if (!bypassed) {
+      const { data: repRow, error: repErr } = await supa
+        .from("reps")
+        .select("id, org_id")
+        .eq("id", repIdRaw)
+        .limit(1)
+        .maybeSingle();
+
+      if (repErr) throw new Error(repErr.message ?? "rep_lookup_failed");
+      if (!repRow) throw new Error("rep_not_found");
+      if (String((repRow as any).org_id ?? "") !== orgId) {
+        throw new Error("forbidden_org_scope");
+      }
+    }
+
+    return [repIdRaw];
+  }
+
+  if (!bypassed) {
+    const ids = await listOrgRepIdsBestEffort({ orgId });
+    if (!ids.length) throw new Error("org_scope_not_supported");
+    return ids;
+  }
+
+  // Dev bypass: safest is requester-only.
+  return [requester];
+}
+
+const OpportunityUpdateSchema = z
+  .object({
+    name: z.string().trim().min(1).max(200).optional(),
+    stage: z.string().trim().min(1).max(60).optional(),
+    amount: z.number().finite().optional().nullable(),
+    currency: z.string().trim().min(1).max(10).optional().nullable(),
+    close_date: z.string().trim().min(1).max(40).optional().nullable(),
+  })
+  .refine(
+    (b) =>
+      b.name !== undefined ||
+      b.stage !== undefined ||
+      b.amount !== undefined ||
+      b.currency !== undefined ||
+      b.close_date !== undefined,
+    { message: "no_fields" }
+  );
+
+router.get("/opportunities/:id", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const id = String((req.params as any)?.id ?? "").trim();
+
+    if (!id) return res.status(400).json({ ok: false, error: "id_required" });
+    if (!UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
+
+    const qAny = req.query as any;
+    const { repIdRaw, wantTeam } = parseScopeParams(qAny);
+
+    let allowedUserIds: string[] = [requester];
+
+    if (wantTeam) {
+      try {
+        allowedUserIds = await resolveTeamUserIdsOrThrow({ req, requester, repIdRaw });
+      } catch (e: any) {
+        const msg = String(e?.message ?? e);
+        if (msg === "forbidden_not_manager") return res.status(403).json({ ok: false, error: msg });
+        if (msg === "invalid_rep_id") return res.status(400).json({ ok: false, error: msg });
+        if (msg === "rep_not_found") return res.status(404).json({ ok: false, error: msg });
+        if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: msg });
+        if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
+        return res.status(500).json({ ok: false, error: msg || "team_scope_failed" });
+      }
+    }
+
+    const selectCandidates = [
+      "id, user_id, name, title, stage, amount, currency, close_date, account_id, contact_id, account_name, contact_email, created_at, updated_at",
+      "id, user_id, name, title, stage, amount, currency, close_date, account_id, contact_id, created_at, updated_at",
+      "id, user_id, name, title, stage, amount, currency, close_date, account_id, contact_id, created_at",
+      "id, user_id, name, title, stage, amount, currency, close_date, created_at",
+      "id, user_id, name, title, stage, amount, close_date, created_at",
+      "id, user_id, name, title, stage, created_at",
+      "id, user_id, name, stage, created_at",
+      "id, user_id, name, stage",
+      "id, name, stage",
+      "id, name",
+      "id",
+    ];
+
+    let row: any = null;
+    let lastErr: any = null;
+
+    for (const sel of selectCandidates) {
+      const r = await supa
+        .from("crm_opportunities")
+        .select(sel)
+        .eq("id", id)
+        .in("user_id", allowedUserIds)
+        .limit(1)
+        .maybeSingle();
+
+      if (!r.error) {
+        row = r.data ?? null;
+        lastErr = null;
+        break;
+      }
+
+      lastErr = r.error;
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
+
+      if (
+        (msg.includes("relation") && msg.includes("does not exist")) ||
+        (msg.includes("could not find the table") && msg.includes("crm_opportunities")) ||
+        (msg.includes("schema cache") && msg.includes("crm_opportunities"))
+      ) {
+        return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+      }
+
+      if (msg.includes("column") && msg.includes("does not exist")) continue;
+      break;
+    }
+
+    if (lastErr) {
+      return res.status(500).json({ ok: false, error: (lastErr as any)?.message ?? "opportunity_fetch_failed" });
+    }
+
+    if (!row) return res.status(404).json({ ok: false, error: "not_found" });
+
+    return res.json({
+      ok: true,
+      opportunity: {
+        id: String((row as any).id),
+        name: (row as any).name ?? (row as any).title ?? null,
+        stage: normaliseStage((row as any).stage ?? "new"),
+        amount: (row as any).amount ?? null,
+        currency: (row as any).currency ?? null,
+        close_date: (row as any).close_date ?? null,
+        account_id: (row as any).account_id ?? null,
+        contact_id: (row as any).contact_id ?? null,
+        account_name: (row as any).account_name ?? null,
+        contact_email: (row as any).contact_email ?? null,
+        created_at: (row as any).created_at ?? null,
+        updated_at: (row as any).updated_at ?? null,
+      },
+    });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+router.patch("/opportunities/:id", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const id = String((req.params as any)?.id ?? "").trim();
+
+    if (!id) return res.status(400).json({ ok: false, error: "id_required" });
+    if (!UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
+
+    const qAny = req.query as any;
+    const { repIdRaw, wantTeam } = parseScopeParams(qAny);
+
+    let allowedUserIds: string[] = [requester];
+
+    if (wantTeam) {
+      try {
+        allowedUserIds = await resolveTeamUserIdsOrThrow({ req, requester, repIdRaw });
+      } catch (e: any) {
+        const msg = String(e?.message ?? e);
+        if (msg === "forbidden_not_manager") return res.status(403).json({ ok: false, error: msg });
+        if (msg === "invalid_rep_id") return res.status(400).json({ ok: false, error: msg });
+        if (msg === "rep_not_found") return res.status(404).json({ ok: false, error: msg });
+        if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: msg });
+        if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
+        return res.status(500).json({ ok: false, error: msg || "team_scope_failed" });
+      }
+    }
+
+    const body = OpportunityUpdateSchema.parse(req.body ?? {});
+
+    const patchBase: any = {};
+    if (body.name !== undefined) patchBase.name = body.name;
+    if (body.stage !== undefined) patchBase.stage = normaliseStage(body.stage);
+    if (body.amount !== undefined) patchBase.amount = body.amount;
+    if (body.currency !== undefined) patchBase.currency = body.currency;
+    if (body.close_date !== undefined) patchBase.close_date = body.close_date;
+
+    const attempts: any[] = [
+      { ...patchBase },
+      (() => {
+        const p = { ...patchBase };
+        delete p.close_date;
+        return p;
+      })(),
+      (() => {
+        const p = { ...patchBase };
+        delete p.currency;
+        return p;
+      })(),
+      (() => {
+        const p = { ...patchBase };
+        delete p.amount;
+        return p;
+      })(),
+      (() => {
+        const p = { ...patchBase };
+        delete p.stage;
+        return p;
+      })(),
+      (() => {
+        const p = { ...patchBase };
+        delete p.name;
+        return p;
+      })(),
+    ].filter((p) => Object.keys(p).length > 0);
+
+    let updated: any = null;
+    let lastErr: any = null;
+
+    for (const p of attempts) {
+      const r = await supa
+        .from("crm_opportunities")
+        .update(p)
+        .eq("id", id)
+        .in("user_id", allowedUserIds)
+        .select("id, name, title, stage, amount, currency, close_date, account_id, contact_id, account_name, contact_email, created_at, updated_at")
+        .maybeSingle();
+
+      if (!r.error) {
+        updated = r.data ?? null;
+        lastErr = null;
+        break;
+      }
+
+      lastErr = r.error;
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
+
+      if (
+        (msg.includes("relation") && msg.includes("does not exist")) ||
+        (msg.includes("could not find the table") && msg.includes("crm_opportunities")) ||
+        (msg.includes("schema cache") && msg.includes("crm_opportunities"))
+      ) {
+        return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+      }
+
+      const isMissingCol =
+        (msg.includes("column") && msg.includes("does not exist")) ||
+        msg.includes("could not find") ||
+        msg.includes("unknown column");
+
+      if (isMissingCol) continue;
+      break;
+    }
+
+    if (lastErr) {
+      return res.status(500).json({ ok: false, error: (lastErr as any)?.message ?? "opportunity_update_failed" });
+    }
+
+    if (!updated) return res.status(404).json({ ok: false, error: "not_found" });
+
+    return res.json({
+      ok: true,
+      opportunity: {
+        id: String((updated as any).id),
+        name: (updated as any).name ?? (updated as any).title ?? null,
+        stage: normaliseStage((updated as any).stage ?? "new"),
+        amount: (updated as any).amount ?? null,
+        currency: (updated as any).currency ?? null,
+        close_date: (updated as any).close_date ?? null,
+        account_id: (updated as any).account_id ?? null,
+        contact_id: (updated as any).contact_id ?? null,
+        account_name: (updated as any).account_name ?? null,
+        contact_email: (updated as any).contact_email ?? null,
+        created_at: (updated as any).created_at ?? null,
+        updated_at: (updated as any).updated_at ?? null,
+      },
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    if (msg === "no_fields") {
+      return res.status(400).json({ ok: false, error: "no_fields" });
+    }
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
 /** ----------------------------------------------------------------
  * Demo contacts (until DB is populated)
  * ---------------------------------------------------------------- */
@@ -312,23 +1178,19 @@ function shapeDemoContact(c: DemoContact) {
   };
 }
 
+
 /* ---------------------------------------------
    GET /v1/crm/contacts?query=&limit=
-   - Search contacts by name/email (case-insensitive)
-   - Returns minimal fields for the drawer
+   - Search contacts by name/email/company (case-insensitive)
+   - Returns minimal fields for pickers/drawers
+   - Safe: empty query => empty list (never returns demo)
 ---------------------------------------------- */
 router.get("/contacts", async (req, res) => {
-  // PROBE: if you don't see these headers/logs, you're not hitting this handler.
-  const marker = "contacts_handler_v4";
-  res.setHeader("x-crm-contacts-marker", marker);
-  res.setHeader("x-crm-contacts-marker-src", "routes/crm.ts");
-  console.log("[CRM] /contacts hit", { marker, q: (req.query as any)?.query ?? (req.query as any)?.q, limit: (req.query as any)?.limit });
-
   try {
     const requester = getUserIdHeader(req);
 
     // Express query params can be string | string[] | undefined.
-    // Accept a few aliases to avoid silent empty-query bugs.
+    // Accept aliases to avoid silent empty-query bugs.
     const raw: unknown =
       (req.query.query as any) ??
       (req.query.q as any) ??
@@ -343,13 +1205,10 @@ router.get("/contacts", async (req, res) => {
           ? String(raw[0] ?? "").trim()
           : "";
 
-    const limit = Math.min(Math.max(Number(req.query.limit ?? 12), 1), 50);
-
-    // Marker so we can confirm which handler is live.
-    const marker = "contacts_handler_v4";
+    const limit = Math.min(Math.max(Number(req.query.limit ?? 10), 1), 50);
 
     // Empty query => empty list (never spam demo)
-    if (!query) return res.json({ ok: true, items: [], marker });
+    if (!query) return res.json({ ok: true, items: [] });
 
     // 1) DB search first
     const { rows, hasLastContacted } = await selectContactsSafe({ requester, query, limit });
@@ -363,7 +1222,7 @@ router.get("/contacts", async (req, res) => {
         last_contacted_at: hasLastContacted ? (c.last_contacted_at ?? null) : null,
       }));
 
-      return res.json({ ok: true, items: shaped, marker, source: "db" });
+      return res.json({ ok: true, items: shaped, source: "db" });
     }
 
     // 2) No DB matches — if this user has ANY real contacts, return empty (no demo pollution)
@@ -373,14 +1232,13 @@ router.get("/contacts", async (req, res) => {
       .eq("user_id", requester)
       .limit(1);
 
-    // If this query errors, fail closed (empty) rather than showing demo noise.
     if (anyErr) {
-      return res.status(500).json({ ok: false, error: anyErr.message ?? "contacts_count_failed", marker });
+      return res.status(500).json({ ok: false, error: anyErr.message ?? "contacts_count_failed" });
     }
 
     const hasRealContacts = (anyReal?.length ?? 0) > 0;
     if (hasRealContacts) {
-      return res.json({ ok: true, items: [], marker, source: "db_empty" });
+      return res.json({ ok: true, items: [], source: "db_empty" });
     }
 
     // 3) Demo fallback ONLY when user has zero real contacts
@@ -392,7 +1250,7 @@ router.get("/contacts", async (req, res) => {
       .slice(0, limit)
       .map(shapeDemoContact);
 
-    return res.json({ ok: true, items: demo, marker, source: "demo" });
+    return res.json({ ok: true, items: demo, source: "demo" });
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
@@ -970,6 +1828,166 @@ router.get("/contacts/:id/activity", async (req, res) => {
   }
 });
 
+/* ---------------------------------------------------------
+   CRM ACTIVITIES / TASKS (Day 51)
+   type = "task"
+--------------------------------------------------------- */
+
+const CreateActivitySchema = z.object({
+  type: z.string().trim().min(1).max(40),
+  title: z.string().trim().min(1).max(200),
+  status: z.string().trim().min(1).max(40).optional().default("open"),
+  due_at: z.string().optional().nullable(),
+  opportunity_id: z.string().uuid().optional().nullable(),
+  contact_id: z.string().uuid().optional().nullable(),
+  account_id: z.string().uuid().optional().nullable(),
+});
+
+router.post("/activities", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    const body = CreateActivitySchema.parse(req.body ?? {});
+
+    const payload: any = {
+      user_id: requester,
+      type: body.type,
+      title: body.title,
+      status: body.status ?? "open",
+      due_at: body.due_at ?? null,
+      opportunity_id: body.opportunity_id ?? null,
+      contact_id: body.contact_id ?? null,
+      account_id: body.account_id ?? null,
+    };
+
+    const r = await supa
+      .from("crm_activities")
+      .insert(payload)
+      .select("id,type,title,status,due_at,opportunity_id,contact_id,account_id,created_at")
+      .maybeSingle();
+
+    if (r.error) {
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
+
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_activities_table_missing" });
+      }
+
+      return res.status(500).json({ ok: false, error: r.error.message ?? "activity_create_failed" });
+    }
+
+    return res.json({ ok: true, activity: r.data });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+router.get("/activities", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    const type = String(req.query.type ?? "task");
+    const status = String(req.query.status ?? "").trim();
+
+    let q = supa
+      .from("crm_activities")
+      .select("id,type,title,status,due_at,opportunity_id,contact_id,account_id,created_at")
+      .eq("user_id", requester)
+      .eq("type", type)
+      .order("created_at", { ascending: false })
+      .limit(200);
+
+    if (status) q = q.eq("status", status);
+
+    const r = await q;
+
+    if (r.error) {
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
+
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.json({ ok: true, items: [] });
+      }
+
+      return res.status(500).json({ ok: false, error: r.error.message ?? "activities_fetch_failed" });
+    }
+
+    return res.json({ ok: true, items: r.data ?? [] });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+const UpdateActivitySchema = z.object({
+  title: z.string().trim().min(1).max(200).optional(),
+  status: z.string().trim().min(1).max(40).optional(),
+  due_at: z.string().optional().nullable(),
+});
+
+router.patch("/activities/:id", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const id = String(req.params.id ?? "").trim();
+
+    if (!UUID_RE.test(id)) {
+      return res.status(400).json({ ok: false, error: "invalid_id" });
+    }
+
+    const body = UpdateActivitySchema.parse(req.body ?? {});
+
+    const patch: any = {};
+    if (body.title !== undefined) patch.title = body.title;
+    if (body.status !== undefined) patch.status = body.status;
+    if (body.due_at !== undefined) patch.due_at = body.due_at;
+
+    const r = await supa
+      .from("crm_activities")
+      .update(patch)
+      .eq("id", id)
+      .eq("user_id", requester)
+      .select("id,type,title,status,due_at")
+      .maybeSingle();
+
+    if (r.error) {
+      return res.status(500).json({ ok: false, error: r.error.message ?? "activity_update_failed" });
+    }
+
+    if (!r.data) return res.status(404).json({ ok: false, error: "not_found" });
+
+    return res.json({ ok: true, activity: r.data });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+router.post("/activities/:id/complete", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const id = String(req.params.id ?? "").trim();
+
+    if (!UUID_RE.test(id)) {
+      return res.status(400).json({ ok: false, error: "invalid_id" });
+    }
+
+    const r = await supa
+      .from("crm_activities")
+      .update({ status: "done" })
+      .eq("id", id)
+      .eq("user_id", requester)
+      .select("id,status")
+      .maybeSingle();
+
+    if (r.error) {
+      return res.status(500).json({ ok: false, error: r.error.message ?? "activity_complete_failed" });
+    }
+
+    if (!r.data) return res.status(404).json({ ok: false, error: "not_found" });
+
+    return res.json({ ok: true, activity: r.data });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
 /** ----------------------------------------------------------------
  * Contact AI Brief (heuristic for now)
  * GET /v1/crm/contacts/:id/ai-brief
@@ -1257,72 +2275,725 @@ router.get("/contacts/:id/ai-brief", async (req, res) => {
 
 /* ---------------------------------------------
    POST /v1/crm/link-call
-   Body: { callId: uuid, email: string }
-   - Ensure the caller owns the call
-   - Upsert contact by email (for this user)
-   - Link call → contact in crm_call_links
+   Body (flexible):
+     - callId | call_id (uuid) [required]
+     - contact_id | contactId (uuid) OR email (string) [one required]
+     - account_id | accountId (uuid) [optional]
+     - opportunity_id | opportunityId (uuid) [optional]
+
+   Behaviour (best-effort + schema tolerant):
+     - Verify caller owns the call
+     - Resolve contact (by contact_id if provided, else upsert by email scoped to requester)
+     - Upsert link in crm_call_links (call_id -> contact_id)
+     - Best-effort: update calls(contact_id/account_id/opportunity_id) if columns exist
+     - Best-effort: insert crm_activities row (type=call) if table exists
 ---------------------------------------------- */
-const LinkCallSchema = z.object({
-  callId: z.string().uuid(),
-  email: z.string().email().toLowerCase(),
-});
+const LinkCallSchema = z
+  .object({
+    // NOTE: call ids in this system may be UUIDs OR demo/string ids (e.g. "demo-001").
+    // So we accept any non-empty string here.
+    callId: z.string().trim().min(1).optional(),
+    call_id: z.string().trim().min(1).optional(),
+
+    contact_id: z.string().uuid().optional(),
+    contactId: z.string().uuid().optional(),
+    email: z
+      .string()
+      .email()
+      .transform((s) => s.toLowerCase().trim())
+      .optional(),
+
+    account_id: z.string().uuid().optional().nullable(),
+    accountId: z.string().uuid().optional().nullable(),
+    opportunity_id: z.string().uuid().optional().nullable(),
+    opportunityId: z.string().uuid().optional().nullable(),
+  })
+  .refine((b) => Boolean(b.callId || b.call_id), { message: "call_id_required" })
+  .refine((b) => Boolean(b.contact_id || b.contactId || b.email), { message: "contact_required" });
 
 router.post("/link-call", async (req, res) => {
   try {
     const requester = getUserIdHeader(req);
-    const body = LinkCallSchema.parse(req.body);
-    const { callId, email } = body;
+    const body = LinkCallSchema.parse(req.body ?? {});
 
-    // Verify the call belongs to the requester
-    const { data: call, error: callErr } = await supa
-      .from("calls")
-      .select("id, user_id")
-      .eq("id", callId)
-      .single();
+    const callId = (body.callId ?? body.call_id) as string;
+    const accountId = (body.accountId ?? body.account_id) ?? null;
+    const opportunityId = (body.opportunityId ?? body.opportunity_id) ?? null;
 
-    if (callErr || !call) return res.status(404).json({ ok: false, error: "call_not_found" });
-    if ((call as any).user_id !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
+    const contactIdFromBody = (body.contactId ?? body.contact_id) ?? null;
+    const email = body.email ?? null;
 
-    // Upsert contact by email for this user (note: your crm_contacts has UNIQUE(email) currently)
-    // If email is globally unique, this will fail across users. For now, we keep it simple:
-    // - attempt insert
-    // - if conflict, select existing by email
-    const insertAttempt = await supa
-      .from("crm_contacts")
-      .insert({ user_id: requester, email })
-      .select("id")
-      .single();
+    // 1) Verify the call belongs to the requester
+    // NOTE: In local/dev we may have demo call ids like "demo-001" that are not persisted.
+    // Also: some schemas expect calls.id and crm_call_links.call_id to be UUID.
+    // So we treat non-UUID call ids as “virtual/demo” and skip DB linkage writes.
+    const callIdStr = String(callId);
+    const isDemoCallId = /^demo-\d+$/i.test(callIdStr);
+    const isUuidCallId = UUID_RE.test(callIdStr);
+    const isVirtualCallId = isDemoCallId || !isUuidCallId;
 
-    let contactId: string | null = null;
+    if (!isVirtualCallId) {
+      const { data: call, error: callErr } = await supa
+        .from("calls")
+        .select("id, user_id")
+        .eq("id", callId)
+        .maybeSingle();
 
-    if (!insertAttempt.error && insertAttempt.data) {
-      contactId = (insertAttempt.data as any).id;
-    } else {
-      const { data: existing, error: exErr } = await supa
-        .from("crm_contacts")
-        .select("id")
-        .eq("email", email)
-        .single();
-      if (exErr || !existing) throw insertAttempt.error ?? exErr;
-      contactId = (existing as any).id;
+      if (callErr || !call) return res.status(404).json({ ok: false, error: "call_not_found" });
+      if (String((call as any).user_id ?? "") !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
     }
 
-    const { error: linkErr } = await supa
-      .from("crm_call_links")
-      .upsert({ call_id: callId, contact_id: contactId }, { onConflict: "call_id" });
+    // 2) Resolve contact
+    let contactId: string | null = null;
 
-    if (linkErr) throw linkErr;
+    // 2a) If contact_id provided, validate ownership
+    if (contactIdFromBody) {
+      const { data: c, error: cErr } = await supa
+        .from("crm_contacts")
+        .select("id")
+        .eq("id", contactIdFromBody)
+        .eq("user_id", requester)
+        .maybeSingle();
 
-    // best-effort: linking a call is a "touch"
+      if (cErr) return res.status(500).json({ ok: false, error: cErr.message ?? "contact_lookup_failed" });
+      if (!c) return res.status(404).json({ ok: false, error: "contact_not_found" });
+      contactId = String((c as any).id);
+    } else {
+      // 2b) Else resolve by email (scoped to requester)
+      if (!email) return res.status(400).json({ ok: false, error: "email_required" });
+
+      // Prefer selecting by (user_id + email) first
+      const { data: existingScoped, error: exScopedErr } = await supa
+        .from("crm_contacts")
+        .select("id")
+        .eq("user_id", requester)
+        .eq("email", email)
+        .maybeSingle();
+
+      if (exScopedErr) return res.status(500).json({ ok: false, error: exScopedErr.message ?? "contact_lookup_failed" });
+
+      if (existingScoped?.id) {
+        contactId = String((existingScoped as any).id);
+      } else {
+        // Insert new contact owned by requester
+        const insertAttempt = await supa
+          .from("crm_contacts")
+          .insert({ user_id: requester, email })
+          .select("id")
+          .single();
+
+        if (!insertAttempt.error && insertAttempt.data) {
+          contactId = String((insertAttempt.data as any).id);
+        } else {
+          // If email is globally unique, select by email and ensure ownership
+          const { data: existingByEmail, error: exErr } = await supa
+            .from("crm_contacts")
+            .select("id, user_id")
+            .eq("email", email)
+            .maybeSingle();
+
+          if (exErr) return res.status(500).json({ ok: false, error: exErr.message ?? "contact_lookup_failed" });
+          if (!existingByEmail) {
+            return res.status(500).json({ ok: false, error: (insertAttempt.error as any)?.message ?? "contact_upsert_failed" });
+          }
+          if (String((existingByEmail as any).user_id ?? "") !== requester) {
+            return res.status(409).json({ ok: false, error: "email_owned_by_other_user" });
+          }
+          contactId = String((existingByEmail as any).id);
+        }
+      }
+    }
+
+    if (!contactId) return res.status(500).json({ ok: false, error: "contact_resolve_failed" });
+
+    // 3) Link the call -> contact (best-effort)
+    // Goals:
+    // - Accept demo/string call ids (e.g. demo-001)
+    // - Never attempt invalid UUID writes
+    // - Do NOT depend on UNIQUE constraints / onConflict
+    //
+    // Behaviour:
+    // - If callId is not a UUID (or is demo), we skip DB linkage writes and just return a stable response.
+    // - If callId is a UUID, we do a simple "replace" write: delete existing links for call_id, then insert.
+    if (isUuidCallId) {
+      try {
+        // crm_call_links may not exist yet
+        // Replace semantics: one call_id should point to one contact_id
+        await supa.from("crm_call_links").delete().eq("call_id", callId);
+
+        const ins = await supa.from("crm_call_links").insert({ call_id: callId, contact_id: contactId });
+        if (ins.error) {
+          const msg = String((ins.error as any)?.message ?? "").toLowerCase();
+
+          // Missing table is a hard error for link-call
+          if (msg.includes("relation") && msg.includes("does not exist")) {
+            return res.status(500).json({ ok: false, error: "crm_call_links_table_missing" });
+          }
+
+          // If the schema expects UUIDs and rejects (shouldn't happen because isUuidCallId), fail-soft and continue.
+          if (msg.includes("invalid input syntax") && msg.includes("uuid")) {
+            // no-op
+          } else {
+            return res.status(500).json({ ok: false, error: (ins.error as any)?.message ?? "link_call_failed" });
+          }
+        }
+      } catch (e: any) {
+        const emsg = String(e?.message ?? "").toLowerCase();
+        if (emsg.includes("relation") && emsg.includes("does not exist")) {
+          return res.status(500).json({ ok: false, error: "crm_call_links_table_missing" });
+        }
+        // Otherwise fail-soft (link table issues shouldn't block the rest)
+      }
+    }
+
+    // 3b) Persist demo/virtual call links so GET /v1/crm/link can re-hydrate UI after refresh.
+    // This is best-effort: if the table doesn't exist yet, we fail-soft.
+    if (isVirtualCallId) {
+      try {
+        // Replace semantics: one (user_id, call_id) row
+        await supa
+          .from("crm_demo_call_links")
+          .delete()
+          .eq("user_id", requester)
+          .eq("call_id", callIdStr);
+
+        const ins = await supa.from("crm_demo_call_links").insert({
+          user_id: requester,
+          call_id: callIdStr,
+          contact_id: contactId,
+          account_id: accountId,
+          opportunity_id: opportunityId,
+        });
+
+        if (ins.error) {
+          const msg = String((ins.error as any)?.message ?? "").toLowerCase();
+          // Table missing -> fail-soft (demo persistence not available)
+          if (!(msg.includes("relation") && msg.includes("does not exist"))) {
+            console.error("[crm/link-call] demo link insert failed:", ins.error);
+          }
+        }
+      } catch (e: any) {
+        const msg = String(e?.message ?? "").toLowerCase();
+        // Table missing -> fail-soft
+        if (!(msg.includes("relation") && msg.includes("does not exist"))) {
+          console.error("[crm/link-call] demo link insert exception:", e);
+        }
+      }
+    }
+
+    // 4) Best-effort: update calls row with linkage columns (schema tolerant)
+    // Virtual/demo call ids are not persisted, so skip updating `calls`.
+    if (!isVirtualCallId) {
+      try {
+        const patchBase: any = {
+          contact_id: contactId,
+          ...(accountId ? { account_id: accountId } : {}),
+          ...(opportunityId ? { opportunity_id: opportunityId } : {}),
+        };
+
+        const updateAttempts: any[] = [
+          { ...patchBase },
+          (() => {
+            const p = { ...patchBase };
+            delete p.opportunity_id;
+            return p;
+          })(),
+          (() => {
+            const p = { ...patchBase };
+            delete p.account_id;
+            return p;
+          })(),
+          (() => {
+            const p = { ...patchBase };
+            delete p.account_id;
+            delete p.opportunity_id;
+            return p;
+          })(),
+        ].filter((p) => Object.keys(p).length > 0);
+
+        for (const p of updateAttempts) {
+          const r = await supa
+            .from("calls")
+            .update(p)
+            .eq("id", callId)
+            .eq("user_id", requester)
+            .select("id")
+            .maybeSingle();
+
+          if (!r.error) break;
+
+          const msg = String((r.error as any)?.message ?? "").toLowerCase();
+          const isMissingCol =
+            (msg.includes("column") && msg.includes("does not exist")) ||
+            msg.includes("could not find") ||
+            msg.includes("unknown column");
+
+          if (isMissingCol) continue;
+          break;
+        }
+      } catch {
+        // fail-soft
+      }
+    }
+
+    // 5) Best-effort: insert an activity row (timeline)
+    // If call_id is not a UUID, many schemas will reject it; skip activity insert.
+    if (!isUuidCallId) {
+      // still continue (we’ll return ok below)
+    } else {
+      try {
+        const activityBase: any = {
+          user_id: requester,
+          type: "call",
+          contact_id: contactId,
+          call_id: callId,
+          ...(accountId ? { account_id: accountId } : {}),
+          ...(opportunityId ? { opportunity_id: opportunityId } : {}),
+          meta: { source: "link_call_v1" },
+        };
+
+        const activityAttempts: any[] = [
+          { ...activityBase },
+          (() => {
+            const p = { ...activityBase };
+            delete p.meta;
+            return p;
+          })(),
+          (() => {
+            const p = { ...activityBase };
+            delete p.call_id;
+            return p;
+          })(),
+          (() => {
+            const p = { ...activityBase };
+            delete p.account_id;
+            delete p.opportunity_id;
+            return p;
+          })(),
+          { user_id: requester, type: "call", contact_id: contactId },
+        ];
+
+        for (const payload of activityAttempts) {
+          const r = await supa.from("crm_activities").insert(payload);
+          if (!r.error) break;
+
+          const msg = String((r.error as any)?.message ?? "").toLowerCase();
+          if (msg.includes("relation") && msg.includes("does not exist")) break;
+
+          const isMissingCol =
+            (msg.includes("column") && msg.includes("does not exist")) ||
+            msg.includes("could not find") ||
+            msg.includes("unknown column");
+
+          if (isMissingCol) continue;
+          break;
+        }
+      } catch {
+        // fail-soft
+      }
+    }
+
+    // 6) Touch contact (best-effort)
     try {
       await touchContactBestEffort({ requester, contactId });
     } catch {
       // fail-soft
     }
 
-    res.json({ ok: true, link: { contact_id: contactId } });
+    return res.json({
+      ok: true,
+      link: {
+        call_id: callId,
+        contact_id: contactId,
+        account_id: accountId,
+        opportunity_id: opportunityId,
+        demo_call: isDemoCallId,
+        virtual_call: isVirtualCallId,
+      },
+    });
   } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+  }
+});
+
+/* ---------------------------------------------
+   POST /v1/crm/unlink
+   Body:
+     - callId (string) [required] (UUID or demo-###)
+     - target: 'contact' | 'account' [required]
+
+   Behaviour:
+     - For UUID calls: verify caller owns the call via `calls` table, then update/delete from `crm_call_links`.
+     - For demo/virtual calls: update/delete from `crm_demo_call_links` (scoped by user_id).
+     - Best-effort schema tolerance: if account_id column missing, fallback to deleting the link row.
+---------------------------------------------- */
+const UnlinkSchema = z.object({
+  callId: z.string().trim().min(1),
+  target: z.enum(["contact", "account"]),
+});
+
+// POST /v1/crm/unlink
+// Body: { callId | call_id, target?: "contact"|"account"|"opportunity"|"all" }
+// Supports demo/string call IDs by using `crm_demo_call_links` for non-UUID ids.
+router.post("/unlink", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    const body = (req.body ?? {}) as any;
+    const callId = String(body.callId ?? body.call_id ?? "").trim();
+    const target = String(body.target ?? "all").trim().toLowerCase();
+
+    if (!callId) {
+      return res.status(400).json({ ok: false, error: "callId_required" });
+    }
+
+    const callIdStr = String(callId);
+    const isDemoCallId = /^demo-\d+$/i.test(callIdStr);
+    const isUuidCallId = UUID_RE.test(callIdStr);
+    const isVirtualCallId = isDemoCallId || !isUuidCallId;
+
+
+
+    // ----------------------------
+    // A) DEMO/VIRTUAL call ids
+    // ----------------------------
+    if (isVirtualCallId) {
+      try {
+        // IMPORTANT:
+        // GET /v1/crm/link for demo ids hydrates from crm_demo_call_links.
+        // So unlinking the CONTACT must delete the row, otherwise it will “come back”.
+        if (target === "all" || target === "contact") {
+          const del = await supa
+            .from("crm_demo_call_links")
+            .delete()
+            .eq("user_id", requester)
+            .eq("call_id", callIdStr);
+
+          if (del.error) {
+            const msg = String((del.error as any)?.message ?? "").toLowerCase();
+            // Table missing -> fail-soft
+            if (!(msg.includes("relation") && msg.includes("does not exist"))) {
+              console.error("[crm/unlink] demo delete failed:", del.error);
+            }
+          }
+
+          return res.json({ ok: true, call_id: callIdStr, unlinked: target });
+        }
+
+        // For demo ids, we only support clearing account/opportunity via update.
+        const patch: any = {};
+        if (target === "account") {
+          patch.account_id = null;
+          patch.opportunity_id = null;
+        } else if (target === "opportunity") {
+          patch.opportunity_id = null;
+        } else {
+          // unknown target: fail-soft but don't delete the link
+          patch.opportunity_id = null;
+        }
+
+        const attempts: any[] = [
+          { ...patch },
+          (() => {
+            const p = { ...patch };
+            delete p.opportunity_id;
+            return p;
+          })(),
+          (() => {
+            const p = { ...patch };
+            delete p.account_id;
+            return p;
+          })(),
+        ].filter((p) => Object.keys(p).length > 0);
+
+        for (const p of attempts) {
+          const r = await supa
+            .from("crm_demo_call_links")
+            .update(p)
+            .eq("user_id", requester)
+            .eq("call_id", callIdStr);
+
+          if (!r.error) break;
+
+          const msg = String((r.error as any)?.message ?? "").toLowerCase();
+          const isMissingCol =
+            (msg.includes("column") && msg.includes("does not exist")) ||
+            msg.includes("could not find") ||
+            msg.includes("unknown column");
+
+          if (msg.includes("relation") && msg.includes("does not exist")) break; // fail-soft
+          if (isMissingCol) continue;
+          break;
+        }
+
+        return res.json({ ok: true, call_id: callIdStr, unlinked: target });
+      } catch {
+        // fail-soft
+        return res.json({ ok: true, call_id: callIdStr, unlinked: target });
+      }
+    }
+
+    // 2) Best-effort: clear linkage columns on calls (schema tolerant)
+    {
+      const patchBase: any = {};
+
+      if (target === "contact") {
+        patchBase.contact_id = null;
+        patchBase.opportunity_id = null;
+      } else if (target === "account") {
+        patchBase.account_id = null;
+        patchBase.opportunity_id = null;
+      } else if (target === "opportunity") {
+        patchBase.opportunity_id = null;
+      } else {
+        patchBase.contact_id = null;
+        patchBase.account_id = null;
+        patchBase.opportunity_id = null;
+      }
+
+      const attempts: any[] = [
+        { ...patchBase },
+        (() => {
+          const p = { ...patchBase };
+          delete p.opportunity_id;
+          return p;
+        })(),
+        (() => {
+          const p = { ...patchBase };
+          delete p.account_id;
+          return p;
+        })(),
+        (() => {
+          const p = { ...patchBase };
+          delete p.contact_id;
+          return p;
+        })(),
+      ].filter((p) => Object.keys(p).length > 0);
+
+      for (const p of attempts) {
+        const r = await supa
+          .from("calls")
+          .update(p)
+          .eq("id", callIdStr)
+          .eq("user_id", requester)
+          .select("id")
+          .maybeSingle();
+
+        if (!r.error) break;
+
+        const msg = String((r.error as any)?.message ?? "").toLowerCase();
+        const isMissingCol =
+          (msg.includes("column") && msg.includes("does not exist")) ||
+          msg.includes("could not find") ||
+          msg.includes("unknown column");
+
+        if (isMissingCol) continue;
+        break;
+      }
+    }
+
+    return res.json({ ok: true, call_id: callIdStr, unlinked: target });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+// GET /v1/crm/link?callId=...
+// Returns CRM link info for a call.
+// Notes:
+// - Demo ids like "demo-001" are allowed (returns a stable empty link unless your schema supports text call_ids).
+// - We do NOT depend on crm_call_links.user_id existing.
+// - Related entities (contact/account/opportunity) are always scoped to requester via user_id.
+router.get("/link", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const callId = String((req.query as any)?.callId ?? "").trim();
+
+    if (!callId) {
+      return res.status(400).json({ ok: false, error: "callId_required" });
+    }
+
+    const isDemoCallId = /^demo-\d+$/i.test(callId);
+    const isUuidCallId = UUID_RE.test(callId);
+
+    // If it's not a UUID, the main link table may be UUID-typed.
+    // For demo/virtual calls we persist links in crm_demo_call_links (text call_id).
+    if (!isUuidCallId) {
+      try {
+        const dl = await supa
+          .from("crm_demo_call_links")
+          .select("call_id, contact_id, account_id, opportunity_id")
+          .eq("user_id", requester)
+          .eq("call_id", callId)
+          .maybeSingle();
+
+        if (!dl.error && dl.data) {
+          const linkRow: any = {
+            call_id: (dl.data as any).call_id,
+            contact_id: (dl.data as any).contact_id,
+            account_id: (dl.data as any).account_id ?? null,
+            opportunity_id: (dl.data as any).opportunity_id ?? null,
+            demo_call: isDemoCallId,
+            virtual_call: true,
+          };
+
+          let contact: any = null;
+          let account: any = null;
+          let opportunity: any = null;
+
+          if (linkRow.contact_id) {
+            const r = await supa
+              .from("crm_contacts")
+              .select("id, first_name, last_name, email, company")
+              .eq("id", linkRow.contact_id)
+              .eq("user_id", requester)
+              .maybeSingle();
+            if (!r.error) contact = r.data ?? null;
+          }
+
+          if (linkRow.account_id) {
+            const r = await supa
+              .from("crm_accounts")
+              .select("id, name")
+              .eq("id", linkRow.account_id)
+              .eq("user_id", requester)
+              .maybeSingle();
+            if (!r.error) account = r.data ?? null;
+          }
+
+          if (linkRow.opportunity_id) {
+            const r = await supa
+              .from("crm_opportunities")
+              .select("id, name, stage")
+              .eq("id", linkRow.opportunity_id)
+              .eq("user_id", requester)
+              .maybeSingle();
+            if (!r.error) opportunity = r.data ?? null;
+          }
+
+          return res.json({ ok: true, link: linkRow, contact, account, opportunity });
+        }
+
+        // If demo table missing, fail-soft and fall through to stable empty response
+        if (dl.error) {
+          const msg = String((dl.error as any)?.message ?? "").toLowerCase();
+          if (!(msg.includes("relation") && msg.includes("does not exist"))) {
+            console.error("[crm/link] demo link fetch failed:", dl.error);
+          }
+        }
+      } catch {
+        // ignore
+      }
+
+      return res.json({
+        ok: true,
+        link: isDemoCallId
+          ? {
+            call_id: callId,
+            contact_id: null,
+            account_id: null,
+            opportunity_id: null,
+            demo_call: true,
+            virtual_call: true,
+          }
+          : null,
+        contact: null,
+        account: null,
+        opportunity: null,
+      });
+    }
+
+    // Find link row (schema-tolerant: do NOT assume user_id/account_id/opportunity_id columns exist)
+    let linkRow: any = null;
+    try {
+      const r = await supa
+        .from("crm_call_links")
+        .select("*")
+        .eq("call_id", callId)
+        .maybeSingle();
+
+      if (r.error) {
+        const msg = String((r.error as any)?.message ?? "").toLowerCase();
+
+        // Missing table => fail-open (stable empty link)
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+          return res.json({ ok: true, link: null, contact: null, account: null, opportunity: null });
+        }
+
+        // Any uuid parsing mismatch => treat as not linked
+        if (msg.includes("invalid input") && msg.includes("uuid")) {
+          return res.json({ ok: true, link: null, contact: null, account: null, opportunity: null });
+        }
+
+        throw r.error;
+      }
+
+      linkRow = r.data ?? null;
+    } catch (err: any) {
+      const msg = String(err?.message ?? "").toLowerCase();
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.json({ ok: true, link: null, contact: null, account: null, opportunity: null });
+      }
+      if (msg.includes("invalid input") && msg.includes("uuid")) {
+        return res.json({ ok: true, link: null, contact: null, account: null, opportunity: null });
+      }
+      throw err;
+    }
+
+    if (!linkRow) {
+      return res.json({ ok: true, link: null, contact: null, account: null, opportunity: null });
+    }
+
+    let contact: any = null;
+    let account: any = null;
+    let opportunity: any = null;
+
+    if ((linkRow as any).contact_id) {
+      const r = await supa
+        .from("crm_contacts")
+        .select("id, first_name, last_name, email, company")
+        .eq("id", (linkRow as any).contact_id)
+        .eq("user_id", requester)
+        .maybeSingle();
+
+      if (!r.error) contact = r.data ?? null;
+    }
+
+    // account_id/opportunity_id are optional and may not exist on older link schemas.
+    if ((linkRow as any).account_id) {
+      const r = await supa
+        .from("crm_accounts")
+        .select("id, name")
+        .eq("id", (linkRow as any).account_id)
+        .eq("user_id", requester)
+        .maybeSingle();
+
+      if (!r.error) account = r.data ?? null;
+    }
+
+    if ((linkRow as any).opportunity_id) {
+      const r = await supa
+        .from("crm_opportunities")
+        .select("id, name, stage")
+        .eq("id", (linkRow as any).opportunity_id)
+        .eq("user_id", requester)
+        .maybeSingle();
+
+      if (!r.error) opportunity = r.data ?? null;
+    }
+
+    return res.json({
+      ok: true,
+      link: linkRow,
+      contact,
+      account,
+      opportunity,
+    });
+  } catch (e: any) {
+    return res.status(500).json({
+      ok: false,
+      error: e?.message ?? "link_fetch_failed",
+    });
   }
 });
 
@@ -2233,7 +3904,281 @@ router.post("/actions", async (req, res) => {
         return res.status(500).json({ ok: false, error: "crm_actions_table_missing" });
       }
 
-      // If it’s a missing column error, continue retry ladder
+      // If it’s a missing column error, continue trying next payload
+      if (msg.includes("column") && msg.includes("does not exist")) {
+        continue;
+      }
+
+      // Otherwise stop retrying
+      break;
+    }
+
+    return res.status(500).json({
+      ok: false,
+      error: (lastErr as any)?.message ?? "action_create_failed",
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      ok: false,
+      error: err.message || "action_create_failed",
+    });
+  }
+});
+
+
+/* ---------------------------------------------
+   OPPORTUNITIES (Pipeline / Kanban v1)
+   - Minimal endpoints to power Day 50
+---------------------------------------------- */
+
+const StageSchema = z.object({
+  stage: z.string().trim().min(1),
+});
+
+// Best-effort select helper (schema tolerant) for crm_opportunities
+async function selectCrmOpportunitiesSafe(args: {
+  requester: string;
+  stage?: string | null;
+  limit: number;
+}) {
+  const { requester, stage, limit } = args;
+
+  const candidateSelects = [
+    "id, name, stage, amount, close_date, account_id, contact_id, created_at, updated_at",
+    "id, name, stage, amount, close_date, account_id, contact_id, created_at",
+    "id, name, stage, amount, close_date, account_id, contact_id",
+    "id, name, stage, account_id, contact_id",
+    "id, name, stage",
+    "id, stage",
+    "id",
+  ];
+
+  for (const sel of candidateSelects) {
+    const q = supa
+      .from("crm_opportunities")
+      .select(sel)
+      .eq("user_id", requester)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    const r = stage ? await q.eq("stage", stage) : await q;
+
+    if (!r.error) {
+      return { ok: true as const, rows: (r.data as any[]) ?? [], select: sel };
+    }
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+
+    // Table missing: hard fail (pipeline depends on this table)
+    if (msg.includes("relation") && msg.includes("does not exist")) {
+      return { ok: false as const, error: r.error };
+    }
+
+    // Missing column: try the next select candidate
+    if (msg.includes("column") && msg.includes("does not exist")) {
+      continue;
+    }
+
+    // Unknown error: stop
+    return { ok: false as const, error: r.error };
+  }
+
+  return { ok: false as const, error: new Error("crm_opportunities_select_failed") };
+}
+
+/* ---------------------------------------------
+   POST /v1/crm/opportunities
+   Body:
+     - name | title (string) [required]
+     - stage (string) [optional, default "new"]
+     - amount | value (number) [optional]
+     - currency (string) [optional]
+     - account_name | accountName (string) [optional]
+     - contact_email | contactEmail | email (string) [optional]
+
+   Behaviour (MVP):
+     - Inserts into crm_opportunities (schema tolerant)
+     - Scoped to requester (user_id=requester)
+---------------------------------------------- */
+
+const CreateOpportunitySchema = z.object({
+  name: z.string().trim().min(1).optional(),
+  title: z.string().trim().min(1).optional(),
+  stage: z.string().trim().min(1).optional(),
+
+  amount: z.number().finite().nonnegative().optional().nullable(),
+  value: z.number().finite().nonnegative().optional().nullable(),
+  currency: z.string().trim().min(1).max(12).optional().nullable(),
+
+  account_name: z.string().trim().min(1).max(180).optional().nullable(),
+  accountName: z.string().trim().min(1).max(180).optional().nullable(),
+
+  contact_email: z.string().email().transform((s) => s.toLowerCase().trim()).optional().nullable(),
+  contactEmail: z.string().email().transform((s) => s.toLowerCase().trim()).optional().nullable(),
+  email: z.string().email().transform((s) => s.toLowerCase().trim()).optional().nullable(),
+});
+
+router.post("/opportunities", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    const body = CreateOpportunitySchema.parse(req.body ?? {});
+    const name = String(body.name ?? body.title ?? "").trim();
+    if (!name) return res.status(400).json({ ok: false, error: "name_required" });
+
+    const stage = String(body.stage ?? "new").trim() || "new";
+
+    const accountName = String(body.account_name ?? body.accountName ?? "").trim() || null;
+    const contactEmail = (body.contact_email ?? body.contactEmail ?? body.email) ?? null;
+
+    const amount = (body.amount ?? body.value ?? null) as number | null;
+    const currency = String(body.currency ?? "").trim() || null;
+
+    // --------------------------------------------
+    // AUTO-CREATE / LINK CONTACT + ACCOUNT (optional)
+    // --------------------------------------------
+    let contactId: string | null = null;
+    let accountId: string | null = null;
+
+    // 1) Resolve or create contact by email
+    if (contactEmail) {
+      const existingContact = await supa
+        .from("crm_contacts")
+        .select("id, user_id")
+        .eq("user_id", requester)
+        .eq("email", contactEmail)
+        .maybeSingle();
+
+      if (existingContact.error) {
+        const msg = String((existingContact.error as any)?.message ?? "").toLowerCase();
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+          return res.status(500).json({ ok: false, error: "crm_contacts_table_missing" });
+        }
+        return res.status(500).json({ ok: false, error: "contact_lookup_failed" });
+      }
+
+      if (existingContact.data) {
+        contactId = String((existingContact.data as any).id);
+      } else {
+        const ins = await supa
+          .from("crm_contacts")
+          .insert({
+            user_id: requester,
+            email: contactEmail,
+          })
+          .select("id")
+          .maybeSingle();
+
+        if (ins.error) {
+          return res.status(500).json({
+            ok: false,
+            error: (ins.error as any)?.message ?? "contact_create_failed",
+          });
+        }
+
+        contactId = String((ins.data as any).id);
+      }
+    }
+
+    // 2) Resolve or create account by name
+    if (accountName) {
+      const existingAccount = await supa
+        .from("crm_accounts")
+        .select("id, user_id")
+        .eq("user_id", requester)
+        .eq("name", accountName)
+        .maybeSingle();
+
+      if (existingAccount.error) {
+        const msg = String((existingAccount.error as any)?.message ?? "").toLowerCase();
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+          return res.status(500).json({ ok: false, error: "crm_accounts_table_missing" });
+        }
+        return res.status(500).json({ ok: false, error: "account_lookup_failed" });
+      }
+
+      if (existingAccount.data) {
+        accountId = String((existingAccount.data as any).id);
+      } else {
+        const ins = await supa
+          .from("crm_accounts")
+          .insert({
+            user_id: requester,
+            name: accountName,
+          })
+          .select("id")
+          .maybeSingle();
+
+        if (ins.error) {
+          return res.status(500).json({
+            ok: false,
+            error: (ins.error as any)?.message ?? "account_create_failed",
+          });
+        }
+
+        accountId = String((ins.data as any).id);
+      }
+    }
+
+    // Insert (schema tolerant: try richer payload then fall back if cols missing)
+    const payloadBase: any = {
+      user_id: requester,
+      name,
+      title: name,
+      stage,
+      ...(amount !== null ? { amount, value: amount } : {}),
+      ...(currency ? { currency } : {}),
+      ...(accountId ? { account_id: accountId } : {}),
+      ...(contactId ? { contact_id: contactId } : {}),
+      ...(accountName ? { account_name: accountName } : {}),
+      ...(contactEmail ? { contact_email: contactEmail } : {}),
+    };
+
+    const attempts: any[] = [
+      { ...payloadBase },
+      (() => {
+        const p = { ...payloadBase };
+        delete p.value;
+        return p;
+      })(),
+      (() => {
+        const p = { ...payloadBase };
+        delete p.amount;
+        delete p.value;
+        return p;
+      })(),
+      (() => {
+        const p = { ...payloadBase };
+        delete p.account_name;
+        return p;
+      })(),
+      (() => {
+        const p = { ...payloadBase };
+        delete p.contact_email;
+        return p;
+      })(),
+      { user_id: requester, name, title: name, stage },
+    ];
+
+    let created: any = null;
+    let lastErr: any = null;
+
+    for (const p of attempts) {
+      const ins = await supa.from("crm_opportunities").insert(p).select("*").maybeSingle();
+
+      if (!ins.error) {
+        created = ins.data;
+        break;
+      }
+
+      lastErr = ins.error;
+      const msg = String((ins.error as any)?.message ?? "").toLowerCase();
+
+      // loud if table missing
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+      }
+
       const isMissingCol =
         (msg.includes("column") && msg.includes("does not exist")) ||
         msg.includes("could not find") ||
@@ -2241,696 +4186,643 @@ router.post("/actions", async (req, res) => {
 
       if (isMissingCol) continue;
 
-      // Unknown error -> fail closed
-      console.error("[crm/actions/create]", r.error);
-      return res
-        .status(500)
-        .json({ ok: false, error: (r.error as any)?.message ?? "actions_create_failed" });
+      // otherwise stop retrying and return error
+      break;
     }
 
-    console.error("[crm/actions/create] exhausted_attempts", lastErr);
-    return res
-      .status(500)
-      .json({ ok: false, error: (lastErr as any)?.message ?? "actions_create_failed" });
-  } catch (err: any) {
-    console.error("[crm/actions/create]", err);
-    return res
-      .status(500)
-      .json({ ok: false, error: err.message || "actions_create_failed" });
+    if (!created) {
+      return res.status(500).json({
+        ok: false,
+        error: (lastErr as any)?.message ?? "opportunity_create_failed",
+      });
+    }
+
+    return res.json({ ok: true, opportunity: created });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
   }
 });
 
-// POST /v1/crm/actions/:id/complete
-router.post("/actions/:id/complete", async (req, res) => {
+// GET /v1/crm/opportunities/pipeline
+// Returns opportunities grouped by stage (kanban-ready)
+router.get("/opportunities/pipeline", async (req, res) => {
   try {
     const requester = getUserIdHeader(req);
-    const actionId = String(req.params.id ?? "").trim();
-    if (!actionId) {
-      return res.status(400).json({ ok: false, error: "action_id_required" });
+
+    const limit = Math.min(Math.max(Number((req.query as any)?.limit ?? 500), 1), 2000);
+    const stage = String((req.query as any)?.stage ?? "").trim() || null;
+
+    const r = await selectCrmOpportunitiesSafe({ requester, stage, limit });
+    if (!r.ok) {
+      const msg = String(((r as any).error as any)?.message ?? (r as any).error ?? "pipeline_fetch_failed");
+      return res.status(500).json({ ok: false, error: msg });
     }
 
-    const nowIso = new Date().toISOString();
+    const rows = (r.rows ?? []).map((o: any) => ({
+      id: o.id,
+      name: o.name ?? null,
+      stage: o.stage ?? null,
+      amount: (o as any).amount ?? null,
+      close_date: (o as any).close_date ?? null,
+      account_id: (o as any).account_id ?? null,
+      contact_id: (o as any).contact_id ?? null,
+      created_at: (o as any).created_at ?? null,
+      updated_at: (o as any).updated_at ?? null,
+    }));
 
-    const { data, error } = await supa
-      .from("crm_actions")
-      .update({
-        completed_at: nowIso,
-        status: "done",
-      })
-      .eq("id", actionId)
-      .eq("user_id", requester)
-      .select("id, contact_id")
-      .single();
-
-    if (error || !data) {
-      return res.status(404).json({ ok: false, error: "action_not_found" });
+    const byStage: Record<string, any[]> = {};
+    for (const o of rows) {
+      const s = String(o.stage ?? "Unstaged").trim() || "Unstaged";
+      (byStage[s] ||= []).push(o);
     }
 
-    // 🔥 Touch the related contact so health stays honest (fail-soft)
-    try {
-      const contactId = (data as any)?.contact_id;
-      if (contactId) {
-        await touchContactBestEffort({
-          requester,
-          contactId,
-        });
-      }
-    } catch (err) {
-      console.error("touch_on_action_complete_failed", err);
-    }
-
-    return res.json({ ok: true });
-  } catch (err: any) {
-    return res.status(500).json({
-      ok: false,
-      error: err.message || "action_complete_failed",
-    });
-  }
-});
-
-// ------------------------------
-// ------------------------------
-// MANAGER CONTACTS + NUDGES helpers (v1)
-// ------------------------------
-async function fetchManagerContactsEnrichedV1(args: { requester: string; limit: number }) {
-  const { requester, limit } = args;
-
-  // ------------------------------
-  // Contacts fetch (schema tolerant)
-  // ------------------------------
-  const selectContactsBestEffort = async () => {
-    const ownerCols: Array<"user_id" | "requester_id"> = ["user_id", "requester_id"];
-    const selectColsCandidates = [
-      "id, first_name, last_name, email, company, last_contacted_at, created_at",
-      "id, first_name, last_name, email, company, created_at",
+    // Deterministic column order (alpha), but keep common stages first if present
+    const preferred = ["Lead", "Qualified", "Proposal", "Negotiation", "Won", "Lost"];
+    const stageSet = new Set(Object.keys(byStage));
+    const orderedStages = [
+      ...preferred.filter((s) => stageSet.has(s)),
+      ...[...stageSet].filter((s) => !preferred.includes(s)).sort((a, b) => a.localeCompare(b)),
     ];
 
-    for (const ownerCol of ownerCols) {
-      for (const sel of selectColsCandidates) {
-        const r = await supa
-          .from("crm_contacts")
-          .select(sel)
-          // @ts-ignore - dynamic column name
-          .eq(ownerCol, requester)
-          .order("created_at", { ascending: false })
-          .limit(limit);
+    return res.json({
+      ok: true,
+      stages: orderedStages,
+      by_stage: byStage,
+      opportunities: rows,
+      meta: { select: r.select, limit, stage },
+    });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
 
-        if (!r.error) {
-          const rows = (r.data as any[]) ?? [];
-          const hasLastContacted = sel.includes("last_contacted_at");
-          return { rows, hasLastContacted };
-        }
+// GET /v1/crm/opportunities/stages
+// Returns distinct stage values for the requester.
+router.get("/opportunities/stages", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
 
-        const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    // Best-effort: select just stage; tolerate schemas without created_at
+    const r = await supa
+      .from("crm_opportunities")
+      .select("stage")
+      .eq("user_id", requester)
+      .limit(2000);
 
-        // Missing table -> return empty
-        if (msg.includes("relation") && msg.includes("does not exist")) {
-          return { rows: [] as any[], hasLastContacted: false };
-        }
-
-        // Missing column -> try next candidate
-        if ((msg.includes("column") && msg.includes("does not exist")) || msg.includes("could not find")) {
-          continue;
-        }
-
-        // Unknown error -> surface
-        throw r.error;
+    if (r.error) {
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
       }
+      // fail-open with defaults
+      return res.json({
+        ok: true,
+        stages: ["Lead", "Qualified", "Proposal", "Negotiation", "Won", "Lost"],
+        source: "defaults",
+      });
     }
 
-    return { rows: [] as any[], hasLastContacted: false };
-  };
+    const stages = Array.from(
+      new Set(
+        ((r.data as any[]) ?? [])
+          .map((x) => String((x as any)?.stage ?? "").trim())
+          .filter(Boolean)
+      )
+    ).sort((a, b) => a.localeCompare(b));
 
-  const { rows, hasLastContacted } = await selectContactsBestEffort();
+    const out = stages.length
+      ? stages
+      : ["Lead", "Qualified", "Proposal", "Negotiation", "Won", "Lost"];
 
-  // ------------------------------
-  // Enrich per contact (best-effort)
-  // ------------------------------
-  const nowMs = Date.now();
+    return res.json({ ok: true, stages: out, source: stages.length ? "db" : "defaults" });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
 
-  const enriched = await Promise.all(
-    (rows ?? []).map(async (c: any) => {
-      const contactId = String(c?.id ?? "");
+// PATCH /v1/crm/opportunities/:id/stage
+// Body: { stage: string }
+router.patch("/opportunities/:id/stage", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const id = String((req.params as any)?.id ?? "").trim();
+    if (!id) return res.status(400).json({ ok: false, error: "opportunity_id_required" });
 
-      // Action counts (best-effort)
-      let open = 0;
-      let completed = 0;
-      let overdue = 0;
+    const body = StageSchema.parse(req.body ?? {});
 
-      try {
-        const r = await fetchCrmActionsBestEffort({ requester, contactId, limit: 250 });
-        if (r.ok) {
-          const openItems = (r.open ?? []) as any[];
-          const completedItems = (r.completed ?? []) as any[];
+    // Best-effort: update stage (and updated_at if present)
+    const candidates: any[] = [
+      { stage: body.stage, updated_at: new Date().toISOString() },
+      { stage: body.stage },
+    ];
 
-          open = openItems.length;
-          completed = completedItems.length;
+    let lastErr: any = null;
 
-          overdue = openItems.reduce((acc, a) => {
-            const dueAt = (a as any)?.due_at ?? null;
-            if (!dueAt) return acc;
-            const dueMs = new Date(String(dueAt)).getTime();
-            if (Number.isFinite(dueMs) && dueMs < nowMs) return acc + 1;
-            return acc;
-          }, 0);
-        }
-      } catch {
-        // fail-soft
+    for (const payload of candidates) {
+      const r = await supa
+        .from("crm_opportunities")
+        .update(payload)
+        .eq("id", id)
+        .eq("user_id", requester)
+        .select("id, name, stage")
+        .maybeSingle();
+
+      if (!r.error) {
+        if (!r.data) return res.status(404).json({ ok: false, error: "not_found" });
+        return res.json({ ok: true, opportunity: r.data });
       }
 
-      const lastContactedAt = hasLastContacted ? (c?.last_contacted_at ?? null) : null;
-      const health = computeContactHealthV1({
-        last_contacted_at: lastContactedAt,
-        open_actions: open,
-        overdue_actions: overdue,
-        has_notes: false,
-        has_recent_call: false,
-      });
+      lastErr = r.error;
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
 
-      return {
-        id: contactId,
-        first_name: c?.first_name ?? null,
-        last_name: c?.last_name ?? null,
-        email: c?.email ?? null,
-        company: c?.company ?? null,
-        last_contacted_at: hasLastContacted ? (c?.last_contacted_at ?? null) : null,
-        created_at: c?.created_at ?? null,
-        health,
-        action_counts: {
-          open,
-          overdue,
-          completed,
+      // Missing column updated_at -> try next payload
+      if (msg.includes("column") && msg.includes("updated_at") && msg.includes("does not exist")) {
+        continue;
+      }
+
+      // Missing table
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+      }
+
+      break;
+    }
+
+    return res.status(500).json({ ok: false, error: (lastErr as any)?.message ?? "stage_update_failed" });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+/* ---------------------------------------------
+   GET /v1/crm/opportunities/:id
+   Query:
+     - scope=mine|team (default mine)
+
+   Behaviour:
+     - mine (default): requester can fetch only their own opportunities
+     - team: manager-only, can fetch an opp owned by a rep in the same org
+
+   Returns minimal fields for the Opportunity Drawer.
+---------------------------------------------- */
+router.get("/opportunities/:id", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const id = String((req.params as any)?.id ?? "").trim();
+    if (!id || !UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
+
+    const scopeRaw = String((req.query as any)?.scope ?? "mine").trim().toLowerCase();
+    const scope = scopeRaw === "team" ? "team" : "mine";
+
+    const selectCols =
+      "id,user_id,org_id,name,title,stage,amount,value,currency,close_date,account_id,contact_id,account_name,contact_email,created_at,updated_at";
+
+    if (scope === "mine") {
+      const { data, error } = await supa
+        .from("crm_opportunities")
+        .select(selectCols)
+        .eq("id", id)
+        .eq("user_id", requester)
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) return res.status(404).json({ ok: false, error: "not_found" });
+
+      return res.json({
+        ok: true,
+        opportunity: {
+          id: (data as any).id,
+          name: (data as any).name ?? (data as any).title ?? null,
+          stage: (data as any).stage ?? null,
+          amount: (data as any).amount ?? (data as any).value ?? null,
+          currency: (data as any).currency ?? null,
+          close_date: (data as any).close_date ?? null,
+          account_id: (data as any).account_id ?? null,
+          contact_id: (data as any).contact_id ?? null,
+          account_name: (data as any).account_name ?? null,
+          contact_email: (data as any).contact_email ?? null,
+          created_at: (data as any).created_at ?? null,
+          updated_at: (data as any).updated_at ?? null,
         },
-      };
-    })
-  );
-
-  return enriched;
-}
-
-function nudgePriorityScoreV1(c: any) {
-  const overdue = Number(c?.action_counts?.overdue ?? 0);
-  const open = Number(c?.action_counts?.open ?? 0);
-
-  const healthScore = Number(c?.health?.score ?? 100);
-  const band = String(c?.health?.band ?? "");
-
-  const daysRaw = c?.health?.stats?.last_contacted_days;
-  const days = typeof daysRaw === "number" && Number.isFinite(daysRaw) ? daysRaw : null;
-
-  const next = (c?.health as any)?.next_action ?? null;
-  const severity = String((next as any)?.severity ?? "none");
-
-  // --- Weights (tuned for “feels right” sorting) ---
-  // 1) Overdue dominates (manager urgency)
-  // 2) Next-action severity matters (high/medium/low)
-  // 3) Staleness ramps after 7 days, ramps harder after 14+
-  // 4) Backlog (open actions) matters but should not eclipse overdue
-  // 5) Poor health nudges up, good health nudges down slightly
-
-  const bandW = band === "at_risk" ? 300 : band === "watch" ? 120 : 0;
-
-  const sevW =
-    severity === "high"
-      ? 400
-      : severity === "medium"
-        ? 180
-        : severity === "low"
-          ? 60
-          : 0;
-
-  const staleW = (() => {
-    // If never contacted/unknown, treat as stale.
-    if (days === null) return 240;
-    if (days <= 3) return 0;
-    if (days <= 7) return (days - 3) * 15; // 4..7 => 15..60
-    if (days <= 14) return 60 + (days - 7) * 25; // 8..14 => 85..235
-    return 235 + (days - 14) * 35; // 15+ ramps hard
-  })();
-
-  // Health delta: bad health increases priority, good health slightly decreases
-  const healthW = (100 - Math.max(0, Math.min(100, healthScore))) * 4;
-
-  // Backlog grows but with diminishing returns
-  const backlogW = Math.min(240, open * 35);
-
-  // Overdue is king
-  const overdueW = overdue * 900;
-
-  // Small boost if there's literally anything to do (prevents lots of ties)
-  const activityW = open > 0 ? 25 : 0;
-
-  const priority = overdueW + bandW + sevW + staleW + backlogW + healthW + activityW;
-
-  // Stable integer score for consistent sorts
-  return Math.max(0, Math.round(priority));
-}
-
-function shapeManagerNudgeV1(c: any) {
-  const contactId = String(c?.id ?? c?.contact_id ?? "").trim();
-
-  const name =
-    String(c?.name ?? "").trim() ||
-    [c?.first_name, c?.last_name].filter(Boolean).join(" ").trim() ||
-    "(no name)";
-
-  const email = c?.email ?? null;
-  const company = c?.company ?? null;
-
-  const actionCounts = {
-    open: Number(c?.action_counts?.open ?? 0),
-    overdue: Number(c?.action_counts?.overdue ?? 0),
-    completed: Number(c?.action_counts?.completed ?? 0),
-  };
-
-  // Always have a full, known-good health object to fall back to.
-  const fallbackHealth = computeContactHealthV1({
-    last_contacted_at: (c?.last_contacted_at ?? null) as any,
-    open_actions: actionCounts.open,
-    overdue_actions: actionCounts.overdue,
-    has_notes: Boolean(c?.health?.stats?.has_notes ?? c?.has_notes ?? false),
-    has_recent_call: Boolean(c?.health?.stats?.has_recent_call ?? c?.has_recent_call ?? false),
-  });
-
-  // Prefer enriched health if it looks like ours; otherwise use fallback.
-  const h =
-    c?.health &&
-    typeof c.health === "object" &&
-    (typeof (c.health as any).score === "number" || typeof (c.health as any).band === "string")
-      ? c.health
-      : fallbackHealth;
-
-  // Normalise next_action to strings everywhere (older code sometimes used an object).
-  const nextAny = (h as any)?.next_action ?? null;
-
-  const nextLabelRaw =
-    nextAny && typeof nextAny === "object"
-      ? String((nextAny as any).label ?? "")
-      : String(nextAny ?? "");
-
-  const nextTypeRaw =
-    nextAny && typeof nextAny === "object"
-      ? String((nextAny as any).type ?? "none")
-      : "none";
-
-  const nextSeverityRaw =
-    nextAny && typeof nextAny === "object"
-      ? String((nextAny as any).severity ?? "none")
-      : "none";
-
-  // If label is blank, fall back to our derived default label.
-  const fallbackNext: any = (fallbackHealth as any)?.next_action ?? null;
-  const next_action =
-    nextLabelRaw.trim() ||
-    String(fallbackNext?.label ?? "") ||
-    "Contact healthy";
-
-  const next_action_type =
-    nextTypeRaw.trim() ||
-    String(fallbackNext?.type ?? "none") ||
-    "none";
-
-  const next_action_severity =
-    nextSeverityRaw.trim() ||
-    String(fallbackNext?.severity ?? "none") ||
-    "none";
-
-  const score =
-    typeof (h as any)?.score === "number" && Number.isFinite((h as any).score)
-      ? (h as any).score
-      : fallbackHealth.score;
-
-  const band =
-    String((h as any)?.band ?? "").trim() ||
-    String(fallbackHealth.band ?? "").trim() ||
-    "healthy";
-
-  const reasons = Array.isArray((h as any)?.reasons)
-    ? (h as any).reasons
-    : fallbackHealth.reasons;
-
-  const stats =
-    (h as any)?.stats && typeof (h as any).stats === "object"
-      ? (h as any).stats
-      : fallbackHealth.stats;
-
-  const health = {
-    score,
-    band,
-    reasons,
-    stats,
-    next_action,
-    next_action_type,
-    next_action_severity,
-  };
-
-  const lastContactedAt = c?.last_contacted_at ?? null;
-  const createdAt = c?.created_at ?? null;
-
-  const priority = Number(c?.priority ?? c?.priority_score ?? nudgePriorityScoreV1(c) ?? 0);
-
-  return {
-    contact_id: contactId,
-    name,
-    email,
-    company,
-    priority,
-    health,
-    action_counts: actionCounts,
-    last_contacted_at: lastContactedAt,
-    created_at: createdAt,
-  };
-}
-
-// ------------------------------
-// MANAGER CONTACTS (v1)
-// GET /v1/crm/manager/contacts?filter=at-risk&limit=50
-// - Org-scoped (fail-closed via requireManagerOrg)
-// - Returns a list of contacts enriched with health + action counts
-// - Schema tolerant: crm_contacts may lack last_contacted_at; ownership may be user_id or requester_id
-// ------------------------------
-router.get("/manager/contacts", async (req, res) => {
-  try {
-    const { requester } = await requireManagerOrg(req);
-
-    const rawFilter = String((req.query as any)?.filter ?? "").trim().toLowerCase();
-    const filter = rawFilter || null; // 'at-risk' | null
-
-    const limit = Math.min(Math.max(Number((req.query as any)?.limit ?? 50), 1), 200);
-
-    const enriched = await fetchManagerContactsEnrichedV1({ requester, limit });
-
-    // ... rest of handler ...
-  } catch (e: any) {
-    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request", contacts: [] });
-  }
-});
-
-// ------------------------------
-// MANAGER NUDGES (v1)
-// GET /v1/crm/manager/nudges?limit=25
-// - Org-scoped by default (fail-closed), with local-dev bypass when x-org-id is all-zero UUID.
-// - Reuses manager contacts list, computes priority score, sorts, and returns a shaped list.
-// ------------------------------
-router.get("/manager/nudges", async (req, res) => {
-  try {
-    const { requester, orgId, bypassed } = await requireManagerOrg(req);
-
-    const limit = Math.min(Math.max(Number((req.query as any)?.limit ?? 25), 1), 200);
-
-    const enriched = await fetchManagerContactsEnrichedV1({ requester, limit });
-
-    const nudges = (enriched ?? [])
-      .map((c: any) => {
-        const shaped = shapeManagerNudgeV1(c);
-
-        // FINAL GUARD: never allow null health out of this endpoint.
-        // If anything upstream mutates health, we still return a real object.
-        if (!shaped.health || typeof shaped.health !== "object") {
-          const fallback = computeContactHealthV1({
-            last_contacted_at: shaped.last_contacted_at ?? null,
-            open_actions: Number(shaped.action_counts?.open ?? 0),
-            overdue_actions: Number(shaped.action_counts?.overdue ?? 0),
-            has_notes: false,
-            has_recent_call: false,
-          });
-
-          shaped.health = {
-            score: fallback.score,
-            band: fallback.band,
-            reasons: fallback.reasons,
-            stats: fallback.stats,
-            next_action: String((fallback as any)?.next_action?.label ?? "Contact healthy"),
-            next_action_type: String((fallback as any)?.next_action?.type ?? "none"),
-            next_action_severity: String((fallback as any)?.next_action?.severity ?? "none"),
-          } as any;
-        }
-
-        return shaped;
-      })
-      .sort((a: any, b: any) => Number(b?.priority ?? 0) - Number(a?.priority ?? 0))
-      .slice(0, limit);
-
-    return res.json({
-      ok: true,
-      org: { id: orgId, bypassed },
-      nudges,
-    });
-  } catch (e: any) {
-    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request", nudges: [] });
-  }
-});
-
-// ------------------------------
-// MANAGER CONTROL CENTRE (v1)
-// GET /v1/crm/manager/control-centre?days=7&limit=20
-// - Org-scoped by default via requireManagerOrg
-// - Best-effort analytics: never crash if tables/cols are missing
-// - Returns: reps_at_risk + headline counts to power the Manager dashboard
-// ------------------------------
-router.get("/manager/control-centre", async (req, res) => {
-  try {
-    const { requester, orgId, bypassed } = await requireManagerOrg(req);
-
-    const days = Math.min(Math.max(Number((req.query as any)?.days ?? 7), 1), 90);
-    const limit = Math.min(Math.max(Number((req.query as any)?.limit ?? 20), 1), 200);
-
-    const nowMs = Date.now();
-    const sinceIso = new Date(nowMs - days * 24 * 60 * 60 * 1000).toISOString();
-
-    // ------------------------------
-    // 1) Load reps (org-scoped when possible)
-    // ------------------------------
-    const reps: Array<{ id: string; name: string | null; email: string | null }> = [];
-
-    const tryFetchReps = async () => {
-      // Prefer org-scoped reps when org_id exists.
-      const selCandidates = [
-        "id, org_id, name, full_name, email",
-        "id, org_id, name, email",
-        "id, name, full_name, email",
-        "id, name, email",
-        "id, email",
-        "id",
-      ];
-
-      for (const sel of selCandidates) {
-        // 1) org-scoped attempt
-        try {
-          const r1 = await supa
-            .from("reps")
-            .select(sel)
-            .eq("org_id", orgId)
-            .order("created_at", { ascending: false })
-            .limit(200);
-
-          if (!r1.error) {
-            const rows = (r1.data as any[]) ?? [];
-            for (const row of rows) {
-              const id = String((row as any)?.id ?? "").trim();
-              if (!id) continue;
-              const nm = (row as any)?.full_name ?? (row as any)?.name ?? null;
-              reps.push({ id, name: nm ? String(nm) : null, email: (row as any)?.email ?? null });
-            }
-            return;
-          }
-
-          const msg = String((r1.error as any)?.message ?? "").toLowerCase();
-          if (
-            (msg.includes("column") && msg.includes("org_id") && msg.includes("does not exist")) ||
-            msg.includes("could not find")
-          ) {
-            // fall through to non-org select
-          } else if (msg.includes("relation") && msg.includes("does not exist")) {
-            // reps table missing
-            return;
-          }
-        } catch {
-          // fall through
-        }
-
-        // 2) non-org attempt (dev/local bypass mode)
-        try {
-          const r2 = await supa
-            .from("reps")
-            .select(sel)
-            .or(`id.eq.${requester},user_id.eq.${requester}`)
-            .limit(1);
-
-          if (!r2.error) {
-            const row = ((r2.data as any[]) ?? [])[0] ?? null;
-            if (row) {
-              const id = String((row as any)?.id ?? requester).trim() || requester;
-              const nm = (row as any)?.full_name ?? (row as any)?.name ?? null;
-              reps.push({ id, name: nm ? String(nm) : null, email: (row as any)?.email ?? null });
-            } else {
-              reps.push({ id: requester, name: null, email: null });
-            }
-            return;
-          }
-
-          const msg = String((r2.error as any)?.message ?? "").toLowerCase();
-          if (msg.includes("relation") && msg.includes("does not exist")) return;
-        } catch {
-          // ignore
-        }
-      }
-
-      // Absolute fallback
-      reps.push({ id: requester, name: null, email: null });
-    };
-
-    await tryFetchReps();
-
-    // ------------------------------
-    // 2) Per-rep action stats (best-effort)
-    // ------------------------------
-    const repStats: Array<{
-      rep_id: string;
-      name: string | null;
-      email: string | null;
-      open_actions: number;
-      overdue_actions: number;
-      completed_actions: number;
-      last_action_at: string | null;
-      risk_score: number;
-      risk_band: "healthy" | "watch" | "at_risk";
-      reason: string;
-    }> = [];
-
-    const safeNum = (v: any) => {
-      const n = Number(v);
-      return Number.isFinite(n) ? n : 0;
-    };
-
-    const riskBandFromScore = (s: number): "healthy" | "watch" | "at_risk" => {
-      if (s >= 300) return "at_risk";
-      if (s >= 120) return "watch";
-      return "healthy";
-    };
-
-    for (const rep of reps) {
-      let open = 0;
-      let overdue = 0;
-      let completed = 0;
-      let lastActionAt: string | null = null;
-
-      // Pull actions for the rep if possible. If `rep_id` column is missing, selectCrmActionsSafe will degrade.
-      try {
-        const r = await selectCrmActionsSafe({
-          requester,
-          repId: rep.id,
-          contactId: null,
-          status: null,
-          limit: 500,
-          orderByDue: false,
-        });
-
-        if ((r as any).ok) {
-          const rows = ((r as any).data ?? []) as any[];
-          const now = Date.now();
-
-          for (const a of rows) {
-            const completedAt = (a as any)?.completed_at ?? null;
-            const dueAt = (a as any)?.due_at ?? null;
-
-            const createdAt = (a as any)?.created_at ?? null;
-            if (createdAt) {
-              if (!lastActionAt) lastActionAt = String(createdAt);
-              else {
-                const t0 = new Date(lastActionAt).getTime();
-                const t1 = new Date(String(createdAt)).getTime();
-                if (Number.isFinite(t1) && (!Number.isFinite(t0) || t1 > t0)) lastActionAt = String(createdAt);
-              }
-            }
-
-            const isDone = !!completedAt || String((a as any)?.status ?? "").toLowerCase() === "done";
-            if (isDone) {
-              completed++;
-              continue;
-            }
-
-            open++;
-
-            if (dueAt) {
-              const dueMs = new Date(String(dueAt)).getTime();
-              if (Number.isFinite(dueMs) && dueMs < now) overdue++;
-            }
-          }
-        }
-      } catch {
-        // fail-soft
-      }
-
-      // Risk score (simple, tuned for manager urgency)
-      // - Overdue dominates
-      // - Backlog matters after 5 open
-      // - No recent activity is a warning
-      const daysSinceLast = (() => {
-        if (!lastActionAt) return null;
-        const t = new Date(lastActionAt).getTime();
-        if (!Number.isFinite(t)) return null;
-        const d = Math.floor((Date.now() - t) / (1000 * 60 * 60 * 24));
-        return d < 0 ? 0 : d;
-      })();
-
-      const backlogOver5 = Math.max(0, open - 5);
-      const staleW = daysSinceLast === null ? 80 : daysSinceLast >= 7 ? 120 : daysSinceLast >= 3 ? 40 : 0;
-
-      const riskScore = overdue * 180 + backlogOver5 * 20 + staleW;
-      const band = riskBandFromScore(riskScore);
-
-      const reasonParts: string[] = [];
-      if (overdue > 0) reasonParts.push(`${overdue} overdue`);
-      if (open > 0) reasonParts.push(`${open} open`);
-      if (daysSinceLast === null) reasonParts.push("no recent activity");
-      else if (daysSinceLast >= 7) reasonParts.push(`${daysSinceLast}d since last action`);
-
-      repStats.push({
-        rep_id: rep.id,
-        name: rep.name,
-        email: rep.email,
-        open_actions: safeNum(open),
-        overdue_actions: safeNum(overdue),
-        completed_actions: safeNum(completed),
-        last_action_at: lastActionAt,
-        risk_score: safeNum(riskScore),
-        risk_band: band,
-        reason: reasonParts.join(" · ") || "healthy",
       });
     }
 
-    // Sort full list by risk (highest first) so UI always has something meaningful
-    const reps_all = repStats
-      .slice()
-      .sort((a, b) => b.risk_score - a.risk_score)
-      .slice(0, limit);
+    // team scope => manager-only + org guard
+    const mgr = await requireManagerOrg(req);
+    const orgId = String((mgr as any)?.orgId ?? "").trim();
 
-    const reps_at_risk = reps_all.filter((r) => r.risk_band === "at_risk");
-    const reps_watch = reps_all.filter((r) => r.risk_band === "watch");
-    const reps_ok = reps_all.filter((r) => r.risk_band === "healthy");
+    const { data, error } = await supa.from("crm_opportunities").select(selectCols).eq("id", id).maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ ok: false, error: "not_found" });
 
-    const headline = {
-      reps_total: repStats.length,
-      reps_at_risk: repStats.filter((r) => r.risk_band === "at_risk").length,
-      reps_watch: repStats.filter((r) => r.risk_band === "watch").length,
-      overdue_actions_total: repStats.reduce((acc, r) => acc + r.overdue_actions, 0),
-      open_actions_total: repStats.reduce((acc, r) => acc + r.open_actions, 0),
-      window_days: days,
-      since: sinceIso,
-    };
+    const oppOrgId = String((data as any).org_id ?? "").trim();
+    const ownerId = String((data as any).user_id ?? "").trim();
+
+    // Validate owner is in org. Prefer explicit opp.org_id; otherwise validate via reps table.
+    if (orgId) {
+      if (oppOrgId) {
+        if (oppOrgId !== orgId) return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+      } else if (ownerId) {
+        const { data: repRow, error: repErr } = await supa.from("reps").select("id,org_id").eq("id", ownerId).maybeSingle();
+        if (repErr) throw repErr;
+        const repOrg = String((repRow as any)?.org_id ?? "").trim();
+        if (!repOrg || repOrg !== orgId) return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+      }
+    }
 
     return res.json({
       ok: true,
-      org: { id: orgId, bypassed },
-      headline,
-      reps_at_risk,
-      reps_watch,
-      reps_ok,
-      reps_all,
-      weakest_skill: null,
-      recurring_objection: null,
+      opportunity: {
+        id: (data as any).id,
+        name: (data as any).name ?? (data as any).title ?? null,
+        stage: (data as any).stage ?? null,
+        amount: (data as any).amount ?? (data as any).value ?? null,
+        currency: (data as any).currency ?? null,
+        close_date: (data as any).close_date ?? null,
+        account_id: (data as any).account_id ?? null,
+        contact_id: (data as any).contact_id ?? null,
+        account_name: (data as any).account_name ?? null,
+        contact_email: (data as any).contact_email ?? null,
+        created_at: (data as any).created_at ?? null,
+        updated_at: (data as any).updated_at ?? null,
+      },
     });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+    if (msg === "forbidden_not_manager") return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    return res.status(500).json({ ok: false, error: e?.message ?? "opportunity_fetch_failed" });
+  }
+});
+
+/* ---------------------------------------------
+   PATCH /v1/crm/opportunities/:id
+   Query:
+     - scope=mine|team (default mine)
+
+   Allows editing v1:
+     - name, stage, amount, currency, close_date
+---------------------------------------------- */
+const PatchOpportunitySchema = z.object({
+  name: z.string().trim().min(1).max(200).optional(),
+  stage: z.string().trim().min(1).max(80).optional(),
+  amount: z.number().finite().nonnegative().optional(),
+  currency: z.string().trim().min(1).max(8).optional(),
+  close_date: z.string().trim().min(1).nullable().optional(),
+});
+
+router.patch("/opportunities/:id", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const id = String((req.params as any)?.id ?? "").trim();
+    if (!id || !UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
+
+    const scopeRaw = String((req.query as any)?.scope ?? "mine").trim().toLowerCase();
+    const scope = scopeRaw === "team" ? "team" : "mine";
+
+    const body = PatchOpportunitySchema.parse(req.body ?? {});
+    const patch: any = {};
+
+    if (typeof body.name === "string") {
+      patch.name = body.name;
+      patch.title = body.name; // keep compat
+    }
+    if (typeof body.stage === "string") patch.stage = body.stage;
+    if (typeof body.amount === "number") {
+      patch.amount = body.amount;
+      patch.value = body.amount;
+    }
+    if (typeof body.currency === "string") patch.currency = body.currency;
+    if (body.close_date === null) patch.close_date = null;
+    if (typeof body.close_date === "string") patch.close_date = body.close_date;
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ ok: false, error: "no_changes" });
+    }
+
+    const selectCols =
+      "id,user_id,org_id,name,title,stage,amount,value,currency,close_date,account_id,contact_id,account_name,contact_email,created_at,updated_at";
+
+    if (scope === "mine") {
+      const { data, error } = await supa
+        .from("crm_opportunities")
+        .update(patch)
+        .eq("id", id)
+        .eq("user_id", requester)
+        .select(selectCols)
+        .maybeSingle();
+
+      if (error) throw error;
+      if (!data) return res.status(404).json({ ok: false, error: "not_found" });
+
+      return res.json({
+        ok: true,
+        opportunity: {
+          id: (data as any).id,
+          name: (data as any).name ?? (data as any).title ?? null,
+          stage: (data as any).stage ?? null,
+          amount: (data as any).amount ?? (data as any).value ?? null,
+          currency: (data as any).currency ?? null,
+          close_date: (data as any).close_date ?? null,
+          account_id: (data as any).account_id ?? null,
+          contact_id: (data as any).contact_id ?? null,
+          account_name: (data as any).account_name ?? null,
+          contact_email: (data as any).contact_email ?? null,
+          created_at: (data as any).created_at ?? null,
+          updated_at: (data as any).updated_at ?? null,
+        },
+      });
+    }
+
+    // team scope => manager-only + org guard
+    const mgr = await requireManagerOrg(req);
+    const orgId = String((mgr as any)?.orgId ?? "").trim();
+
+    // validate opp belongs to org
+    const { data: existing, error: exErr } = await supa.from("crm_opportunities").select("id,user_id,org_id").eq("id", id).maybeSingle();
+    if (exErr) throw exErr;
+    if (!existing) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const oppOrgId = String((existing as any).org_id ?? "").trim();
+    const ownerId = String((existing as any).user_id ?? "").trim();
+
+    if (orgId) {
+      if (oppOrgId) {
+        if (oppOrgId !== orgId) return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+      } else if (ownerId) {
+        const { data: repRow, error: repErr } = await supa.from("reps").select("id,org_id").eq("id", ownerId).maybeSingle();
+        if (repErr) throw repErr;
+        const repOrg = String((repRow as any)?.org_id ?? "").trim();
+        if (!repOrg || repOrg !== orgId) return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+      }
+    }
+
+    const { data, error } = await supa.from("crm_opportunities").update(patch).eq("id", id).select(selectCols).maybeSingle();
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      opportunity: {
+        id: (data as any)?.id ?? id,
+        name: (data as any)?.name ?? (data as any)?.title ?? null,
+        stage: (data as any)?.stage ?? null,
+        amount: (data as any)?.amount ?? (data as any)?.value ?? null,
+        currency: (data as any)?.currency ?? null,
+        close_date: (data as any)?.close_date ?? null,
+        account_id: (data as any)?.account_id ?? null,
+        contact_id: (data as any)?.contact_id ?? null,
+        account_name: (data as any)?.account_name ?? null,
+        contact_email: (data as any)?.contact_email ?? null,
+        created_at: (data as any)?.created_at ?? null,
+        updated_at: (data as any)?.updated_at ?? null,
+      },
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "");
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+    if (msg === "forbidden_not_manager") return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+
+/* ---------------------------------------------
+   LIGHTWEIGHT CREATE ENDPOINTS (v1)
+
+   POST /v1/crm/contacts
+   Body: { email: string, first_name?: string, last_name?: string, company?: string }
+   - Creates or finds a contact scoped to requester by email.
+
+   POST /v1/crm/accounts
+   Body: { name: string }
+   - Creates or finds an account scoped to requester by name.
+
+   Notes:
+   - Minimal for MVP quick-create flows.
+   - Clear errors when tables missing.
+---------------------------------------------- */
+
+const CreateContactSchema = z.object({
+  email: z.string().email().transform((s) => s.toLowerCase().trim()),
+  first_name: z.string().trim().min(1).max(120).optional(),
+  last_name: z.string().trim().min(1).max(120).optional(),
+  company: z.string().trim().min(1).max(200).optional(),
+});
+
+router.post("/contacts", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const body = CreateContactSchema.parse(req.body ?? {});
+
+    // 1) Find existing by (user_id + email)
+    const ex = await supa
+      .from("crm_contacts")
+      .select("id, first_name, last_name, email, company, created_at")
+      .eq("user_id", requester)
+      .eq("email", body.email)
+      .limit(1)
+      .maybeSingle();
+
+    if (ex.error) {
+      const msg = String((ex.error as any)?.message ?? "").toLowerCase();
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_contacts_table_missing" });
+      }
+      return res.status(500).json({ ok: false, error: (ex.error as any)?.message ?? "contact_lookup_failed" });
+    }
+
+    if (ex.data) {
+      return res.json({ ok: true, contact: ex.data, created: false });
+    }
+
+    // 2) Insert new contact
+    const payload: any = {
+      user_id: requester,
+      email: body.email,
+      ...(body.first_name ? { first_name: body.first_name } : {}),
+      ...(body.last_name ? { last_name: body.last_name } : {}),
+      ...(body.company ? { company: body.company } : {}),
+    };
+
+    const ins = await supa
+      .from("crm_contacts")
+      .insert(payload)
+      .select("id, first_name, last_name, email, company, created_at")
+      .maybeSingle();
+
+    if (ins.error) {
+      const msg = String((ins.error as any)?.message ?? "").toLowerCase();
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_contacts_table_missing" });
+      }
+      return res.status(500).json({ ok: false, error: (ins.error as any)?.message ?? "contact_create_failed" });
+    }
+
+    return res.json({ ok: true, contact: ins.data, created: true });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+const CreateAccountSchema = z.object({
+  name: z.string().trim().min(1).max(200),
+});
+
+router.post("/accounts", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const body = CreateAccountSchema.parse(req.body ?? {});
+    const nameNorm = body.name.trim();
+
+    // 1) Find existing by (user_id + name)
+    const ex = await supa
+      .from("crm_accounts")
+      .select("id, name, created_at")
+      .eq("user_id", requester)
+      .eq("name", nameNorm)
+      .limit(1)
+      .maybeSingle();
+
+    if (ex.error) {
+      const msg = String((ex.error as any)?.message ?? "").toLowerCase();
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_accounts_table_missing" });
+      }
+      return res.status(500).json({ ok: false, error: (ex.error as any)?.message ?? "account_lookup_failed" });
+    }
+
+    if (ex.data) {
+      return res.json({ ok: true, account: ex.data, created: false });
+    }
+
+    // 2) Insert new account
+    const ins = await supa
+      .from("crm_accounts")
+      .insert({ user_id: requester, name: nameNorm })
+      .select("id, name, created_at")
+      .maybeSingle();
+
+    if (ins.error) {
+      const msg = String((ins.error as any)?.message ?? "").toLowerCase();
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_accounts_table_missing" });
+      }
+      return res.status(500).json({ ok: false, error: (ins.error as any)?.message ?? "account_create_failed" });
+    }
+
+    return res.json({ ok: true, account: ins.data, created: true });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+/* ---------------------------------------------
+   QUICK CREATE (v1)
+   - Contact / Account
+   - Re-usable from anywhere (call page, pipeline, etc.)
+---------------------------------------------- */
+
+const CreateContactSchemaV2 = z.object({
+  email: z.string().email().transform((s) => s.toLowerCase().trim()),
+  first_name: z.string().trim().min(1).max(120).optional().nullable(),
+  last_name: z.string().trim().min(1).max(120).optional().nullable(),
+  company: z.string().trim().min(1).max(160).optional().nullable(),
+});
+
+// POST /v1/crm/contacts/create
+router.post("/contacts/create", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const body = CreateContactSchemaV2.parse(req.body ?? {});
+
+    const email = body.email;
+
+    // 1) Try scoped lookup (user_id + email)
+    const scoped = await supa
+      .from("crm_contacts")
+      .select("id, user_id, email, first_name, last_name, company")
+      .eq("user_id", requester)
+      .eq("email", email)
+      .maybeSingle();
+
+    if (!scoped.error && scoped.data) {
+      return res.json({ ok: true, contact: scoped.data, created: false });
+    }
+
+    // 2) Insert new
+    const ins = await supa
+      .from("crm_contacts")
+      .insert({
+        user_id: requester,
+        email,
+        first_name: body.first_name ?? null,
+        last_name: body.last_name ?? null,
+        company: body.company ?? null,
+      })
+      .select("id, user_id, email, first_name, last_name, company")
+      .single();
+
+    if (!ins.error && ins.data) {
+      return res.json({ ok: true, contact: ins.data, created: true });
+    }
+
+    // 3) Fallback: email may be globally unique — fetch by email and validate ownership
+    const ex = await supa
+      .from("crm_contacts")
+      .select("id, user_id, email, first_name, last_name, company")
+      .eq("email", email)
+      .maybeSingle();
+
+    if (ex.error) {
+      return res.status(500).json({ ok: false, error: (ex.error as any)?.message ?? "contact_lookup_failed" });
+    }
+
+    if (!ex.data) {
+      return res.status(500).json({ ok: false, error: (ins.error as any)?.message ?? "contact_create_failed" });
+    }
+
+    if (String((ex.data as any).user_id ?? "") !== requester) {
+      return res.status(409).json({ ok: false, error: "email_owned_by_other_user" });
+    }
+
+    return res.json({ ok: true, contact: ex.data, created: false });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+const CreateAccountSchemaV2 = z.object({
+  name: z.string().trim().min(1).max(160),
+  domain: z.string().trim().min(1).max(160).optional().nullable(),
+});
+
+// POST /v1/crm/accounts/create
+router.post("/accounts/create", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const body = CreateAccountSchemaV2.parse(req.body ?? {});
+
+    // Best-effort: if you later add unique (user_id, domain) or (user_id, name), we can upsert.
+    // For now: create + return.
+    const ins = await supa
+      .from("crm_accounts")
+      .insert({
+        user_id: requester,
+        name: body.name,
+        domain: body.domain ?? null,
+      })
+      .select("id, name, domain")
+      .single();
+
+    if (ins.error) {
+      const msg = String((ins.error as any)?.message ?? "").toLowerCase();
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_accounts_table_missing" });
+      }
+      return res.status(500).json({ ok: false, error: (ins.error as any)?.message ?? "account_create_failed" });
+    }
+
+    return res.json({ ok: true, account: ins.data, created: true });
   } catch (e: any) {
     return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
   }
