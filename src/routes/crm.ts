@@ -2163,6 +2163,235 @@ router.get("/reps/:id/coaching-history", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------
+// DAY 53 — CRM ANALYTICS
+// Live metrics for dashboards
+// ---------------------------------------------------------
+
+// GET /v1/crm/analytics/summary?days=30&repId=
+router.get("/analytics/summary", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
+    const repIdRaw = String(req.query.repId ?? "").trim();
+    const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
+
+    const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+
+    let oppsQ = supa
+      .from("crm_opportunities")
+      .select("id,stage,amount,created_at,user_id")
+      .gte("created_at", sinceIso);
+
+    let activitiesQ = supa
+      .from("crm_activities")
+      .select("id,status,created_at,user_id")
+      .gte("created_at", sinceIso);
+
+    let callsQ = supa
+      .from("calls")
+      .select("score_overall,created_at,user_id")
+      .gte("created_at", sinceIso);
+
+    if (repId) {
+      oppsQ = oppsQ.eq("user_id", repId);
+      activitiesQ = activitiesQ.eq("user_id", repId);
+      callsQ = callsQ.eq("user_id", repId);
+    }
+
+    const opps = await oppsQ;
+    const activities = await activitiesQ;
+    const calls = await callsQ;
+
+    const oppRows = opps.data ?? [];
+    const actRows = activities.data ?? [];
+    const callRows = calls.data ?? [];
+
+    const won = oppRows.filter((o: any) => String(o.stage) === "won").length;
+    const totalOpps = oppRows.length;
+    const conversion = totalOpps ? Math.round((won / totalOpps) * 100) : 0;
+
+    const avgScore = callRows.length
+      ? Math.round(callRows.reduce((a: any, b: any) => a + Number(b.score_overall || 0), 0) / callRows.length)
+      : null;
+
+    const tasksCompleted = actRows.filter((a: any) => a.status === "done").length;
+
+    return res.json({
+      ok: true,
+      scope: repId ? "rep" : "team",
+      rep_id: repId,
+      requester_id: requester,
+      opportunities: totalOpps,
+      won,
+      conversion_rate: conversion,
+      avg_score: avgScore,
+      activities_created: actRows.length,
+      tasks_completed: tasksCompleted,
+    });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "analytics_summary_failed" });
+  }
+});
+
+
+// GET /v1/crm/analytics/stage-conversion
+router.get("/analytics/stage-conversion", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
+    const repIdRaw = String(req.query.repId ?? "").trim();
+    const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
+
+    const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+
+    let q = supa
+      .from("crm_opportunities")
+      .select("stage,amount,created_at,user_id")
+      .gte("created_at", sinceIso);
+
+    if (repId) q = q.eq("user_id", repId);
+
+    const r = await q;
+    const rows = r.data ?? [];
+
+    const stages: Record<string, number> = {};
+
+    rows.forEach((o: any) => {
+      const s = String(o.stage ?? "new");
+      stages[s] = (stages[s] ?? 0) + 1;
+    });
+
+    return res.json({
+      ok: true,
+      scope: repId ? "rep" : "team",
+      rep_id: repId,
+      requester_id: requester,
+      stages,
+    });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "stage_conversion_failed" });
+  }
+});
+
+
+// GET /v1/crm/analytics/score-trend
+router.get("/analytics/score-trend", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
+    const repIdRaw = String(req.query.repId ?? "").trim();
+    const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
+
+    const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+
+    let q = supa
+      .from("calls")
+      .select("score_overall,created_at,user_id")
+      .gte("created_at", sinceIso)
+      .order("created_at", { ascending: true });
+
+    if (repId) q = q.eq("user_id", repId);
+
+    const r = await q;
+    const rows = r.data ?? [];
+
+    const buckets: Record<string, { total: number; count: number }> = {};
+
+    rows.forEach((c: any) => {
+      const d = String(c.created_at).slice(0, 10);
+      if (!buckets[d]) buckets[d] = { total: 0, count: 0 };
+      buckets[d].total += Number(c.score_overall || 0);
+      buckets[d].count += 1;
+    });
+
+    const trend = Object.entries(buckets).map(([date, v]) => ({
+      date,
+      avg_score: Math.round(v.total / v.count),
+    }));
+
+    return res.json({
+      ok: true,
+      scope: repId ? "rep" : "team",
+      rep_id: repId,
+      requester_id: requester,
+      trend,
+    });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "score_trend_failed" });
+  }
+});
+
+
+// GET /v1/crm/analytics/activity-by-rep
+router.get("/analytics/activity-by-rep", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
+    const repIdRaw = String(req.query.repId ?? "").trim();
+    const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
+
+    const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+
+    let q = supa
+      .from("crm_activities")
+      .select("user_id,status,created_at")
+      .gte("created_at", sinceIso);
+
+    if (repId) q = q.eq("user_id", repId);
+
+    const r = await q;
+    const rows = r.data ?? [];
+
+    const reps: Record<string, { created: number; completed: number }> = {};
+
+    rows.forEach((a: any) => {
+      const uid = String(a.user_id);
+      if (!reps[uid]) reps[uid] = { created: 0, completed: 0 };
+      reps[uid].created += 1;
+      if (a.status === "done") reps[uid].completed += 1;
+    });
+
+    const repIds = Object.keys(reps);
+
+    // Fetch rep names (best-effort) from auth.users
+    let userMap: Record<string, string> = {};
+
+    if (repIds.length) {
+      try {
+        const users = await supa
+          .from("auth.users")
+          .select("id,email")
+          .in("id", repIds);
+
+        (users.data ?? []).forEach((u: any) => {
+          userMap[String(u.id)] = u.email;
+        });
+      } catch {
+        // fail-soft if auth.users not accessible
+      }
+    }
+
+    const result = Object.entries(reps).map(([rep_id, v]) => ({
+      rep_id,
+      rep_name: userMap[rep_id] ?? rep_id,
+      activities_created: v.created,
+      activities_completed: v.completed,
+    }));
+
+    return res.json({
+      ok: true,
+      scope: repId ? "rep" : "team",
+      rep_id: repId,
+      requester_id: requester,
+      reps: result,
+    });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "activity_by_rep_failed" });
+  }
+});
+
 /** ----------------------------------------------------------------
  * Contact AI Brief (heuristic for now)
  * GET /v1/crm/contacts/:id/ai-brief
