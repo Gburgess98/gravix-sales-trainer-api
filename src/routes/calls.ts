@@ -114,12 +114,12 @@ router.post("/", async (req, res) => {
           },
           ...(data?.id
             ? [
-                {
-                  type: "button",
-                  text: { type: "plain_text", text: "Open This Call" },
-                  url: callLink,
-                } as const,
-              ]
+              {
+                type: "button",
+                text: { type: "plain_text", text: "Open This Call" },
+                url: callLink,
+              } as const,
+            ]
             : []),
         ],
       },
@@ -415,6 +415,98 @@ router.post("/:id/score", async (req, res) => {
     if (histErr) {
       // don't fail the whole request for history insert
       console.warn("[score history] insert failed", histErr);
+    }
+
+    // ---------------------------------------------------------
+    // DAY 52 — AUTO COACHING TRIGGERS
+    // Detect weak close / objection and auto-create CRM tasks
+    // Future-safe: include coaching_reason metadata when schema supports it
+    // ---------------------------------------------------------
+    try {
+      const rubric: any = body.rubric ?? {};
+
+      const closeScore = typeof rubric?.close === "number" ? rubric.close : null;
+      const objectionScore = typeof rubric?.objection === "number" ? rubric.objection : null;
+
+      const due = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
+
+      const ensureCoachingTask = async (args: {
+        title: string;
+        reason: "weak_close" | "objection_handling";
+      }) => {
+        const { title, reason } = args;
+
+        // Prevent duplicate open coaching tasks for the same reason/title
+        const existingTask = await supa
+          .from("crm_activities")
+          .select("id")
+          .eq("user_id", requester)
+          .eq("title", title)
+          .eq("status", "open")
+          .limit(1)
+          .maybeSingle();
+
+        if (existingTask.data) return;
+
+        const payloadWithMeta: any = {
+          type: "task",
+          title,
+          status: "open",
+          due_at: due,
+          user_id: requester,
+          opportunity_id: null,
+          contact_id: null,
+          account_id: null,
+          meta: {
+            coaching_reason: reason,
+            source: "call_score",
+            source_call_id: id,
+          },
+        };
+
+        const insertWithMeta = await supa.from("crm_activities").insert(payloadWithMeta);
+        if (!insertWithMeta.error) return;
+
+        const metaErr = String((insertWithMeta.error as any)?.message ?? "").toLowerCase();
+
+        // Backwards-compatible fallback if meta column does not exist yet
+        if (metaErr.includes("column") && metaErr.includes("meta")) {
+          const payloadNoMeta = {
+            type: "task",
+            title,
+            status: "open",
+            due_at: due,
+            user_id: requester,
+            opportunity_id: null,
+            contact_id: null,
+            account_id: null,
+          };
+
+          const retry = await supa.from("crm_activities").insert(payloadNoMeta);
+          if (retry.error) throw retry.error;
+          return;
+        }
+
+        throw insertWithMeta.error;
+      };
+
+      // Weak close trigger
+      if (closeScore !== null && closeScore < 60) {
+        await ensureCoachingTask({
+          title: "Review and strengthen close before next call",
+          reason: "weak_close",
+        });
+      }
+
+      // Weak objection handling trigger
+      if (objectionScore !== null && objectionScore < 60) {
+        await ensureCoachingTask({
+          title: "Practise objection handling before next follow-up",
+          reason: "objection_handling",
+        });
+      }
+    } catch (coachErr) {
+      console.warn("[coaching auto-task] failed", coachErr);
     }
 
     res.json({

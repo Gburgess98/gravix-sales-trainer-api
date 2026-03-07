@@ -1988,6 +1988,181 @@ router.post("/activities/:id/complete", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------
+// DAY 52 — COACHING NUDGES (auto task creation)
+// ---------------------------------------------------------
+
+async function createCoachingTask(args: {
+  userId: string;
+  weakness: "weak_close" | "objection_handling";
+  opportunityId?: string | null;
+  contactId?: string | null;
+  accountId?: string | null;
+}) {
+  const { userId, weakness, opportunityId, contactId, accountId } = args;
+
+  let title = "";
+
+  if (weakness === "weak_close") {
+    title = "Review and strengthen close before next call";
+  }
+
+  if (weakness === "objection_handling") {
+    title = "Practise objection handling before next follow‑up";
+  }
+
+  const payload: any = {
+    user_id: userId,
+    type: "task",
+    title,
+    status: "open",
+    due_at: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString(),
+    opportunity_id: opportunityId ?? null,
+    contact_id: contactId ?? null,
+    account_id: accountId ?? null,
+  };
+
+  const r = await supa.from("crm_activities").insert(payload);
+
+  if (r.error) {
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+
+    if (msg.includes("relation") && msg.includes("does not exist")) {
+      return { ok: false, reason: "crm_activities_table_missing" };
+    }
+
+    return { ok: false, reason: "activity_create_failed" };
+  }
+
+  return { ok: true };
+}
+
+const CoachingNudgeSchema = z.object({
+  weakness: z.enum(["weak_close", "objection_handling"]),
+  opportunity_id: z.string().uuid().optional().nullable(),
+  contact_id: z.string().uuid().optional().nullable(),
+  account_id: z.string().uuid().optional().nullable(),
+});
+
+// POST /v1/crm/coaching/nudges
+// Manual endpoint for creating coaching tasks based on detected weaknesses
+router.post("/coaching/nudges", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    const body = CoachingNudgeSchema.parse(req.body ?? {});
+
+    const r = await createCoachingTask({
+      userId: requester,
+      weakness: body.weakness,
+      opportunityId: body.opportunity_id ?? null,
+      contactId: body.contact_id ?? null,
+      accountId: body.account_id ?? null,
+    });
+
+    if (!r.ok) {
+      return res.status(500).json({ ok: false, error: r.reason });
+    }
+
+    return res.json({ ok: true, created: true });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
+// ---------------------------------------------------------
+// DAY 52 — REP COACHING HISTORY (manager insight)
+// ---------------------------------------------------------
+
+// GET /v1/crm/reps/:id/coaching-history
+// Returns lightweight coaching metrics for a rep
+router.get("/reps/:id/coaching-history", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const repId = String(req.params.id ?? "").trim();
+
+    if (!UUID_RE.test(repId)) {
+      return res.status(400).json({ ok: false, error: "invalid_rep_id" });
+    }
+
+    // Manager guard (same pattern used in pipeline team scope)
+    const okManager = await isManagerUser(requester);
+    if (!okManager && requester !== repId) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    }
+
+    // -------------------------------------------------
+    // Fetch tasks created for this rep
+    // -------------------------------------------------
+
+    const tasksRes = await supa
+      .from("crm_activities")
+      .select("id,status,title,created_at")
+      .eq("user_id", repId)
+      .eq("type", "task")
+      .limit(500);
+
+    const tasks = tasksRes.data ?? [];
+
+    const coachingTasks = tasks.filter((t: any) =>
+      String(t.title || "").toLowerCase().includes("close") ||
+      String(t.title || "").toLowerCase().includes("objection")
+    );
+
+    const completedTasks = coachingTasks.filter((t: any) => t.status === "done");
+
+    // -------------------------------------------------
+    // Fetch call scoring trend (best-effort)
+    // -------------------------------------------------
+
+    let avgScore: number | null = null;
+    let callCount = 0;
+
+    try {
+      const scores = await supa
+        .from("call_scores")
+        .select("total_score")
+        .eq("user_id", repId)
+        .limit(200);
+
+      const rows = scores.data ?? [];
+
+      if (rows.length) {
+        callCount = rows.length;
+        const sum = rows.reduce((acc: number, r: any) => acc + Number(r.total_score || 0), 0);
+        avgScore = Math.round(sum / rows.length);
+      }
+    } catch {
+      // fail-soft if table missing
+    }
+
+    // -------------------------------------------------
+    // Weakness detection counts
+    // -------------------------------------------------
+
+    const weakCloseEvents = coachingTasks.filter((t: any) =>
+      String(t.title || "").toLowerCase().includes("close")
+    ).length;
+
+    const objectionEvents = coachingTasks.filter((t: any) =>
+      String(t.title || "").toLowerCase().includes("objection")
+    ).length;
+
+    return res.json({
+      ok: true,
+      rep_id: repId,
+      calls_reviewed: callCount,
+      avg_score: avgScore,
+      coaching_tasks_created: coachingTasks.length,
+      completed_tasks: completedTasks.length,
+      weak_close_events: weakCloseEvents,
+      objection_events: objectionEvents
+    });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
 /** ----------------------------------------------------------------
  * Contact AI Brief (heuristic for now)
  * GET /v1/crm/contacts/:id/ai-brief
