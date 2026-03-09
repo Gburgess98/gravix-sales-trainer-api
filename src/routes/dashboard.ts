@@ -27,6 +27,41 @@ function isoDaysAgo(days: number) {
   return d.toISOString();
 }
 
+function parseVoiceScoreFromRubric(rubric: any): number | null {
+  if (!rubric) return null;
+
+  const direct = Number((rubric as any)?.voice_score);
+  if (Number.isFinite(direct)) return direct;
+
+  const nestedDirect = Number((rubric as any)?.voiceScore);
+  if (Number.isFinite(nestedDirect)) return nestedDirect;
+
+  const vr = (rubric as any)?.voice_rubric ?? (rubric as any)?.voiceRubric ?? null;
+  if (vr && typeof vr === 'object') {
+    const tone = Number((vr as any)?.tone);
+    const clarity = Number((vr as any)?.clarity);
+    const confidence = Number((vr as any)?.confidence);
+    const filler = Number((vr as any)?.filler);
+    const close = Number((vr as any)?.close);
+
+    const vals = [tone, clarity, confidence, filler, close].filter(Number.isFinite);
+    if (vals.length) {
+      const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+      return Math.round(avg);
+    }
+  }
+
+  return null;
+}
+
+function safeDay(value: string | null | undefined): string | null {
+  const s = String(value || '').trim();
+  if (!s) return null;
+  const d = new Date(s);
+  if (!Number.isFinite(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+}
+
 // ---- GET /v1/dashboard/kpis ----
 // Returns compact KPI payload for CRM Overview cards + sparklines
 router.get('/kpis', async (req, res) => {
@@ -396,6 +431,162 @@ router.get('/rep-summary', async (req, res) => {
   } catch (err: any) {
     console.error('GET /v1/dashboard/rep-summary error:', err);
     res.status(500).json({ ok: false, error: err?.message || 'rep_summary_failed' });
+  }
+});
+
+// ---- GET /v1/dashboard/voice-score-summary ----
+// Query params: days=30&repId=<uuid>
+router.get('/voice-score-summary', async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Supabase not configured');
+
+    const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? '30'), 10) || 30));
+    const since = isoDaysAgo(days);
+    const orgId = (req.query.orgId ? String(req.query.orgId) : '').trim();
+    const repIdRaw = String(req.query.repId ?? '').trim();
+    const repId = repIdRaw || null;
+
+    let q = supabase
+      .from('call_scores')
+      .select('call_id, user_id, created_at, rubric')
+      .gte('created_at', since)
+      .order('created_at', { ascending: false })
+      .limit(10000);
+
+    if (repId) q = q.eq('user_id', repId);
+
+    const { data: scoreRows, error: scoreErr } = await q;
+    if (scoreErr) throw scoreErr;
+
+    const rows = (scoreRows || []) as any[];
+
+    let latest_voice_score: number | null = null;
+    let latest_close_strength: number | null = null;
+    let fillerDensitySum = 0;
+    let fillerDensityCount = 0;
+    let callsReviewedThisWeek = 0;
+
+    const weekCutoff = isoDaysAgo(7);
+
+    for (const row of rows) {
+      const rubric = row?.rubric ?? null;
+      const voiceScore = parseVoiceScoreFromRubric(rubric);
+
+      if (latest_voice_score === null && Number.isFinite(voiceScore as number)) {
+        latest_voice_score = Number(voiceScore);
+      }
+
+      const closeStrength = Number(
+        (rubric as any)?.voice_rubric?.close ??
+        (rubric as any)?.voiceRubric?.close ??
+        (rubric as any)?.close
+      );
+      if (latest_close_strength === null && Number.isFinite(closeStrength)) {
+        latest_close_strength = Math.round(closeStrength);
+      }
+
+      const fillerDensity = Number(
+        (rubric as any)?.review_tags?.filler_density ??
+        (rubric as any)?.reviewTags?.filler_density ??
+        (rubric as any)?.review_tags?.fillerDensity ??
+        (rubric as any)?.reviewTags?.fillerDensity
+      );
+      if (Number.isFinite(fillerDensity)) {
+        fillerDensitySum += fillerDensity;
+        fillerDensityCount += 1;
+      }
+
+      const createdAt = String(row?.created_at || '');
+      if (createdAt && createdAt >= weekCutoff) {
+        callsReviewedThisWeek += 1;
+      }
+    }
+
+    const average_filler_trend = fillerDensityCount
+      ? Number((fillerDensitySum / fillerDensityCount).toFixed(4))
+      : null;
+
+    res.set('Cache-Control', 'public, max-age=15');
+    return res.json({
+      ok: true,
+      scope: repId ? 'rep' : 'team',
+      rep_id: repId,
+      org_id: orgId || null,
+      latest_voice_score,
+      average_filler_trend,
+      latest_close_strength,
+      calls_reviewed_this_week: callsReviewedThisWeek,
+      since,
+    });
+  } catch (err: any) {
+    console.error('GET /v1/dashboard/voice-score-summary error:', err);
+    return res.status(500).json({ ok: false, error: err?.message || 'voice_score_summary_failed' });
+  }
+});
+
+// ---- GET /v1/dashboard/voice-score-trend ----
+// Query params: days=30&repId=<uuid>
+router.get('/voice-score-trend', async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Supabase not configured');
+
+    const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? '30'), 10) || 30));
+    const since = isoDaysAgo(days);
+    const orgId = (req.query.orgId ? String(req.query.orgId) : '').trim();
+    const repIdRaw = String(req.query.repId ?? '').trim();
+    const repId = repIdRaw || null;
+
+    // Prefer snapshots from call_scores because Day 55 writes voice data there even if
+    // dedicated columns do not exist on calls yet.
+    let q = supabase
+      .from('call_scores')
+      .select('call_id, user_id, created_at, rubric')
+      .gte('created_at', since)
+      .order('created_at', { ascending: true })
+      .limit(10000);
+
+    if (repId) q = q.eq('user_id', repId);
+
+    const { data: scoreRows, error: scoreErr } = await q;
+    if (scoreErr) throw scoreErr;
+
+    const dayAgg: Record<string, { total: number; count: number }> = {};
+
+    for (const row of scoreRows || []) {
+      const rubric = (row as any)?.rubric;
+      const voiceScore = parseVoiceScoreFromRubric(rubric);
+      if (!Number.isFinite(voiceScore as number)) continue;
+
+      const day = safeDay((row as any)?.created_at);
+      if (!day) continue;
+
+      if (!dayAgg[day]) dayAgg[day] = { total: 0, count: 0 };
+      dayAgg[day].total += Number(voiceScore);
+      dayAgg[day].count += 1;
+    }
+
+    const trend = Object.keys(dayAgg)
+      .sort()
+      .map((date) => ({
+        date,
+        voice_score: Math.round(dayAgg[date].total / dayAgg[date].count),
+      }));
+
+    const latest_avg = trend.length ? trend[trend.length - 1].voice_score : null;
+
+    res.set('Cache-Control', 'public, max-age=15');
+    return res.json({
+      ok: true,
+      scope: repId ? 'rep' : 'team',
+      rep_id: repId,
+      org_id: orgId || null,
+      trend,
+      latest_avg,
+      since,
+    });
+  } catch (err: any) {
+    console.error('GET /v1/dashboard/voice-score-trend error:', err);
+    return res.status(500).json({ ok: false, error: err?.message || 'voice_score_trend_failed' });
   }
 });
 

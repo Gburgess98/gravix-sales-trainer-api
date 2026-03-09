@@ -25,6 +25,7 @@ const CreateCallSchema = z.object({
 const ScoreSchema = z.object({
   score_overall: z.number().min(0).max(100),
   rubric: z.any().optional(),
+  transcript_text: z.string().optional(),
   // Optional: if the client launched this score action from an assignment CTA (used for auto-complete)
   assignmentId: z.string().uuid().optional(),
 });
@@ -50,6 +51,112 @@ function getUserIdHeader(req: any): string {
     throw new Error("Missing or invalid x-user-id");
   }
   return uid;
+}
+
+const FILLER_WORDS = [
+  "um",
+  "uh",
+  "like",
+  "you know",
+  "sort of",
+  "kind of",
+  "basically",
+  "actually",
+  "literally",
+  "i mean",
+];
+
+function clampScore(n: number): number {
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function analyseFillers(text: string) {
+  const raw = String(text || "").toLowerCase();
+  const words = raw.match(/\b[\w']+\b/g) ?? [];
+  const totalWords = words.length;
+
+  let totalFillers = 0;
+  const hits = new Map<string, number>();
+
+  for (const filler of FILLER_WORDS) {
+    const escaped = filler.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`\\b${escaped}\\b`, "gi");
+    const matches = raw.match(re) ?? [];
+    if (matches.length) {
+      totalFillers += matches.length;
+      hits.set(filler, matches.length);
+    }
+  }
+
+  return {
+    total_words: totalWords,
+    filler_count: totalFillers,
+    filler_words: Array.from(hits.keys()),
+    filler_breakdown: Object.fromEntries(hits.entries()),
+    filler_density: totalWords > 0 ? totalFillers / totalWords : 0,
+  };
+}
+
+function detectWeakClose(args: { closeScore: number | null; text: string }) {
+  const closeScore = typeof args.closeScore === "number" ? args.closeScore : null;
+  const text = String(args.text || "").toLowerCase();
+
+  const strongCloseSignals = [
+    "next step",
+    "book a time",
+    "schedule",
+    "calendar",
+    "let's do",
+    "shall we",
+    "send over",
+    "move forward",
+    "get started",
+    "does that sound fair",
+    "how does that sound",
+  ];
+
+  const hasStrongCloseLanguage = strongCloseSignals.some((s) => text.includes(s));
+
+  if (closeScore !== null && closeScore < 60) return true;
+  if (text && !hasStrongCloseLanguage) return true;
+  return false;
+}
+
+function buildVoiceScore(args: {
+  transcriptText: string;
+  closeScore: number | null;
+}) {
+  const transcriptText = String(args.transcriptText || "");
+  const filler = analyseFillers(transcriptText);
+  const weakClose = detectWeakClose({ closeScore: args.closeScore, text: transcriptText });
+
+  const fillerPenalty = filler.filler_density * 220;
+  const fillerScore = clampScore(100 - fillerPenalty);
+  const clarity = clampScore(92 - filler.filler_density * 160);
+  const tone = clampScore(82 - filler.filler_density * 70 + (weakClose ? -4 : 4));
+  const confidence = clampScore(84 - filler.filler_density * 110 - (weakClose ? 10 : 0));
+  const close = clampScore(args.closeScore ?? (weakClose ? 50 : 78));
+
+  const voice_rubric = {
+    tone,
+    clarity,
+    confidence,
+    filler: fillerScore,
+    close,
+  };
+
+  const voice_score = clampScore(
+    tone * 0.2 + clarity * 0.25 + confidence * 0.2 + fillerScore * 0.15 + close * 0.2
+  );
+
+  const review_tags = {
+    filler_words: filler.filler_words,
+    filler_count: filler.filler_count,
+    filler_density: Number(filler.filler_density.toFixed(4)),
+    weak_close: weakClose,
+  };
+
+  return { voice_score, voice_rubric, review_tags };
 }
 
 
@@ -314,25 +421,67 @@ router.post("/:id/score", async (req, res) => {
     // verify ownership
     const { data: call, error: callErr } = await supa
       .from("calls")
-      .select("id,user_id")
+      .select("id,user_id,summary")
       .eq("id", id)
       .single();
 
     if (callErr || !call) return res.status(404).json({ ok: false, error: "not_found" });
     if (call.user_id !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
 
+    const reviewText = String(body.transcript_text ?? (call as any)?.summary ?? "");
+    const closeScore = typeof (body.rubric as any)?.close === "number" ? Number((body.rubric as any).close) : null;
+    const { voice_score, voice_rubric, review_tags } = buildVoiceScore({
+      transcriptText: reviewText,
+      closeScore,
+    });
+
     const patch: any = {
       score_overall: body.score_overall,
       status: "scored",
+      voice_score,
+      voice_rubric,
+      review_tags,
     };
-    if (typeof body.rubric !== "undefined") patch.rubric = body.rubric;
 
-    const { data, error } = await supa
+    patch.rubric = {
+      ...(typeof body.rubric === "object" && body.rubric ? body.rubric : {}),
+      voice_score,
+      voice_rubric,
+      review_tags,
+    };
+
+    let updatePatch = { ...patch };
+
+    let { data, error } = await supa
       .from("calls")
-      .update(patch)
+      .update(updatePatch)
       .eq("id", id)
       .select()
       .single();
+
+    if (error) {
+      const msg = String((error as any)?.message ?? "").toLowerCase();
+      const missingVoiceCols =
+        (msg.includes("voice_score") || msg.includes("voice_rubric") || msg.includes("review_tags")) &&
+        (msg.includes("column") || msg.includes("schema cache"));
+
+      if (missingVoiceCols) {
+        updatePatch = { ...patch };
+        delete updatePatch.voice_score;
+        delete updatePatch.voice_rubric;
+        delete updatePatch.review_tags;
+
+        const retry = await supa
+          .from("calls")
+          .update(updatePatch)
+          .eq("id", id)
+          .select()
+          .single();
+
+        data = retry.data as any;
+        error = retry.error as any;
+      }
+    }
 
     if (error) throw error;
 
@@ -409,7 +558,12 @@ router.post("/:id/score", async (req, res) => {
       call_id: id,
       user_id: requester,
       score: body.score_overall,
-      rubric: typeof body.rubric !== "undefined" ? body.rubric : null,
+      rubric: {
+        ...(typeof body.rubric === "object" && body.rubric ? body.rubric : {}),
+        voice_score,
+        voice_rubric,
+        review_tags,
+      },
     };
     const { error: histErr } = await supa.from("call_scores").insert(hist);
     if (histErr) {
@@ -512,6 +666,9 @@ router.post("/:id/score", async (req, res) => {
     res.json({
       ok: true,
       call: data,
+      voice_score,
+      voice_rubric,
+      review_tags,
       assignment: effectiveAssignmentId
         ? { assignmentId: effectiveAssignmentId, via: "call_review" }
         : undefined,
@@ -574,29 +731,55 @@ router.get("/:id", async (req, res) => {
 
     const requester = getUserIdHeader(req);
 
-    const { data: call, error } = await supa
+    const baseSelect = `
+      id,
+      user_id,
+      org_id,
+      filename,
+      storage_path,
+      status,
+      created_at,
+      duration_sec,
+      duration_ms,
+      score_overall,
+      ai_model,
+      rep_name,
+      tags,
+      summary,
+      flags,
+      rubric
+    `;
+
+    const extendedSelect = `
+      ${baseSelect},
+      voice_score,
+      voice_rubric,
+      review_tags
+    `;
+
+    let { data: call, error } = await supa
       .from("calls")
-      .select(
-        `
-          id,
-          user_id,
-          org_id,
-          filename,
-          storage_path,
-          status,
-          created_at,
-          duration_sec,
-          duration_ms,
-          score_overall,
-          ai_model,
-          rep_name,
-          tags,
-          summary,
-          flags
-        `
-      )
+      .select(extendedSelect)
       .eq("id", id)
       .single();
+
+    if (error) {
+      const msg = String((error as any)?.message ?? "").toLowerCase();
+      const missingVoiceCols =
+        (msg.includes("voice_score") || msg.includes("voice_rubric") || msg.includes("review_tags")) &&
+        (msg.includes("column") || msg.includes("schema cache"));
+
+      if (missingVoiceCols) {
+        const retry = await supa
+          .from("calls")
+          .select(baseSelect)
+          .eq("id", id)
+          .single();
+
+        call = retry.data as any;
+        error = retry.error as any;
+      }
+    }
 
     if (error || !call) {
       return res.status(404).json({ ok: false, error: "not_found" });
@@ -620,7 +803,10 @@ router.get("/:id", async (req, res) => {
       tags: call.tags ?? null,
       summary: call.summary ?? null,
       flags: call.flags ?? [],
-      // keep user/org if you need them on web side:
+      rubric: (call as any).rubric ?? null,
+      voice_score: (call as any).voice_score ?? null,
+      voice_rubric: (call as any).voice_rubric ?? null,
+      review_tags: (call as any).review_tags ?? null,
       user_id: call.user_id,
       org_id: call.org_id,
     };
