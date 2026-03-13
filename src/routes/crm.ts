@@ -13,6 +13,7 @@ const supa = createClient(
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
 
 function getUserIdHeader(req: any): string {
   const uid = req.header("x-user-id");
@@ -23,10 +24,10 @@ function getUserIdHeader(req: any): string {
 function getOrgIdHeader(req: any): string {
   // Prefer request header; allow a safe dev/default fallback via env.
   const raw = String(req.header("x-org-id") || "").trim();
-  if (raw && UUID_RE.test(raw)) return raw;
+  if (raw && (raw === ZERO_UUID || UUID_RE.test(raw))) return raw;
 
   const fallback = String(process.env.DEFAULT_ORG_ID || "").trim();
-  if (fallback && UUID_RE.test(fallback)) return fallback;
+  if (fallback && (fallback === ZERO_UUID || UUID_RE.test(fallback))) return fallback;
 
   throw new Error("Missing or invalid x-org-id");
 }
@@ -279,6 +280,826 @@ async function selectContactsSafe(args: {
 // GET /v1/crm/health
 router.get("/health", async (_req, res) => {
   return res.json({ ok: true, service: "gravix-crm", ts: new Date().toISOString() });
+});
+
+// ---------------------------------------------------------
+// DAY 56 — MANAGER BATCH DRILL ASSIGNMENTS
+// ---------------------------------------------------------
+
+const BatchAssignCriteriaSchema = z
+  .object({
+    voice_score_lt: z.number().finite().optional(),
+    voice_score_gt: z.number().finite().optional(),
+    weak_close: z.boolean().optional(),
+    inactive_days_gt: z.number().int().positive().optional(),
+  })
+  .refine(
+    (v) =>
+      v.voice_score_lt !== undefined ||
+      v.voice_score_gt !== undefined ||
+      v.weak_close !== undefined ||
+      v.inactive_days_gt !== undefined,
+    { message: "criteria_required" }
+  );
+
+const BatchAssignSchema = z.object({
+  drill_id: z.string().trim().min(1).max(120),
+  criteria: BatchAssignCriteriaSchema,
+  title: z.string().trim().min(1).max(200).optional(),
+  due_at: z.string().trim().min(1).max(80).optional().nullable(),
+  meta: z.record(z.string(), z.any()).optional(),
+});
+
+function readRubricNumber(rubric: any, key: string): number | null {
+  const raw = rubric?.[key];
+  if (raw == null) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
+function readRubricBoolean(rubric: any, key: string): boolean | null {
+  const raw = rubric?.[key];
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw === "string") {
+    const s = raw.trim().toLowerCase();
+    if (s === "true") return true;
+    if (s === "false") return false;
+  }
+  return null;
+}
+
+async function listLatestCallScoresBestEffort(limit = 2000) {
+  const selectCandidates = [
+    "id, user_id, rubric, created_at",
+    "id, user_id, rubric",
+    "id, user_id",
+  ];
+
+  for (const sel of selectCandidates) {
+    const r = await supa
+      .from("call_scores")
+      .select(sel)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (!r.error) return (r.data as any[]) ?? [];
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    if (msg.includes("relation") && msg.includes("does not exist")) {
+      return [];
+    }
+    if (msg.includes("column") && msg.includes("does not exist")) {
+      continue;
+    }
+
+    throw new Error((r.error as any)?.message ?? "call_scores_fetch_failed");
+  }
+
+  return [];
+}
+
+
+async function listRepActivityBestEffort(limit = 2000) {
+  const selectCandidates = [
+    "id, org_id, tier, last_active_at, created_at",
+    "id, org_id, tier, last_active_at",
+    "id, org_id, tier, created_at",
+    "id, org_id, tier",
+    "id, org_id",
+    "id",
+  ];
+
+  for (const sel of selectCandidates) {
+    const r = await supa.from("reps").select(sel).limit(limit);
+
+    if (!r.error) return (r.data as any[]) ?? [];
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    if (msg.includes("relation") && msg.includes("does not exist")) {
+      return [];
+    }
+    if (msg.includes("column") && msg.includes("does not exist")) {
+      continue;
+    }
+
+    throw new Error((r.error as any)?.message ?? "reps_fetch_failed");
+  }
+
+  return [];
+}
+
+// --- Inserted: listRepDirectoryBestEffort and listCrmActivityRowsBestEffort ---
+async function listRepDirectoryBestEffort(limit = 2000) {
+  const selectCandidates = [
+    "id, org_id, tier, name, last_active_at, created_at",
+    "id, org_id, name, tier, last_active_at, created_at",
+    "id, org_id, name, tier, created_at",
+    "id, org_id, name, tier",
+    "id, org_id, name",
+    "id, org_id, tier, last_active_at, created_at",
+    "id, org_id, tier, last_active_at",
+    "id, org_id, tier, created_at",
+    "id, org_id, tier",
+    "id, org_id",
+    "id",
+  ];
+
+  for (const sel of selectCandidates) {
+    const r = await supa.from("reps").select(sel).limit(limit);
+
+    if (!r.error) return (r.data as any[]) ?? [];
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    if (msg.includes("relation") && msg.includes("does not exist")) {
+      return [];
+    }
+    if (msg.includes("column") && msg.includes("does not exist")) {
+      continue;
+    }
+
+    throw new Error((r.error as any)?.message ?? "reps_directory_fetch_failed");
+  }
+
+  return [];
+}
+
+async function listCrmActivityRowsBestEffort(limit = 5000) {
+  const selectCandidates = [
+    "id, user_id, status, due_at, completed_at, created_at",
+    "id, user_id, status, due_at, completed_at",
+    "id, user_id, status, due_at, created_at",
+    "id, user_id, status, due_at",
+    "id, user_id, status, completed_at, created_at",
+    "id, user_id, status, created_at",
+    "id, user_id, status",
+    "id, user_id",
+  ];
+
+  for (const sel of selectCandidates) {
+    const r = await supa
+      .from("crm_activities")
+      .select(sel)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (!r.error) return (r.data as any[]) ?? [];
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    if (msg.includes("relation") && msg.includes("does not exist")) {
+      return [];
+    }
+    if (msg.includes("column") && msg.includes("does not exist")) {
+      continue;
+    }
+
+    throw new Error((r.error as any)?.message ?? "crm_activities_fetch_failed");
+  }
+
+  return [];
+}
+
+async function insertBatchAssignmentBestEffort(args: {
+  userId: string;
+  requester: string;
+  drillId: string;
+  title?: string;
+  dueAt?: string | null;
+  meta?: Record<string, any>;
+}) {
+  const { userId, requester, drillId, title, dueAt, meta } = args;
+
+  const payloads = [
+    {
+      table: "assignments",
+      payload: {
+        user_id: userId,
+        created_by: requester,
+        drill_id: drillId,
+        title: title ?? drillId,
+        status: "assigned",
+        due_at: dueAt ?? null,
+        meta: meta ?? null,
+      },
+    },
+    {
+      table: "assignments",
+      payload: {
+        user_id: userId,
+        drill_id: drillId,
+        title: title ?? drillId,
+        status: "assigned",
+        due_at: dueAt ?? null,
+        meta: meta ?? null,
+      },
+    },
+    {
+      table: "assignments",
+      payload: {
+        user_id: userId,
+        drill_id: drillId,
+        status: "assigned",
+        due_at: dueAt ?? null,
+        meta: meta ?? null,
+      },
+    },
+    {
+      table: "assignments",
+      payload: {
+        user_id: userId,
+        drill_id: drillId,
+        status: "assigned",
+      },
+    },
+    {
+      table: "coach_assignments",
+      payload: {
+        user_id: userId,
+        created_by: requester,
+        drill_id: drillId,
+        title: title ?? drillId,
+        status: "assigned",
+        due_at: dueAt ?? null,
+        meta: meta ?? null,
+      },
+    },
+    {
+      table: "coach_assignments",
+      payload: {
+        user_id: userId,
+        drill_id: drillId,
+        title: title ?? drillId,
+        status: "assigned",
+        due_at: dueAt ?? null,
+        meta: meta ?? null,
+      },
+    },
+    {
+      table: "coach_assignments",
+      payload: {
+        user_id: userId,
+        drill_id: drillId,
+        status: "assigned",
+      },
+    },
+    {
+      table: "crm_activities",
+      payload: {
+        user_id: userId,
+        type: "task",
+        title: title ?? `Assigned drill: ${drillId}`,
+        status: "open",
+        due_at: dueAt ?? null,
+      },
+    },
+  ];
+
+  let lastErr: any = null;
+
+  for (const attempt of payloads) {
+    const r = await supa.from(attempt.table).insert(attempt.payload).select("id").maybeSingle();
+
+    if (!r.error) {
+      return {
+        ok: true as const,
+        table: attempt.table,
+        id: (r.data as any)?.id ?? null,
+      };
+    }
+
+    lastErr = r.error;
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    const retryable =
+      (msg.includes("relation") && msg.includes("does not exist")) ||
+      (msg.includes("column") && msg.includes("does not exist")) ||
+      msg.includes("could not find");
+
+    if (retryable) continue;
+    break;
+  }
+
+  return {
+    ok: false as const,
+    error: lastErr,
+  };
+}
+
+router.post("/assignments/manager/batch-assign", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    const body = BatchAssignSchema.parse(req.body ?? {});
+
+    const okManager = await isManagerUser(requester);
+    if (!okManager) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    }
+
+    const latestScores = await listLatestCallScoresBestEffort();
+    const latestByUser = new Map<string, any>();
+
+    for (const row of latestScores) {
+      const uid = String((row as any)?.user_id ?? "").trim();
+      if (!uid) continue;
+      if (latestByUser.has(uid)) continue;
+      latestByUser.set(uid, row);
+    }
+
+    const repRows = await listRepActivityBestEffort();
+    const nowMs = Date.now();
+
+    const matchedUserIds = new Set<string>();
+
+    for (const rep of repRows) {
+      const uid = String((rep as any)?.id ?? "").trim();
+      if (!uid) continue;
+      if (uid === requester) continue;
+
+      const latestScoreRow = latestByUser.get(uid) ?? null;
+      const rubric = (latestScoreRow as any)?.rubric ?? null;
+
+      let matched = false;
+
+      if (body.criteria.voice_score_lt !== undefined) {
+        const voiceScore = readRubricNumber(rubric, "voice_score");
+        if (voiceScore !== null && voiceScore < body.criteria.voice_score_lt) {
+          matched = true;
+        }
+      }
+
+      if (body.criteria.voice_score_gt !== undefined) {
+        const voiceScore = readRubricNumber(rubric, "voice_score");
+        if (voiceScore !== null && voiceScore > body.criteria.voice_score_gt) {
+          matched = true;
+        }
+      }
+
+      if (body.criteria.weak_close === true) {
+        const weakClose = readRubricBoolean(rubric, "weak_close");
+        if (weakClose === true) {
+          matched = true;
+        }
+      }
+
+      if (body.criteria.inactive_days_gt !== undefined) {
+        const rawLastActive =
+          (rep as any)?.last_active_at ??
+          (rep as any)?.created_at ??
+          null;
+
+        if (rawLastActive) {
+          const t = new Date(String(rawLastActive)).getTime();
+          if (Number.isFinite(t)) {
+            const inactiveDays = Math.floor((nowMs - t) / 86400000);
+            if (inactiveDays > body.criteria.inactive_days_gt) {
+              matched = true;
+            }
+          }
+        }
+      }
+
+      if (matched) matchedUserIds.add(uid);
+    }
+
+    const assigned: Array<{ user_id: string; id: string | null; table: string }> = [];
+    const failed: Array<{ user_id: string; error: string }> = [];
+
+    for (const userId of matchedUserIds) {
+      const inserted = await insertBatchAssignmentBestEffort({
+        userId,
+        requester,
+        drillId: body.drill_id,
+        title: body.title,
+        dueAt: body.due_at ?? null,
+        meta: {
+          ...(body.meta ?? {}),
+          criteria: body.criteria,
+          source: "manager_batch_assign",
+        },
+      });
+
+      if (inserted.ok) {
+        assigned.push({ user_id: userId, id: inserted.id, table: inserted.table });
+      } else {
+        failed.push({
+          user_id: userId,
+          error: String((inserted.error as any)?.message ?? "assignment_insert_failed"),
+        });
+      }
+    }
+
+    return res.json({
+      ok: true,
+      matched_count: matchedUserIds.size,
+      assigned_count: assigned.length,
+      failed_count: failed.length,
+      assigned,
+      failed,
+    });
+  } catch (e: any) {
+    return res.status(500).json({
+      ok: false,
+      error: e?.message ?? "batch_assignment_failed",
+    });
+  }
+});
+
+// ---------------------------------------------------------
+// DAY 56 — TEAM SETTINGS (manager configurable coaching engine)
+// ---------------------------------------------------------
+
+const DEFAULT_TEAM_SETTINGS = {
+  streak_threshold: 3,
+  xp_multiplier: 1,
+  comeback_bonus: 0,
+  xp_cap_daily: 500,
+  voice_score_threshold: 60,
+  weak_close_threshold: 60,
+  filler_density_threshold: 0.08,
+  coaching_trigger_thresholds: {
+    voice_score_lt: 60,
+    weak_close: true,
+    inactive_days_gt: 3,
+  },
+};
+
+const TeamSettingsSchema = z.object({
+  streak_threshold: z.number().int().min(1).max(365).optional(),
+  xp_multiplier: z.number().finite().min(0).max(100).optional(),
+  comeback_bonus: z.number().int().min(0).max(100000).optional(),
+  xp_cap_daily: z.number().int().min(0).max(100000).optional(),
+  voice_score_threshold: z.number().int().min(0).max(100).optional(),
+  weak_close_threshold: z.number().int().min(0).max(100).optional(),
+  filler_density_threshold: z.number().finite().min(0).max(1).optional(),
+  coaching_trigger_thresholds: z.record(z.string(), z.any()).optional(),
+});
+
+function buildDefaultTeamSettings(orgId: string) {
+  return {
+    org_id: orgId,
+    ...DEFAULT_TEAM_SETTINGS,
+    updated_at: null,
+    updated_by: null,
+  };
+}
+
+function normaliseTeamSettingsRow(row: any, orgId: string) {
+  const base = buildDefaultTeamSettings(orgId);
+  return {
+    org_id: orgId,
+    streak_threshold:
+      typeof row?.streak_threshold === "number"
+        ? row.streak_threshold
+        : Number.isFinite(Number(row?.streak_threshold))
+          ? Number(row?.streak_threshold)
+          : base.streak_threshold,
+    xp_multiplier:
+      typeof row?.xp_multiplier === "number"
+        ? row.xp_multiplier
+        : Number.isFinite(Number(row?.xp_multiplier))
+          ? Number(row?.xp_multiplier)
+          : base.xp_multiplier,
+    comeback_bonus:
+      typeof row?.comeback_bonus === "number"
+        ? row.comeback_bonus
+        : Number.isFinite(Number(row?.comeback_bonus))
+          ? Number(row?.comeback_bonus)
+          : base.comeback_bonus,
+    xp_cap_daily:
+      typeof row?.xp_cap_daily === "number"
+        ? row.xp_cap_daily
+        : Number.isFinite(Number(row?.xp_cap_daily))
+          ? Number(row?.xp_cap_daily)
+          : base.xp_cap_daily,
+    voice_score_threshold:
+      typeof row?.voice_score_threshold === "number"
+        ? row.voice_score_threshold
+        : Number.isFinite(Number(row?.voice_score_threshold))
+          ? Number(row?.voice_score_threshold)
+          : base.voice_score_threshold,
+    weak_close_threshold:
+      typeof row?.weak_close_threshold === "number"
+        ? row.weak_close_threshold
+        : Number.isFinite(Number(row?.weak_close_threshold))
+          ? Number(row?.weak_close_threshold)
+          : base.weak_close_threshold,
+    filler_density_threshold:
+      typeof row?.filler_density_threshold === "number"
+        ? row.filler_density_threshold
+        : Number.isFinite(Number(row?.filler_density_threshold))
+          ? Number(row?.filler_density_threshold)
+          : base.filler_density_threshold,
+    coaching_trigger_thresholds:
+      row?.coaching_trigger_thresholds && typeof row.coaching_trigger_thresholds === "object"
+        ? row.coaching_trigger_thresholds
+        : base.coaching_trigger_thresholds,
+    updated_at: row?.updated_at ?? null,
+    updated_by: row?.updated_by ?? null,
+  };
+}
+
+async function getTeamSettingsBestEffort(orgId: string) {
+  const selectCandidates = [
+    "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold, coaching_trigger_thresholds, updated_at, updated_by",
+    "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold, updated_at, updated_by",
+    "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold, updated_at",
+    "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold",
+    "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold",
+    "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold",
+    "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily",
+    "org_id, streak_threshold, xp_multiplier, comeback_bonus",
+    "org_id, streak_threshold, xp_multiplier",
+    "org_id, streak_threshold",
+    "org_id",
+  ];
+
+  for (const sel of selectCandidates) {
+    const r = await supa
+      .from("team_settings")
+      .select(sel)
+      .eq("org_id", orgId)
+      .limit(1)
+      .maybeSingle();
+
+    if (!r.error) {
+      return {
+        ok: true as const,
+        exists: !!r.data,
+        settings: normaliseTeamSettingsRow(r.data ?? {}, orgId),
+      };
+    }
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    if (
+      (msg.includes("relation") && msg.includes("does not exist")) ||
+      (msg.includes("could not find the table") && msg.includes("team_settings")) ||
+      (msg.includes("schema cache") && msg.includes("team_settings"))
+    ) {
+      return {
+        ok: true as const,
+        exists: false,
+        settings: buildDefaultTeamSettings(orgId),
+      };
+    }
+
+    if (msg.includes("column") && msg.includes("does not exist")) {
+      continue;
+    }
+
+    return {
+      ok: false as const,
+      error: r.error,
+    };
+  }
+
+  return {
+    ok: true as const,
+    exists: false,
+    settings: buildDefaultTeamSettings(orgId),
+  };
+}
+
+async function upsertTeamSettingsBestEffort(args: {
+  orgId: string;
+  requester: string;
+  patch: Record<string, any>;
+}) {
+  const { orgId, requester, patch } = args;
+
+  const payloads = [
+    {
+      org_id: orgId,
+      ...patch,
+      updated_at: new Date().toISOString(),
+      updated_by: requester,
+    },
+    {
+      org_id: orgId,
+      ...patch,
+      updated_at: new Date().toISOString(),
+    },
+    {
+      org_id: orgId,
+      ...patch,
+    },
+  ];
+
+  for (const payload of payloads) {
+    const r = await supa
+      .from("team_settings")
+      .upsert(payload, { onConflict: "org_id" })
+      .select(
+        "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold, coaching_trigger_thresholds, updated_at, updated_by"
+      )
+      .maybeSingle();
+
+    if (!r.error) {
+      return {
+        ok: true as const,
+        settings: normaliseTeamSettingsRow(r.data ?? payload, orgId),
+      };
+    }
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    const retryable =
+      (msg.includes("column") && msg.includes("does not exist")) ||
+      msg.includes("could not find") ||
+      (msg.includes("schema cache") && msg.includes("team_settings"));
+
+    if (retryable) continue;
+
+    return {
+      ok: false as const,
+      error: r.error,
+    };
+  }
+
+  return {
+    ok: false as const,
+    error: new Error("team_settings_upsert_failed"),
+  };
+}
+
+// --- Inserted: manager overview route ---
+router.get("/manager/overview", async (req, res) => {
+  try {
+    const { requester, orgId, bypassed } = await requireManagerOrg(req);
+
+    const okManager = await isManagerUser(requester);
+    if (!okManager) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    }
+
+    const repRows = await listRepDirectoryBestEffort();
+    const activityRows = await listCrmActivityRowsBestEffort();
+
+    const visibleReps = repRows.filter((rep: any) => {
+      const repId = String(rep?.id ?? "").trim();
+      if (!repId) return false;
+      if (bypassed) return true;
+      return String(rep?.org_id ?? "") === orgId;
+    });
+
+    const nowMs = Date.now();
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const startOfTodayMs = startOfToday.getTime();
+
+    const countsByUser = new Map<string, { open: number; overdue: number; completed_today: number }>();
+
+    for (const row of activityRows) {
+      const uid = String((row as any)?.user_id ?? "").trim();
+      if (!uid) continue;
+
+      const bucket = countsByUser.get(uid) ?? { open: 0, overdue: 0, completed_today: 0 };
+
+      const completedAt = (row as any)?.completed_at ?? null;
+      const dueAt = (row as any)?.due_at ?? null;
+      const status = String((row as any)?.status ?? "").trim().toLowerCase();
+
+      const isCompleted = !!completedAt || status === "done" || status === "completed" || status === "closed";
+
+      if (isCompleted) {
+        const completedMs = completedAt ? new Date(String(completedAt)).getTime() : NaN;
+        if (Number.isFinite(completedMs) && completedMs >= startOfTodayMs) {
+          bucket.completed_today += 1;
+        }
+      } else {
+        bucket.open += 1;
+
+        const dueMs = dueAt ? new Date(String(dueAt)).getTime() : NaN;
+        if (Number.isFinite(dueMs) && dueMs < nowMs) {
+          bucket.overdue += 1;
+        }
+      }
+
+      countsByUser.set(uid, bucket);
+    }
+
+    const items = visibleReps
+      .map((rep: any) => {
+        const repId = String(rep?.id ?? "").trim();
+        const repNameRaw = String(rep?.name ?? "").trim();
+        const counts = countsByUser.get(repId) ?? { open: 0, overdue: 0, completed_today: 0 };
+
+        return {
+          rep_id: repId,
+          rep_name: repNameRaw || `Rep ${repId.slice(0, 8)}`,
+          counts,
+          meta: {
+            tier: rep?.tier ?? null,
+            org_id: rep?.org_id ?? null,
+            last_active_at: rep?.last_active_at ?? null,
+            created_at: rep?.created_at ?? null,
+          },
+        };
+      })
+      .sort((a, b) => {
+        const overdueDelta = Number(b.counts?.overdue ?? 0) - Number(a.counts?.overdue ?? 0);
+        if (overdueDelta !== 0) return overdueDelta;
+        const openDelta = Number(b.counts?.open ?? 0) - Number(a.counts?.open ?? 0);
+        if (openDelta !== 0) return openDelta;
+        return a.rep_name.localeCompare(b.rep_name);
+      });
+
+    return res.json({
+      ok: true,
+      mode: bypassed ? "fallback" : "org",
+      items,
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "bad_request");
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: msg });
+    if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
+    return res.status(400).json({ ok: false, error: msg });
+  }
+});
+
+router.get("/manager/settings", async (req, res) => {
+  try {
+    const { requester, orgId } = await requireManagerOrg(req);
+
+    const okManager = await isManagerUser(requester);
+    if (!okManager) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    }
+
+    const settingsRes = await getTeamSettingsBestEffort(orgId);
+    if (!settingsRes.ok) {
+      return res.status(500).json({
+        ok: false,
+        error: (settingsRes.error as any)?.message ?? "team_settings_fetch_failed",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      exists: settingsRes.exists,
+      settings: settingsRes.settings,
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "bad_request");
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: msg });
+    if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
+    return res.status(400).json({ ok: false, error: msg });
+  }
+});
+
+router.post("/manager/settings", async (req, res) => {
+  try {
+    const { requester, orgId } = await requireManagerOrg(req);
+
+    const okManager = await isManagerUser(requester);
+    if (!okManager) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    }
+
+    const body = TeamSettingsSchema.parse(req.body ?? {});
+
+    const currentRes = await getTeamSettingsBestEffort(orgId);
+    if (!currentRes.ok) {
+      return res.status(500).json({
+        ok: false,
+        error: (currentRes.error as any)?.message ?? "team_settings_fetch_failed",
+      });
+    }
+
+    const merged = {
+      ...currentRes.settings,
+      ...body,
+      org_id: orgId,
+    };
+
+    const upsertRes = await upsertTeamSettingsBestEffort({
+      orgId,
+      requester,
+      patch: {
+        streak_threshold: merged.streak_threshold,
+        xp_multiplier: merged.xp_multiplier,
+        comeback_bonus: merged.comeback_bonus,
+        xp_cap_daily: merged.xp_cap_daily,
+        voice_score_threshold: merged.voice_score_threshold,
+        weak_close_threshold: merged.weak_close_threshold,
+        filler_density_threshold: merged.filler_density_threshold,
+        coaching_trigger_thresholds: merged.coaching_trigger_thresholds,
+      },
+    });
+
+    if (!upsertRes.ok) {
+      return res.status(500).json({
+        ok: false,
+        error: (upsertRes.error as any)?.message ?? "team_settings_upsert_failed",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      settings: upsertRes.settings,
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "bad_request");
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: msg });
+    if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
+    return res.status(400).json({ ok: false, error: msg });
+  }
 });
 
 /* ---------------------------------------------
@@ -3019,6 +3840,7 @@ router.post("/link-call", async (req, res) => {
     return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
 });
+
 
 /* ---------------------------------------------
    POST /v1/crm/unlink

@@ -533,6 +533,151 @@ function getUserIdHeader(req: Request): string {
   return raw;
 }
 
+function getOrgIdFromRequest(req: Request): string | null {
+  const headerOrg = (req.headers['x-org-id'] as string | undefined)?.toString().trim();
+  if (headerOrg) return headerOrg;
+
+  const bodyOrg =
+    typeof (req.body as any)?.orgId === 'string'
+      ? String((req.body as any).orgId).trim()
+      : '';
+  if (bodyOrg) return bodyOrg;
+
+  const fallbackOrg = String(process.env.DEFAULT_ORG_ID || '').trim();
+  if (fallbackOrg) return fallbackOrg;
+
+  return null;
+}
+
+const DEFAULT_TEAM_SETTINGS_SNAPSHOT = {
+  streak_threshold: 3,
+  xp_multiplier: 1,
+  comeback_bonus: 0,
+  xp_cap_daily: 500,
+  voice_score_threshold: 60,
+  weak_close_threshold: 60,
+  filler_density_threshold: 0.08,
+  coaching_trigger_thresholds: {
+    voice_score_lt: 60,
+    weak_close: true,
+    inactive_days_gt: 3,
+  },
+};
+
+async function loadTeamSettingsSnapshot(orgId: string | null) {
+  if (!orgId) {
+    return {
+      org_id: null,
+      source: 'default_no_org',
+      ...DEFAULT_TEAM_SETTINGS_SNAPSHOT,
+    };
+  }
+
+  const selectCandidates = [
+    'org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold, coaching_trigger_thresholds, updated_at, updated_by',
+    'org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold, updated_at, updated_by',
+    'org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold, updated_at',
+    'org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold',
+    'org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold',
+    'org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold',
+    'org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily',
+    'org_id, streak_threshold, xp_multiplier, comeback_bonus',
+    'org_id, streak_threshold, xp_multiplier',
+    'org_id, streak_threshold',
+    'org_id',
+  ];
+
+  for (const sel of selectCandidates) {
+    const r = await supa
+      .from('team_settings')
+      .select(sel)
+      .eq('org_id', orgId)
+      .limit(1)
+      .maybeSingle();
+
+    if (!r.error) {
+      const row = (r.data ?? {}) as any;
+      return {
+        org_id: orgId,
+        source: r.data ? 'team_settings' : 'default_missing_row',
+        streak_threshold:
+          typeof row?.streak_threshold === 'number'
+            ? row.streak_threshold
+            : Number.isFinite(Number(row?.streak_threshold))
+              ? Number(row?.streak_threshold)
+              : DEFAULT_TEAM_SETTINGS_SNAPSHOT.streak_threshold,
+        xp_multiplier:
+          typeof row?.xp_multiplier === 'number'
+            ? row.xp_multiplier
+            : Number.isFinite(Number(row?.xp_multiplier))
+              ? Number(row?.xp_multiplier)
+              : DEFAULT_TEAM_SETTINGS_SNAPSHOT.xp_multiplier,
+        comeback_bonus:
+          typeof row?.comeback_bonus === 'number'
+            ? row.comeback_bonus
+            : Number.isFinite(Number(row?.comeback_bonus))
+              ? Number(row?.comeback_bonus)
+              : DEFAULT_TEAM_SETTINGS_SNAPSHOT.comeback_bonus,
+        xp_cap_daily:
+          typeof row?.xp_cap_daily === 'number'
+            ? row.xp_cap_daily
+            : Number.isFinite(Number(row?.xp_cap_daily))
+              ? Number(row?.xp_cap_daily)
+              : DEFAULT_TEAM_SETTINGS_SNAPSHOT.xp_cap_daily,
+        voice_score_threshold:
+          typeof row?.voice_score_threshold === 'number'
+            ? row.voice_score_threshold
+            : Number.isFinite(Number(row?.voice_score_threshold))
+              ? Number(row?.voice_score_threshold)
+              : DEFAULT_TEAM_SETTINGS_SNAPSHOT.voice_score_threshold,
+        weak_close_threshold:
+          typeof row?.weak_close_threshold === 'number'
+            ? row.weak_close_threshold
+            : Number.isFinite(Number(row?.weak_close_threshold))
+              ? Number(row?.weak_close_threshold)
+              : DEFAULT_TEAM_SETTINGS_SNAPSHOT.weak_close_threshold,
+        filler_density_threshold:
+          typeof row?.filler_density_threshold === 'number'
+            ? row.filler_density_threshold
+            : Number.isFinite(Number(row?.filler_density_threshold))
+              ? Number(row?.filler_density_threshold)
+              : DEFAULT_TEAM_SETTINGS_SNAPSHOT.filler_density_threshold,
+        coaching_trigger_thresholds:
+          row?.coaching_trigger_thresholds && typeof row.coaching_trigger_thresholds === 'object'
+            ? row.coaching_trigger_thresholds
+            : DEFAULT_TEAM_SETTINGS_SNAPSHOT.coaching_trigger_thresholds,
+        updated_at: row?.updated_at ?? null,
+        updated_by: row?.updated_by ?? null,
+      };
+    }
+
+    const msg = String((r.error as any)?.message ?? '').toLowerCase();
+    if (
+      (msg.includes('relation') && msg.includes('does not exist')) ||
+      (msg.includes('could not find the table') && msg.includes('team_settings')) ||
+      (msg.includes('schema cache') && msg.includes('team_settings'))
+    ) {
+      return {
+        org_id: orgId,
+        source: 'default_missing_table',
+        ...DEFAULT_TEAM_SETTINGS_SNAPSHOT,
+      };
+    }
+
+    if (msg.includes('column') && msg.includes('does not exist')) {
+      continue;
+    }
+
+    throw new Error((r.error as any)?.message ?? 'team_settings_snapshot_failed');
+  }
+
+  return {
+    org_id: orgId,
+    source: 'default_fallback',
+    ...DEFAULT_TEAM_SETTINGS_SNAPSHOT,
+  };
+}
+
 const router = express.Router();
 
 function buildPersonaSystemPrompt(opts: {
@@ -1326,6 +1471,9 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
       targetDurationSec?: number;
     };
 
+    const orgId = getOrgIdFromRequest(req);
+    const teamSettingsSnapshot = await loadTeamSettingsSnapshot(orgId);
+
     const sessionId = uuidv4();
 
     // 2) Make sure the rep exists to satisfy FK (reps.id)
@@ -1374,6 +1522,9 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
           personaId || "price_sensitive",
           difficulty || "normal"
         ),
+
+        // Day 56 — snapshot manager/team scoring config at session start
+        team_settings_snapshot: teamSettingsSnapshot,
       },
     };
 
