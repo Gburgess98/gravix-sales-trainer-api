@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { randomUUID } from "crypto";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { postSlack } from "../lib/slack";
@@ -456,6 +457,198 @@ async function listCrmActivityRowsBestEffort(limit = 5000) {
   }
 
   return [];
+}
+
+const ManagerAutoAssignRunBodySchema = z.object({
+  mode: z.enum(["dry_run", "execute"]).optional(),
+  limit_reps: z.number().int().min(1).max(100).optional(),
+  contacts_per_rep: z.number().int().min(1).max(100).optional(),
+  max_total_contacts: z.number().int().min(1).max(1000).optional(),
+});
+
+async function listCrmContactsForUserBestEffort(args: { userId: string; limit: number }) {
+  const { userId, limit } = args;
+
+  const selectCandidates = [
+    "id, user_id, first_name, last_name, email, company, last_contacted_at, created_at",
+    "id, user_id, first_name, last_name, email, company, created_at",
+    "id, user_id, first_name, last_name, email, created_at",
+    "id, user_id, first_name, last_name, email, created_at",
+    "id, user_id, created_at",
+    "id, user_id",
+    "id",
+  ];
+
+  for (const sel of selectCandidates) {
+    const r = await supa
+      .from("crm_contacts")
+      .select(sel)
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (!r.error) return (r.data as any[]) ?? [];
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    if (msg.includes("relation") && msg.includes("does not exist")) return [];
+    if (msg.includes("column") && msg.includes("does not exist")) continue;
+
+    throw new Error((r.error as any)?.message ?? "crm_contacts_fetch_failed");
+  }
+
+  return [];
+}
+
+function buildManagerAutoAssignSuggestion(args: {
+  rep: any;
+  contact: any;
+  health: ReturnType<typeof computeContactHealthV1>;
+}) {
+  const { rep, contact, health } = args;
+
+  const contactName = [contact?.first_name, contact?.last_name].filter(Boolean).join(" ").trim() || contact?.email || contact?.company || "Contact";
+  const repName = String(rep?.name ?? rep?.rep_name ?? "Rep").trim() || "Rep";
+
+  const due = new Date();
+  due.setDate(due.getDate() + (health.band === "at_risk" ? 1 : 2));
+  due.setHours(17, 0, 0, 0);
+
+  const importance: "normal" | "important" | "critical" =
+    health.band === "at_risk" ? "critical" : health.band === "watch" ? "important" : "normal";
+
+  return {
+    type: "follow_up",
+    title: `Follow up with ${contactName}`,
+    due_at: due.toISOString(),
+    importance,
+    meta: {
+      rep_id: rep?.id ?? null,
+      rep_name: repName,
+      contact_id: contact?.id ?? null,
+      contact_name: contactName,
+      health_score: health.score,
+      health_band: health.band,
+      reasons: health.reasons,
+      next_action: health.next_action,
+      source: "manager_auto_assign_v1",
+    },
+  };
+}
+
+async function insertManagerAutoAssignRunBestEffort(args: {
+  runId: string;
+  requester: string;
+  orgId: string;
+  mode: "dry_run" | "execute";
+  source: "manual" | "cron";
+  totals: Record<string, any>;
+  preview: any[];
+}) {
+  const { runId, requester, orgId, mode, source, totals, preview } = args;
+
+  const payload = {
+    run_id: runId,
+    org_id: orgId,
+    user_id: requester,
+    requested_by: requester,
+    mode,
+    source,
+    totals,
+    preview,
+    started_at: new Date().toISOString(),
+    finished_at: new Date().toISOString(),
+  };
+
+  const selectCandidates = [
+    "run_id, org_id, user_id, requested_by, mode, source, totals, started_at, finished_at",
+    "run_id, org_id, user_id, mode, source, totals, started_at, finished_at",
+    "run_id, org_id, mode, source, totals, started_at",
+    "run_id, org_id, mode, source, totals",
+    "run_id, org_id, mode, source",
+    "run_id, org_id, mode",
+    "run_id, org_id",
+    "run_id",
+  ];
+
+  const payloadVariants = [
+    payload,
+    { ...payload, preview: undefined },
+    { ...payload, preview: undefined, requested_by: undefined },
+  ].map((x) => Object.fromEntries(Object.entries(x).filter(([, v]) => v !== undefined)));
+
+  for (const body of payloadVariants) {
+    for (const sel of selectCandidates) {
+      const r = await supa
+        .from("crm_auto_assign_runs")
+        .insert(body)
+        .select(sel)
+        .maybeSingle();
+
+      if (!r.error) {
+        return {
+          ok: true as const,
+          item: r.data ?? body,
+          persisted: true,
+        };
+      }
+
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
+      if ((msg.includes("relation") && msg.includes("does not exist")) || msg.includes("schema cache")) {
+        return {
+          ok: true as const,
+          item: body,
+          persisted: false,
+        };
+      }
+      if (msg.includes("column") && msg.includes("does not exist")) {
+        continue;
+      }
+      return { ok: false as const, error: r.error };
+    }
+  }
+
+  return {
+    ok: true as const,
+    item: payload,
+    persisted: false,
+  };
+}
+
+async function listManagerAutoAssignRunsBestEffort(args: { orgId: string; limit: number }) {
+  const { orgId, limit } = args;
+
+  const selectCandidates = [
+    "run_id, org_id, user_id, requested_by, mode, source, totals, started_at, finished_at, created_at",
+    "run_id, org_id, user_id, mode, source, totals, started_at, finished_at, created_at",
+    "run_id, org_id, mode, source, totals, started_at, finished_at",
+    "run_id, org_id, mode, source, totals, started_at",
+    "run_id, org_id, mode, source, totals",
+    "run_id, org_id, mode, source",
+    "run_id, org_id, mode",
+    "run_id, org_id",
+    "run_id",
+  ];
+
+  for (const sel of selectCandidates) {
+    const r = await supa
+      .from("crm_auto_assign_runs")
+      .select(sel)
+      .eq("org_id", orgId)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (!r.error) return { ok: true as const, items: (r.data as any[]) ?? [] };
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    if ((msg.includes("relation") && msg.includes("does not exist")) || msg.includes("schema cache")) {
+      return { ok: true as const, items: [] };
+    }
+    if (msg.includes("column") && msg.includes("does not exist")) continue;
+
+    return { ok: false as const, error: r.error };
+  }
+
+  return { ok: true as const, items: [] };
 }
 
 async function insertBatchAssignmentBestEffort(args: {
@@ -1004,6 +1197,215 @@ router.get("/manager/overview", async (req, res) => {
       ok: true,
       mode: bypassed ? "fallback" : "org",
       items,
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "bad_request");
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: msg });
+    if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
+    return res.status(400).json({ ok: false, error: msg });
+  }
+
+});
+
+router.post("/manager/auto-assign/run", async (req, res) => {
+  try {
+    const { requester, orgId, bypassed } = await requireManagerOrg(req);
+
+    const okManager = await isManagerUser(requester);
+    if (!okManager) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    }
+
+    const body = ManagerAutoAssignRunBodySchema.parse(req.body ?? {});
+    const mode = body.mode ?? "dry_run";
+    const limitReps = body.limit_reps ?? 10;
+    const contactsPerRep = body.contacts_per_rep ?? 5;
+    const maxTotalContacts = body.max_total_contacts ?? 25;
+    const source: "manual" | "cron" = String(req.header("x-cron-secret") || "").trim() ? "cron" : "manual";
+
+    const repRows = await listRepDirectoryBestEffort(limitReps * 5);
+    const visibleReps = repRows
+      .filter((rep: any) => {
+        const repId = String(rep?.id ?? "").trim();
+        if (!repId) return false;
+        if (repId === requester) return false;
+        if (bypassed) return true;
+        return String(rep?.org_id ?? "") === orgId;
+      })
+      .slice(0, limitReps);
+
+    const preview: any[] = [];
+    const assigned: any[] = [];
+    const failed: any[] = [];
+    let contactsConsidered = 0;
+
+    outer: for (const rep of visibleReps) {
+      const repId = String(rep?.id ?? "").trim();
+      if (!repId) continue;
+
+      const contacts = await listCrmContactsForUserBestEffort({
+        userId: repId,
+        limit: Math.max(contactsPerRep * 3, contactsPerRep),
+      });
+
+      const ranked = contacts
+        .map((contact: any) => {
+          const lastContacted = contact?.last_contacted_at ?? null;
+          const health = computeContactHealthV1({
+            last_contacted_at: lastContacted,
+            open_actions: 0,
+            overdue_actions: 0,
+            has_notes: false,
+            has_recent_call: false,
+          });
+          return { contact, health };
+        })
+        .sort((a, b) => a.health.score - b.health.score)
+        .slice(0, contactsPerRep);
+
+      for (const entry of ranked) {
+        if (contactsConsidered >= maxTotalContacts) break outer;
+
+        const suggestion = buildManagerAutoAssignSuggestion({ rep, contact: entry.contact, health: entry.health });
+        contactsConsidered += 1;
+
+        const previewItem = {
+          rep_id: repId,
+          rep_name: String(rep?.name ?? "").trim() || `Rep ${repId.slice(0, 8)}`,
+          contact_id: entry.contact?.id ?? null,
+          contact_email: entry.contact?.email ?? null,
+          suggestion,
+        };
+
+        preview.push(previewItem);
+
+        if (mode === "execute") {
+          const inserted = await insertCrmActionBestEffort({
+            requester,
+            repId,
+            contactId: String(entry.contact?.id ?? "").trim(),
+            type: suggestion.type,
+            title: suggestion.title,
+            due_at: suggestion.due_at,
+            importance: suggestion.importance,
+            meta: suggestion.meta,
+          });
+
+          if (inserted.ok) {
+            assigned.push(previewItem);
+          } else {
+            failed.push({
+              rep_id: repId,
+              contact_id: entry.contact?.id ?? null,
+              error: String((inserted.error as any)?.message ?? "crm_action_insert_failed"),
+            });
+          }
+        }
+      }
+    }
+
+    const totals = {
+      reps_considered: visibleReps.length,
+      contacts_considered: contactsConsidered,
+      actions_created: assigned.length,
+      skipped_dedupe: 0,
+      errors: failed.length,
+    };
+
+    const runId = randomUUID();
+    const persisted = await insertManagerAutoAssignRunBestEffort({
+      runId,
+      requester,
+      orgId,
+      mode,
+      source,
+      totals,
+      preview,
+    });
+
+    if (!persisted.ok) {
+      return res.status(500).json({
+        ok: false,
+        error: String((persisted.error as any)?.message ?? "auto_assign_run_persist_failed"),
+      });
+    }
+
+    try {
+      await postCrmAutoAssignRunSlack({
+        run_id: runId,
+        org_id: orgId,
+        mode,
+        totals,
+        source,
+      });
+    } catch {
+      // fail-soft
+    }
+
+    return res.json({
+      ok: true,
+      run_id: runId,
+      mode,
+      source,
+      persisted: persisted.persisted,
+      totals,
+      preview,
+      started_at: (persisted.item as any)?.started_at ?? new Date().toISOString(),
+      finished_at: (persisted.item as any)?.finished_at ?? new Date().toISOString(),
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "bad_request");
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: msg });
+    if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
+    return res.status(400).json({ ok: false, error: msg });
+  }
+});
+
+router.get("/manager/auto-assign/runs/latest", async (req, res) => {
+  try {
+    const { requester, orgId } = await requireManagerOrg(req);
+
+    const okManager = await isManagerUser(requester);
+    if (!okManager) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    }
+
+    const runsRes = await listManagerAutoAssignRunsBestEffort({ orgId, limit: 1 });
+    if (!runsRes.ok) {
+      return res.status(500).json({ ok: false, error: String((runsRes.error as any)?.message ?? "auto_assign_runs_fetch_failed") });
+    }
+
+    return res.json({
+      ok: true,
+      item: runsRes.items[0] ?? null,
+      source: "crm_auto_assign_runs",
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "bad_request");
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: msg });
+    if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
+    return res.status(400).json({ ok: false, error: msg });
+  }
+});
+
+router.get("/manager/auto-assign/runs", async (req, res) => {
+  try {
+    const { requester, orgId } = await requireManagerOrg(req);
+
+    const okManager = await isManagerUser(requester);
+    if (!okManager) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    }
+
+    const limit = Math.min(Math.max(Number((req.query as any)?.limit ?? 10), 1), 50);
+    const runsRes = await listManagerAutoAssignRunsBestEffort({ orgId, limit });
+    if (!runsRes.ok) {
+      return res.status(500).json({ ok: false, error: String((runsRes.error as any)?.message ?? "auto_assign_runs_fetch_failed") });
+    }
+
+    return res.json({
+      ok: true,
+      items: runsRes.items,
     });
   } catch (e: any) {
     const msg = String(e?.message ?? "bad_request");
