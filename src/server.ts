@@ -684,6 +684,29 @@ app.post("/v1/upload/finalize", async (req, res) => {
     const kind = isJson ? "json" : "audio";
     const hash = (sha256 && /^[a-f0-9]{64}$/i.test(sha256)) ? sha256.toLowerCase() : null;
 
+    // Attempt real duration extraction using music-metadata if available
+    let durationMs: number | null = null;
+    let durationSec: number | null = null;
+
+    try {
+      const { data } = await supabase.storage.from(BUCKET).download(path);
+      if (data) {
+        try {
+          const mm = await import("music-metadata");
+          const buf = Buffer.from(await data.arrayBuffer());
+          const meta = await mm.parseBuffer(buf, mime || undefined);
+          if (meta?.format?.duration) {
+            durationSec = Math.round(meta.format.duration);
+            durationMs = durationSec * 1000;
+          }
+        } catch {
+          // library not installed or parsing failed — leave null
+        }
+      }
+    } catch {
+      // storage read failed — leave null
+    }
+
     // 1) DB row
     const { error: dbErrCall } = await supabase.from("calls").insert({
       id,
@@ -697,6 +720,8 @@ app.post("/v1/upload/finalize", async (req, res) => {
       kind,
       status: "queued",
       audio_path: path,
+      duration_sec: durationSec,
+      duration_ms: durationMs,
     });
     if (dbErrCall) return res.status(500).json({ ok: false, error: `DB insert failed: ${dbErrCall.message}` });
 
@@ -738,6 +763,21 @@ app.post(
       const key = `${userId}/${id}${ext}`;
       const hash = crypto.createHash("sha256").update(f.buffer).digest("hex");
 
+      // Attempt real duration extraction using music-metadata if available
+      let durationMs: number | null = null;
+      let durationSec: number | null = null;
+
+      try {
+        const mm = await import("music-metadata");
+        const meta = await mm.parseBuffer(f.buffer, f.mimetype);
+        if (meta?.format?.duration) {
+          durationSec = Math.round(meta.format.duration);
+          durationMs = durationSec * 1000;
+        }
+      } catch {
+        // library not installed or parsing failed — leave null
+      }
+
       // 1) Storage
       const { error: upErr } = await supabase.storage.from(BUCKET).upload(key, f.buffer, {
         contentType: f.mimetype, upsert: false,
@@ -746,9 +786,19 @@ app.post(
 
       // 2) DB row
       const { error: dbErrCall } = await supabase.from("calls").insert({
-        id, user_id: userId, org_id: DEFAULT_ORG_ID,
-        filename: f.originalname, storage_path: key, mime_type: f.mimetype,
-        size_bytes: f.size, sha256: hash, kind, status: "queued", audio_path: key,
+        id,
+        user_id: userId,
+        org_id: DEFAULT_ORG_ID,
+        filename: f.originalname,
+        storage_path: key,
+        mime_type: f.mimetype,
+        size_bytes: f.size,
+        sha256: hash,
+        kind,
+        status: "queued",
+        audio_path: key,
+        duration_sec: durationSec,
+        duration_ms: durationMs
       });
       if (dbErrCall) {
         await supabase.storage.from(BUCKET).remove([key]).catch(() => { });
@@ -805,37 +855,6 @@ app.get("/v1/jobs/:id", async (req, res) => {
   const { data, error } = await supabase.from("jobs").select("*").eq("id", req.params.id).single();
   if (error) return res.status(404).json({ ok: false, error: error.message });
   res.json({ ok: true, job: data });
-});
-
-// --- DEMO: paged recent calls (for offline/dev) ---
-app.get("/v1/calls/paged", (req, res) => {
-  const limit = Math.min(Number(req.query.limit || 20), 50);
-  const cursorRaw = req.query.cursor ? String(req.query.cursor) : null;
-  const start = cursorRaw ? Number(cursorRaw) : 0;
-
-  // Build demo data in the exact shape the web expects
-  const all = Array.from({ length: 120 }).map((_, i) => {
-    const idx = i + 1;
-    const createdAt = new Date(Date.now() - i * 90_000).toISOString();
-    const scored = i % 3 !== 0; // 2/3 scored
-    const status = scored ? "scored" as const : (i % 2 === 0 ? "processed" as const : "queued" as const);
-    const overall = scored ? 55 + (i % 45) : null;
-    const duration = 60 + (i % 900);
-    return {
-      id: `demo-${String(idx).padStart(3, "0")}`,
-      filename: `demo-${String(idx).padStart(3, "0")}.wav`,
-      storage_path: null,
-      status,
-      created_at: createdAt,
-      duration_sec: duration,
-      score_overall: overall,
-      ai_model: scored ? "gpt-4o-mini" : null,
-    };
-  });
-
-  const slice = all.slice(start, start + limit);
-  const nextCursor = start + limit < all.length ? String(start + limit) : null;
-  return res.json({ ok: true, items: slice, nextCursor });
 });
 
 // --- ADD: CRM search stub ---
@@ -1217,7 +1236,7 @@ app.patch("/v1/coach/assignments/:id", async (req, res) => {
       .from("coach_assignments")
       .update(patch)
       .eq("id", id)
-      .select("id, call_id, drill_id, status, completed_at, created_at")
+      .select("id, org_id, assignee_user_id, call_id, drill_id, status, completed_at, created_at")
       .maybeSingle();
 
     if (error) return res.status(500).json({ ok: false, error: error.message });
@@ -1232,6 +1251,8 @@ app.patch("/v1/coach/assignments/:id", async (req, res) => {
           : `↩️ Drill reopened: ${updated.drill_id}`;
 
       await supabase.from("activities").insert({
+        org_id: (updated as any)?.org_id ?? null,
+        user_id: (updated as any)?.assignee_user_id ?? null,
         type,
         summary,
         call_id: updated.call_id,

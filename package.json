@@ -5,6 +5,7 @@
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
     "multer": "^2.0.2",
+    "music-metadata": "^11.12.3",
     "node-fetch": "^3.3.2",
     "openai": "^6.0.1",
     "pg": "^8.16.3",

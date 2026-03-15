@@ -10,6 +10,7 @@ export type RubricSection = { score: number; notes: string };
 export type LlmScore = {
   model: string;
   overall: number;
+  summary: string;
   intro: RubricSection;
   discovery: RubricSection;
   objection: RubricSection;
@@ -35,12 +36,13 @@ const JSON_SCHEMA = {
     properties: {
       model: { type: "string" },
       overall: { type: "integer", minimum: 0, maximum: 100 },
+      summary: { type: "string", maxLength: 220 },
       intro: sectionSchema(),
       discovery: sectionSchema(),
       objection: sectionSchema(),
       close: sectionSchema(),
     },
-    required: ["model", "overall", "intro", "discovery", "objection", "close"],
+    required: ["model", "overall", "summary", "intro", "discovery", "objection", "close"],
     additionalProperties: false,
   },
   strict: true,
@@ -60,6 +62,7 @@ export function heuristicScoreFallback(): LlmScore {
   return {
     model: "heuristic:v1",
     overall: s.score,
+    summary: "Solid overall structure, but a fuller transcript is needed for a reliable coaching summary.",
     intro: { ...s },
     discovery: { ...s },
     objection: { ...s },
@@ -171,11 +174,12 @@ export async function scoreWithLLM(opts: {
       "- Discovery: deep questions, pain/impact, budget/timeline, authority.",
       "- Objection: isolates true objection, reframes value, tests commitment.",
       "- Close: clear next step, assumptive/binary ask, time/date locked.",
+      "Also return a short coaching summary in 1-2 sentences (max 220 chars) that explains the main strength and main weakness of the call.",
     ];
     const user = userLines.join("\n");
 
     const system =
-      "You are a strict sales call evaluator. Score from 0–100 overall and for Intro, Discovery, Objection Handling, Close. Be concise. Output must match the provided JSON schema exactly.";
+      "You are a strict sales call evaluator. Score from 0–100 overall and for Intro, Discovery, Objection Handling, Close. Be concise. Also provide a short coaching summary. Output must match the provided JSON schema exactly.";
 
     const openai = getOpenAI();
     const ctrl = new AbortController();
@@ -207,6 +211,10 @@ export async function scoreWithLLM(opts: {
       parsed[k].score = clamp(parsed[k].score);
       parsed[k].notes = (parsed[k].notes || "").slice(0, 300);
     });
+    parsed.summary = String(parsed.summary || "").trim().slice(0, 220);
+    if (!parsed.summary) {
+      parsed.summary = "Good baseline structure, but this call needs clearer strengths and weaknesses captured in the summary.";
+    }
 
     const rubric = {
       intro: parsed.intro,
@@ -220,6 +228,7 @@ export async function scoreWithLLM(opts: {
       .from("calls")
       .update({
         score_overall: parsed.overall,
+        summary: parsed.summary,
         rubric,
         ai_model: parsed.model,
         rubric_version: RUBRIC_VERSION,
@@ -291,6 +300,7 @@ export async function scoreWithLLM(opts: {
       .from("calls")
       .update({
         score_overall: fb.overall,
+        summary: fb.summary,
         rubric,
         ai_model: fb.model,
         rubric_version: RUBRIC_VERSION,
