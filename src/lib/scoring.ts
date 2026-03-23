@@ -5,6 +5,17 @@ import { getOpenAI, AI_MODEL, OPENAI_TIMEOUT_MS } from "./openai";
 import { postScoreSummary } from "./slack";
 
 export const RUBRIC_VERSION = "v1"; // bump when rubric changes
+export const SCORING_PROMPT_VERSION = "v1";
+export const SCORING_MODEL_VERSION = `${AI_MODEL}:${SCORING_PROMPT_VERSION}:${RUBRIC_VERSION}`;
+
+function stableHash(input: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
 
 export type RubricSection = { score: number; notes: string };
 export type LlmScore = {
@@ -52,12 +63,133 @@ function clamp(n: number) {
   return Math.max(0, Math.min(100, Math.round(n)));
 }
 
+function normaliseTranscriptForDeterminism(transcript: string): string {
+  return String(transcript || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function buildDeterministicPromptKey(params: {
+  callId: string;
+  filename?: string | null;
+  sha256?: string | null;
+  transcript?: string | null;
+}) {
+  const transcript = normaliseTranscriptForDeterminism(params.transcript || "");
+  const transcriptHash = stableHash(transcript || params.sha256 || params.callId);
+  return {
+    transcript,
+    transcriptHash,
+    key: [
+      `rubric=${RUBRIC_VERSION}`,
+      `prompt=${SCORING_PROMPT_VERSION}`,
+      `model=${SCORING_MODEL_VERSION}`,
+      `filename=${params.filename || params.callId}`,
+      `sha256=${params.sha256 || "missing"}`,
+      `transcriptHash=${transcriptHash}`,
+    ].join("|"),
+  };
+}
+
+function buildRubricWithMeta(args: {
+  intro: RubricSection;
+  discovery: RubricSection;
+  objection: RubricSection;
+  close: RubricSection;
+  callSha256: string | null;
+  transcriptHash: string | null;
+  transcriptPresent: boolean;
+  modelVersion: string;
+}) {
+  return {
+    intro: args.intro,
+    discovery: args.discovery,
+    objection: args.objection,
+    close: args.close,
+    _meta: {
+      rubric_version: RUBRIC_VERSION,
+      prompt_version: SCORING_PROMPT_VERSION,
+      model_version: args.modelVersion,
+      call_sha256: args.callSha256,
+      transcript_hash: args.transcriptHash,
+      transcript_present: args.transcriptPresent,
+    },
+  };
+}
+
+async function readScoreCache(
+  supabase: SupabaseClient,
+  cacheKey: string
+): Promise<LlmScore | null> {
+  try {
+    const { data, error } = await supabase
+      .from("score_cache")
+      .select("result_json")
+      .eq("cache_key", cacheKey)
+      .maybeSingle();
+
+    if (error) {
+      const msg = String((error as any)?.message ?? "").toLowerCase();
+      const missing =
+        (msg.includes("relation") && msg.includes("does not exist")) ||
+        (msg.includes("could not find") && msg.includes("score_cache")) ||
+        (msg.includes("schema cache") && msg.includes("score_cache"));
+      if (missing) return null;
+      console.warn("[score-cache] read failed:", error.message);
+      return null;
+    }
+
+    const raw = (data as any)?.result_json;
+    if (!raw) return null;
+    return raw as LlmScore;
+  } catch (e: any) {
+    console.warn("[score-cache] read error:", e?.message || e);
+    return null;
+  }
+}
+
+async function writeScoreCache(
+  supabase: SupabaseClient,
+  args: {
+    cacheKey: string;
+    callSha256: string | null;
+    transcriptHash: string | null;
+    result: LlmScore;
+  }
+) {
+  try {
+    const { error } = await supabase.from("score_cache").upsert(
+      {
+        cache_key: args.cacheKey,
+        call_sha256: args.callSha256,
+        transcript_hash: args.transcriptHash,
+        rubric_version: RUBRIC_VERSION,
+        prompt_version: SCORING_PROMPT_VERSION,
+        model_version: SCORING_MODEL_VERSION,
+        result_json: args.result,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "cache_key" }
+    );
+
+    if (error) {
+      const msg = String((error as any)?.message ?? "").toLowerCase();
+      const missing =
+        (msg.includes("relation") && msg.includes("does not exist")) ||
+        (msg.includes("could not find") && msg.includes("score_cache")) ||
+        (msg.includes("schema cache") && msg.includes("score_cache"));
+      if (!missing) console.warn("[score-cache] write failed:", error.message);
+    }
+  } catch (e: any) {
+    console.warn("[score-cache] write error:", e?.message || e);
+  }
+}
+
 export function heuristicScoreFallback(): LlmScore {
-  const pick = () =>
-    Math.max(55, Math.min(85, Math.round(70 + (Math.random() * 16 - 8))));
   const s = {
-    score: pick(),
-    notes: "Heuristic fallback based on minimal call metadata.",
+    score: 68,
+    notes: "Deterministic fallback based on minimal call metadata.",
   };
   return {
     model: "heuristic:v1",
@@ -79,8 +211,19 @@ async function writeScoreHistory(
   rubric: any
 ) {
   try {
+    const { data: callRow, error: callErr } = await supabase
+      .from("calls")
+      .select("user_id")
+      .eq("id", callId)
+      .maybeSingle();
+
+    if (callErr) {
+      console.warn("[score] call lookup for history failed:", callErr.message);
+    }
+
     const { error } = await supabase.from("call_scores").insert({
       call_id: callId,
+      user_id: (callRow as any)?.user_id ?? null,
       ai_model: model,
       rubric_version: RUBRIC_VERSION,
       overall,
@@ -159,15 +302,73 @@ export async function scoreWithLLM(opts: {
     // Pull minimal call meta (include duration for Slack; user_id to resolve rep)
     const { data: call, error: callErr } = await supabase
       .from("calls")
-      .select("id, filename, user_id, duration_sec")
+      .select("id, filename, user_id, duration_sec, sha256, transcript")
       .eq("id", callId)
       .single();
     if (callErr || !call) throw new Error("call_not_found");
 
+    const deterministic = buildDeterministicPromptKey({
+      callId,
+      filename: (call as any)?.filename ?? null,
+      sha256: ((call as any)?.sha256 as string | null) ?? null,
+      transcript: ((call as any)?.transcript as string | null) ?? null,
+    });
+
+    const cached = await readScoreCache(supabase, deterministic.key);
+    if (cached) {
+      const cachedModelVersion = String((cached as any)?.model || SCORING_MODEL_VERSION);
+      const rubric = buildRubricWithMeta({
+        intro: cached.intro,
+        discovery: cached.discovery,
+        objection: cached.objection,
+        close: cached.close,
+        callSha256: ((call as any)?.sha256 as string | null) ?? null,
+        transcriptHash: deterministic.transcriptHash,
+        transcriptPresent: Boolean(deterministic.transcript),
+        modelVersion: cachedModelVersion,
+      });
+
+      const { error: cacheUpErr } = await supabase
+        .from("calls")
+        .update({
+          score_overall: cached.overall,
+          summary: cached.summary,
+          transcript: ((call as any)?.transcript as string | null) ?? null,
+          rubric,
+          ai_model: cachedModelVersion,
+          rubric_version: RUBRIC_VERSION,
+          scored_at: new Date().toISOString(),
+        })
+        .eq("id", callId);
+      if (cacheUpErr) throw cacheUpErr;
+
+      await writeScoreHistory(supabase, callId, cachedModelVersion, cached.overall, rubric);
+
+      await notifySlack({
+        supabase,
+        callId,
+        repIdFallback: (call as any)?.user_id ?? null,
+        durationSec: (call as any)?.duration_sec ?? null,
+        scores: {
+          intro: cached.intro.score,
+          discovery: cached.discovery.score,
+          objection: cached.objection.score,
+          close: cached.close.score,
+          overall: cached.overall,
+        },
+      });
+
+      return cached;
+    }
+
     // Build prompt
     const userLines = [
-      'CALL META: filename="' + (call.filename || call.id) + '"',
-      "TRANSCRIPT: (not available in MVP)",
+      `CALL META: filename="${call.filename || call.id}"`,
+      `CALL HASH: sha256="${(((call as any).sha256 as string | null) || "missing")}"`,
+      `TRANSCRIPT HASH: stable="${deterministic.transcriptHash}"`,
+      `DETERMINISM KEY: "${deterministic.key}"`,
+      "TRANSCRIPT:",
+      deterministic.transcript || "(not available in MVP)",
       "",
       "Rubric guide:",
       "- Intro: pattern interrupt, clear reason, agenda set.",
@@ -175,11 +376,12 @@ export async function scoreWithLLM(opts: {
       "- Objection: isolates true objection, reframes value, tests commitment.",
       "- Close: clear next step, assumptive/binary ask, time/date locked.",
       "Also return a short coaching summary in 1-2 sentences (max 220 chars) that explains the main strength and main weakness of the call.",
+      "For identical transcripts, hashes, rubric versions, and prompt versions, return identical section scores, overall score, and materially consistent reasoning.",
     ];
     const user = userLines.join("\n");
 
     const system =
-      "You are a strict sales call evaluator. Score from 0–100 overall and for Intro, Discovery, Objection Handling, Close. Be concise. Also provide a short coaching summary. Output must match the provided JSON schema exactly.";
+      "You are a strict sales call evaluator. Score from 0–100 overall and for Intro, Discovery, Objection Handling, Close. Be concise. Also provide a short coaching summary. Treat the transcript and determinism key as the source of truth. Identical calls scored under the same rubric and prompt version must return the same result. Output must match the provided JSON schema exactly.";
 
     const openai = getOpenAI();
     const ctrl = new AbortController();
@@ -193,7 +395,7 @@ export async function scoreWithLLM(opts: {
           { role: "user", content: user },
         ],
         response_format: { type: "json_schema", json_schema: JSON_SCHEMA as any },
-        temperature: 0.2,
+        temperature: 0,
       },
       { signal: ctrl.signal }
     );
@@ -216,12 +418,16 @@ export async function scoreWithLLM(opts: {
       parsed.summary = "Good baseline structure, but this call needs clearer strengths and weaknesses captured in the summary.";
     }
 
-    const rubric = {
+    const rubric = buildRubricWithMeta({
       intro: parsed.intro,
       discovery: parsed.discovery,
       objection: parsed.objection,
       close: parsed.close,
-    };
+      callSha256: ((call as any)?.sha256 as string | null) ?? null,
+      transcriptHash: deterministic.transcriptHash,
+      transcriptPresent: Boolean(deterministic.transcript),
+      modelVersion: SCORING_MODEL_VERSION,
+    });
 
     // Persist latest on calls
     const { error: upErr } = await supabase
@@ -229,8 +435,9 @@ export async function scoreWithLLM(opts: {
       .update({
         score_overall: parsed.overall,
         summary: parsed.summary,
+        transcript: ((call as any)?.transcript as string | null) ?? null,
         rubric,
-        ai_model: parsed.model,
+        ai_model: SCORING_MODEL_VERSION,
         rubric_version: RUBRIC_VERSION,
         scored_at: new Date().toISOString(),
       })
@@ -238,7 +445,14 @@ export async function scoreWithLLM(opts: {
     if (upErr) throw upErr;
 
     // History row (non-blocking)
-    await writeScoreHistory(supabase, callId, parsed.model, parsed.overall, rubric);
+    await writeScoreHistory(supabase, callId, SCORING_MODEL_VERSION, parsed.overall, rubric);
+
+    await writeScoreCache(supabase, {
+      cacheKey: deterministic.key,
+      callSha256: ((call as any)?.sha256 as string | null) ?? null,
+      transcriptHash: deterministic.transcriptHash,
+      result: parsed,
+    });
 
     // CRM Activity: record a score event (best-effort; non-blocking)
     try {
@@ -289,12 +503,17 @@ export async function scoreWithLLM(opts: {
 
     const fb = heuristicScoreFallback();
 
-    const rubric = {
+    const fallbackModelVersion = `${fb.model}:${SCORING_PROMPT_VERSION}:${RUBRIC_VERSION}`;
+    const rubric = buildRubricWithMeta({
       intro: fb.intro,
       discovery: fb.discovery,
       objection: fb.objection,
       close: fb.close,
-    };
+      callSha256: null,
+      transcriptHash: null,
+      transcriptPresent: false,
+      modelVersion: fallbackModelVersion,
+    });
 
     await opts.supabase
       .from("calls")
@@ -302,14 +521,21 @@ export async function scoreWithLLM(opts: {
         score_overall: fb.overall,
         summary: fb.summary,
         rubric,
-        ai_model: fb.model,
+        ai_model: fallbackModelVersion,
         rubric_version: RUBRIC_VERSION,
         scored_at: new Date().toISOString(),
       })
       .eq("id", opts.callId);
 
     // History row (non-blocking)
-    await writeScoreHistory(opts.supabase, opts.callId, fb.model, fb.overall, rubric);
+    await writeScoreHistory(opts.supabase, opts.callId, fallbackModelVersion, fb.overall, rubric);
+
+    await writeScoreCache(opts.supabase, {
+      cacheKey: stableHash(`fallback|${opts.callId}|${RUBRIC_VERSION}|${SCORING_PROMPT_VERSION}`),
+      callSha256: null,
+      transcriptHash: null,
+      result: fb,
+    });
 
     // CRM Activity: record a score event for fallback (best-effort)
     try {

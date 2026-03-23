@@ -26,6 +26,7 @@ const ScoreSchema = z.object({
   score_overall: z.number().min(0).max(100),
   rubric: z.any().optional(),
   transcript_text: z.string().optional(),
+  summary: z.string().optional(),
   // Optional: if the client launched this score action from an assignment CTA (used for auto-complete)
   assignmentId: z.string().uuid().optional(),
 });
@@ -435,13 +436,20 @@ router.post("/:id/score", async (req, res) => {
       closeScore,
     });
 
+    const transcriptText = String(body.transcript_text ?? "").trim();
+
     const patch: any = {
       score_overall: body.score_overall,
       status: "scored",
       voice_score,
       voice_rubric,
       review_tags,
+      transcript: transcriptText || null,
     };
+
+    if (typeof body.summary === "string" && String(body.summary).trim()) {
+      patch.summary = String(body.summary).trim();
+    }
 
     patch.rubric = {
       ...(typeof body.rubric === "object" && body.rubric ? body.rubric : {}),
@@ -732,23 +740,24 @@ router.get("/:id", async (req, res) => {
     const requester = getUserIdHeader(req);
 
     const baseSelect = `
-      id,
-      user_id,
-      org_id,
-      filename,
-      storage_path,
-      status,
-      created_at,
-      duration_sec,
-      duration_ms,
-      score_overall,
-      ai_model,
-      rep_name,
-      tags,
-      summary,
-      flags,
-      rubric
-    `;
+  id,
+  user_id,
+  org_id,
+  filename,
+  storage_path,
+  status,
+  created_at,
+  duration_sec,
+  duration_ms,
+  score_overall,
+  ai_model,
+  rep_name,
+  tags,
+  summary,
+  flags,
+  transcript,
+  rubric
+`;
 
     const extendedSelect = `
       ${baseSelect},
@@ -803,6 +812,7 @@ router.get("/:id", async (req, res) => {
       tags: call.tags ?? null,
       summary: call.summary ?? null,
       flags: call.flags ?? [],
+      transcript: (call as any).transcript ?? null,
       rubric: (call as any).rubric ?? null,
       voice_score: (call as any).voice_score ?? null,
       voice_rubric: (call as any).voice_rubric ?? null,

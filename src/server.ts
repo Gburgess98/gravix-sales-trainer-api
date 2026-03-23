@@ -1785,17 +1785,58 @@ async function simulateTranscription(jobId: string, callId: string, _storagePath
   console.log("[transcribe] start", { jobId, callId });
   await setJobStatus(jobId, "processing", { attempts: 1 });
 
-  await new Promise((r) => setTimeout(r, 3000));
+  await new Promise((r) => setTimeout(r, 300));
 
-  const fakeTranscript = {
+  let transcriptResult: { model: string; text: string; words: any[] } = {
     model: "whisper-stub",
     text: "This is a stub transcript. Replace with real Whisper/Deepgram later.",
     words: [],
   };
 
-  await setJobStatus(jobId, "succeeded", { result: fakeTranscript });
+  try {
+    const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+    if (apiKey) {
+      const { default: OpenAI, toFile } = await import("openai");
+      const client = new OpenAI({ apiKey });
 
-  const { error } = await supabase.from("calls").update({ status: "processed" }).eq("id", callId);
+      const { data } = await supabase.storage.from(BUCKET).download(_storagePath);
+      if (!data) throw new Error("storage_download_failed");
+
+      const buf = Buffer.from(await data.arrayBuffer());
+      const filename = _storagePath.split("/").pop() || `${callId}.wav`;
+      const file = await toFile(buf, filename);
+      const model = String(process.env.TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe").trim();
+
+      const tx = await client.audio.transcriptions.create({
+        file,
+        model,
+      });
+
+      const text = String((tx as any)?.text || "").trim();
+      if (text) {
+        transcriptResult = {
+          model,
+          text,
+          words: [],
+        };
+      }
+    }
+  } catch (e: any) {
+    console.warn("[transcribe] OpenAI transcription failed, using stub:", e?.message || e);
+  }
+
+  await setJobStatus(jobId, "succeeded", { result: transcriptResult });
+
+  const transcriptText = String(transcriptResult.text || "").trim();
+
+  const { error } = await supabase
+    .from("calls")
+    .update({
+      status: "processed",
+      transcript: transcriptText || null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", callId);
   if (error) throw new Error(`update call failed: ${error.message}`);
 
   console.log("[transcribe] done → enqueue score", { callId });
