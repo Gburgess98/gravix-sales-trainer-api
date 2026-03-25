@@ -172,6 +172,16 @@ export type ScoreSummaryInput = {
   repName?: string | null;
   contactName?: string | null;
   company?: string | null;
+
+  // Back-compat support for numeric section callers
+  sections?: {
+    intro: number;
+    discovery: number;
+    objection: number;
+    close: number;
+  } | null;
+  callUrl?: string | null;
+  recentUrl?: string | null;
 };
 
 /** Build human-friendly text for a rubric section */
@@ -320,7 +330,34 @@ export function buildScoreBlocks(s: SummaryInput) {
  *
  * (Falls back to no-op if SLACK_WEBHOOK_URL is not set.)
  */
-export async function postScoreSummary(input: ScoreSummaryInput) {
+export async function postScoreSummary(input: ScoreSummaryInput | SummaryInput) {
+  if ("overallScore" in input || "section" in input) {
+    const payload = buildScoreBlocks(input as SummaryInput);
+    return postSlackSummary(payload);
+  }
+
+  if (input.sections && !input.rubric) {
+    const summaryInput: SummaryInput = {
+      callId: input.callId,
+      repName: input.repName ?? undefined,
+      contactName: input.contactName ?? undefined,
+      company: input.company ?? undefined,
+      overallScore: Number(input.overall ?? 0),
+      section: {
+        intro: Number(input.sections.intro ?? 0),
+        discovery: Number(input.sections.discovery ?? 0),
+        objection: Number(input.sections.objection ?? 0),
+        close: Number(input.sections.close ?? 0),
+      },
+      durationSec: input.durationSec ?? undefined,
+      callUrl: input.callUrl || buildCallUrl(input.callId),
+      recentUrl: input.recentUrl || `${resolveWebBase()}/call-library`,
+    };
+
+    const payload = buildScoreBlocks(summaryInput);
+    return postSlackSummary(payload);
+  }
+
   const payload = buildScoreBlocksFromRubric(input);
   return postSlackSummary(payload);
 }

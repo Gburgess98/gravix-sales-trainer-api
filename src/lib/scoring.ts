@@ -18,6 +18,13 @@ function stableHash(input: string): string {
 }
 
 export type RubricSection = { score: number; notes: string };
+export type VoiceScore = {
+  clarity: number;
+  confidence: number;
+  filler_density: number;
+  pace: number;
+  overall: number;
+};
 export type LlmScore = {
   model: string;
   overall: number;
@@ -26,6 +33,7 @@ export type LlmScore = {
   discovery: RubricSection;
   objection: RubricSection;
   close: RubricSection;
+  voice: VoiceScore;
 };
 
 function sectionSchema() {
@@ -61,6 +69,135 @@ const JSON_SCHEMA = {
 
 function clamp(n: number) {
   return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function clampText(input: unknown, max = 300): string {
+  return String(input || "").trim().slice(0, max);
+}
+
+function normaliseSection(section: any, key: string): RubricSection {
+  if (!section || typeof section !== "object") {
+    throw new Error(`invalid_score_schema:${key}`);
+  }
+
+  const score = Number(section.score);
+  if (!Number.isFinite(score)) {
+    throw new Error(`invalid_score_schema:${key}.score`);
+  }
+
+  const notes = clampText(section.notes, 300);
+  if (!notes) {
+    throw new Error(`invalid_score_schema:${key}.notes`);
+  }
+
+  return {
+    score: clamp(score),
+    notes,
+  };
+}
+
+function parseAndValidateScoreResponse(raw: string): Omit<LlmScore, "voice"> {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("invalid_score_schema:json_parse_failed");
+  }
+
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("invalid_score_schema:root");
+  }
+
+  const overall = Number(parsed.overall);
+  if (!Number.isFinite(overall)) {
+    throw new Error("invalid_score_schema:overall");
+  }
+
+  const summary = clampText(parsed.summary, 220);
+  if (!summary) {
+    throw new Error("invalid_score_schema:summary");
+  }
+
+  return {
+    model: clampText(parsed.model, 120) || AI_MODEL,
+    overall: clamp(overall),
+    summary,
+    intro: normaliseSection(parsed.intro, "intro"),
+    discovery: normaliseSection(parsed.discovery, "discovery"),
+    objection: normaliseSection(parsed.objection, "objection"),
+    close: normaliseSection(parsed.close, "close"),
+  };
+}
+
+function computeVoiceScore(transcript: string, durationSec?: number | null): VoiceScore {
+  const text = String(transcript || "").trim();
+  const words = text ? text.split(/\s+/).filter(Boolean) : [];
+  const wordCount = words.length;
+
+  if (!wordCount || !durationSec || durationSec <= 0) {
+    return {
+      clarity: 60,
+      confidence: 55,
+      filler_density: 0,
+      pace: 50,
+      overall: 55,
+    };
+  }
+
+  const minutes = durationSec / 60;
+  const wpm = minutes > 0 ? wordCount / minutes : 0;
+  const fillerMatches =
+    text.match(/\b(um|uh|erm|er|like|you know|sort of|kind of|basically|literally)\b/gi) || [];
+  const fillerCount = fillerMatches.length;
+  const fillerDensityRaw = wordCount > 0 ? (fillerCount / wordCount) * 100 : 0;
+
+  const sentenceParts = text
+    .split(/[.!?\n]+/)
+    .map((x) => x.trim())
+    .filter(Boolean);
+  const sentenceCount = sentenceParts.length || 1;
+  const avgWordsPerSentence = wordCount / sentenceCount;
+
+  const pacePenalty = Math.min(45, Math.abs(wpm - 145) * 0.45);
+  const pace = clamp(100 - pacePenalty);
+  const clarity = clamp(100 - fillerDensityRaw * 4 - Math.max(0, avgWordsPerSentence - 26) * 1.5);
+  const confidence = clamp(55 + pace * 0.25 + clarity * 0.2 - fillerDensityRaw * 2.5);
+  const fillerDensity = clamp(100 - fillerDensityRaw * 8);
+  const overall = clamp((clarity + confidence + fillerDensity + pace) / 4);
+
+  return {
+    clarity,
+    confidence,
+    filler_density: fillerDensity,
+    pace,
+    overall,
+  };
+}
+
+async function updateCallScoreRow(
+  supabase: SupabaseClient,
+  callId: string,
+  payload: Record<string, any>
+) {
+  let { error } = await supabase.from("calls").update(payload).eq("id", callId);
+  if (!error) return;
+
+  const msg = String((error as any)?.message ?? "").toLowerCase();
+  const missingVoiceCols =
+    (msg.includes("voice_score") || msg.includes("voice_rubric")) &&
+    (msg.includes("column") || msg.includes("schema cache") || msg.includes("could not find"));
+
+  if (missingVoiceCols) {
+    const retryPayload = { ...payload };
+    delete retryPayload.voice_score;
+    delete retryPayload.voice_rubric;
+
+    const retry = await supabase.from("calls").update(retryPayload).eq("id", callId);
+    if (retry.error) throw retry.error;
+    return;
+  }
+
+  throw error;
 }
 
 function normaliseTranscriptForDeterminism(transcript: string): string {
@@ -191,6 +328,9 @@ export function heuristicScoreFallback(): LlmScore {
     score: 68,
     notes: "Deterministic fallback based on minimal call metadata.",
   };
+
+  const voice = computeVoiceScore("", null);
+
   return {
     model: "heuristic:v1",
     overall: s.score,
@@ -199,6 +339,7 @@ export function heuristicScoreFallback(): LlmScore {
     discovery: { ...s },
     objection: { ...s },
     close: { ...s },
+    voice,
   };
 }
 
@@ -272,8 +413,8 @@ async function notifySlack(opts: {
 
     await postScoreSummary({
       callId: opts.callId,
-      overallScore: opts.scores.overall,
-      section: {
+      overall: opts.scores.overall,
+      sections: {
         intro: opts.scores.intro,
         discovery: opts.scores.discovery,
         objection: opts.scores.objection,
@@ -317,6 +458,10 @@ export async function scoreWithLLM(opts: {
     const cached = await readScoreCache(supabase, deterministic.key);
     if (cached) {
       const cachedModelVersion = String((cached as any)?.model || SCORING_MODEL_VERSION);
+      const voice = (cached as any)?.voice ?? computeVoiceScore(
+        deterministic.transcript,
+        (call as any)?.duration_sec ?? null
+      );
       const rubric = buildRubricWithMeta({
         intro: cached.intro,
         discovery: cached.discovery,
@@ -328,19 +473,19 @@ export async function scoreWithLLM(opts: {
         modelVersion: cachedModelVersion,
       });
 
-      const { error: cacheUpErr } = await supabase
-        .from("calls")
-        .update({
-          score_overall: cached.overall,
-          summary: cached.summary,
-          transcript: ((call as any)?.transcript as string | null) ?? null,
-          rubric,
-          ai_model: cachedModelVersion,
-          rubric_version: RUBRIC_VERSION,
-          scored_at: new Date().toISOString(),
-        })
-        .eq("id", callId);
-      if (cacheUpErr) throw cacheUpErr;
+      (rubric as any)._meta.voice = voice;
+
+      await updateCallScoreRow(supabase, callId, {
+        score_overall: cached.overall,
+        summary: cached.summary,
+        transcript: ((call as any)?.transcript as string | null) ?? null,
+        voice_score: voice.overall,
+        voice_rubric: voice,
+        rubric,
+        ai_model: cachedModelVersion,
+        rubric_version: RUBRIC_VERSION,
+        scored_at: new Date().toISOString(),
+      });
 
       await writeScoreHistory(supabase, callId, cachedModelVersion, cached.overall, rubric);
 
@@ -357,8 +502,10 @@ export async function scoreWithLLM(opts: {
           overall: cached.overall,
         },
       });
-
-      return cached;
+      return {
+        ...cached,
+        voice,
+      };
     }
 
     // Build prompt
@@ -404,19 +551,16 @@ export async function scoreWithLLM(opts: {
     const raw = resp.choices?.[0]?.message?.content;
     if (!raw) throw new Error("no_model_content");
 
-    const parsed = JSON.parse(raw) as LlmScore;
-
-    // Clamp & tidy
-    parsed.model = AI_MODEL;
-    parsed.overall = clamp(parsed.overall);
-    (["intro", "discovery", "objection", "close"] as const).forEach((k) => {
-      parsed[k].score = clamp(parsed[k].score);
-      parsed[k].notes = (parsed[k].notes || "").slice(0, 300);
-    });
-    parsed.summary = String(parsed.summary || "").trim().slice(0, 220);
-    if (!parsed.summary) {
-      parsed.summary = "Good baseline structure, but this call needs clearer strengths and weaknesses captured in the summary.";
-    }
+    const validated = parseAndValidateScoreResponse(raw);
+    const voice = computeVoiceScore(
+      deterministic.transcript,
+      (call as any)?.duration_sec ?? null
+    );
+    const parsed: LlmScore = {
+      ...validated,
+      model: AI_MODEL,
+      voice,
+    };
 
     const rubric = buildRubricWithMeta({
       intro: parsed.intro,
@@ -429,20 +573,20 @@ export async function scoreWithLLM(opts: {
       modelVersion: SCORING_MODEL_VERSION,
     });
 
+    (rubric as any)._meta.voice = voice;
+
     // Persist latest on calls
-    const { error: upErr } = await supabase
-      .from("calls")
-      .update({
-        score_overall: parsed.overall,
-        summary: parsed.summary,
-        transcript: ((call as any)?.transcript as string | null) ?? null,
-        rubric,
-        ai_model: SCORING_MODEL_VERSION,
-        rubric_version: RUBRIC_VERSION,
-        scored_at: new Date().toISOString(),
-      })
-      .eq("id", callId);
-    if (upErr) throw upErr;
+    await updateCallScoreRow(supabase, callId, {
+      score_overall: parsed.overall,
+      summary: parsed.summary,
+      transcript: ((call as any)?.transcript as string | null) ?? null,
+      voice_score: voice.overall,
+      voice_rubric: voice,
+      rubric,
+      ai_model: SCORING_MODEL_VERSION,
+      rubric_version: RUBRIC_VERSION,
+      scored_at: new Date().toISOString(),
+    });
 
     // History row (non-blocking)
     await writeScoreHistory(supabase, callId, SCORING_MODEL_VERSION, parsed.overall, rubric);
@@ -503,6 +647,8 @@ export async function scoreWithLLM(opts: {
 
     const fb = heuristicScoreFallback();
 
+    const fallbackVoice = computeVoiceScore("", null);
+
     const fallbackModelVersion = `${fb.model}:${SCORING_PROMPT_VERSION}:${RUBRIC_VERSION}`;
     const rubric = buildRubricWithMeta({
       intro: fb.intro,
@@ -515,17 +661,18 @@ export async function scoreWithLLM(opts: {
       modelVersion: fallbackModelVersion,
     });
 
-    await opts.supabase
-      .from("calls")
-      .update({
-        score_overall: fb.overall,
-        summary: fb.summary,
-        rubric,
-        ai_model: fallbackModelVersion,
-        rubric_version: RUBRIC_VERSION,
-        scored_at: new Date().toISOString(),
-      })
-      .eq("id", opts.callId);
+    (rubric as any)._meta.voice = fallbackVoice;
+
+    await updateCallScoreRow(opts.supabase, opts.callId, {
+      score_overall: fb.overall,
+      summary: fb.summary,
+      voice_score: fallbackVoice.overall,
+      voice_rubric: fallbackVoice,
+      rubric,
+      ai_model: fallbackModelVersion,
+      rubric_version: RUBRIC_VERSION,
+      scored_at: new Date().toISOString(),
+    });
 
     // History row (non-blocking)
     await writeScoreHistory(opts.supabase, opts.callId, fallbackModelVersion, fb.overall, rubric);
@@ -568,7 +715,7 @@ export async function scoreWithLLM(opts: {
         .eq("id", opts.callId)
         .single();
       durationSec = (data as any)?.duration_sec ?? null;
-    } catch {}
+    } catch { }
 
     // Slack fallback
     await notifySlack({
@@ -585,6 +732,9 @@ export async function scoreWithLLM(opts: {
       },
     });
 
-    return fb;
+    return {
+      ...fb,
+      voice: fallbackVoice,
+    };
   }
 }
