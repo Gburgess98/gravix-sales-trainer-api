@@ -3,6 +3,13 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "@supabase/supabase-js";
 import { getOpenAI, AI_MODEL, OPENAI_TIMEOUT_MS } from "./openai";
 import { postScoreSummary } from "./slack";
+import type {
+  CallAnalysis,
+  CallAnalysisStages,
+  CallMoment,
+  StageScore,
+  VoiceAnalysis,
+} from "./types/call-analysis";
 
 export const RUBRIC_VERSION = "v1"; // bump when rubric changes
 export const SCORING_PROMPT_VERSION = "v1";
@@ -17,23 +24,10 @@ function stableHash(input: string): string {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
-export type RubricSection = { score: number; notes: string };
-export type VoiceScore = {
-  clarity: number;
-  confidence: number;
-  filler_density: number;
-  pace: number;
-  overall: number;
-};
-export type LlmScore = {
+export type RubricSection = StageScore;
+export type VoiceScore = VoiceAnalysis;
+export type LlmScore = CallAnalysis & {
   model: string;
-  overall: number;
-  summary: string;
-  intro: RubricSection;
-  discovery: RubricSection;
-  objection: RubricSection;
-  close: RubricSection;
-  voice: VoiceScore;
 };
 
 function sectionSchema() {
@@ -48,6 +42,50 @@ function sectionSchema() {
   };
 }
 
+function stagesSchema() {
+  return {
+    type: "object",
+    properties: {
+      intro: sectionSchema(),
+      discovery: sectionSchema(),
+      objection: sectionSchema(),
+      close: sectionSchema(),
+    },
+    required: ["intro", "discovery", "objection", "close"],
+    additionalProperties: false,
+  };
+}
+
+function momentsSchema() {
+  return {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        timestamp: { type: "number" },
+        type: {
+          type: "string",
+          enum: ["objection", "mistake", "highlight", "closing_attempt"],
+        },
+        text: { type: "string", maxLength: 280 },
+        severity: {
+          type: "string",
+          enum: ["low", "medium", "high"],
+        },
+      },
+      required: ["type", "text"],
+      additionalProperties: false,
+    },
+  };
+}
+
+function suggestionsSchema() {
+  return {
+    type: "array",
+    items: { type: "string", maxLength: 220 },
+  };
+}
+
 const JSON_SCHEMA = {
   name: "SalesCallScore",
   schema: {
@@ -56,12 +94,11 @@ const JSON_SCHEMA = {
       model: { type: "string" },
       overall: { type: "integer", minimum: 0, maximum: 100 },
       summary: { type: "string", maxLength: 220 },
-      intro: sectionSchema(),
-      discovery: sectionSchema(),
-      objection: sectionSchema(),
-      close: sectionSchema(),
+      stages: stagesSchema(),
+      moments: momentsSchema(),
+      suggestions: suggestionsSchema(),
     },
-    required: ["model", "overall", "summary", "intro", "discovery", "objection", "close"],
+    required: ["model", "overall", "summary", "stages", "moments", "suggestions"],
     additionalProperties: false,
   },
   strict: true,
@@ -74,6 +111,7 @@ function clamp(n: number) {
 function clampText(input: unknown, max = 300): string {
   return String(input || "").trim().slice(0, max);
 }
+
 
 function normaliseSection(section: any, key: string): RubricSection {
   if (!section || typeof section !== "object") {
@@ -93,6 +131,78 @@ function normaliseSection(section: any, key: string): RubricSection {
   return {
     score: clamp(score),
     notes,
+  };
+}
+
+function normaliseStages(input: any): CallAnalysisStages {
+  const source = input?.stages && typeof input.stages === "object" ? input.stages : input;
+  return {
+    intro: normaliseSection(source?.intro, "intro"),
+    discovery: normaliseSection(source?.discovery, "discovery"),
+    objection: normaliseSection(source?.objection, "objection"),
+    close: normaliseSection(source?.close, "close"),
+  };
+}
+
+function normaliseMoments(input: any): CallMoment[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((moment: any) => {
+      const type = String(moment?.type || "").trim();
+      const text = clampText(moment?.text, 280);
+      const severity = String(moment?.severity || "").trim();
+      const timestamp = Number(moment?.timestamp);
+
+      if (!type || !text) return null;
+      if (!["objection", "mistake", "highlight", "closing_attempt"].includes(type)) return null;
+
+      return {
+        type: type as CallMoment["type"],
+        text,
+        severity: ["low", "medium", "high"].includes(severity)
+          ? (severity as CallMoment["severity"])
+          : undefined,
+        timestamp: Number.isFinite(timestamp) ? timestamp : undefined,
+      };
+    })
+    .filter(Boolean) as CallMoment[];
+}
+
+function normaliseSuggestions(input: any): string[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .map((x) => clampText(x, 220))
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+function normaliseVoiceScore(input: any): VoiceScore {
+  const fallback = computeVoiceScore("", null);
+  if (!input || typeof input !== "object") return fallback;
+
+  return {
+    clarity: clamp(Number(input.clarity ?? fallback.clarity)),
+    confidence: clamp(Number(input.confidence ?? fallback.confidence)),
+    filler_density: clamp(Number(input.filler_density ?? fallback.filler_density)),
+    pace: clamp(Number(input.pace ?? fallback.pace)),
+    overall: clamp(Number(input.overall ?? fallback.overall)),
+  };
+}
+
+function normaliseStoredScore(input: any): LlmScore {
+  const stages = normaliseStages(input);
+  const voice = normaliseVoiceScore(
+    input?.voice ?? input?.rubric?._meta?.voice ?? null
+  );
+
+  return {
+    model: clampText(input?.model, 120) || AI_MODEL,
+    overall: clamp(Number(input?.overall ?? 0)),
+    summary: clampText(input?.summary, 220) || "No summary available.",
+    stages,
+    moments: normaliseMoments(input?.moments),
+    suggestions: normaliseSuggestions(input?.suggestions),
+    voice,
   };
 }
 
@@ -122,10 +232,9 @@ function parseAndValidateScoreResponse(raw: string): Omit<LlmScore, "voice"> {
     model: clampText(parsed.model, 120) || AI_MODEL,
     overall: clamp(overall),
     summary,
-    intro: normaliseSection(parsed.intro, "intro"),
-    discovery: normaliseSection(parsed.discovery, "discovery"),
-    objection: normaliseSection(parsed.objection, "objection"),
-    close: normaliseSection(parsed.close, "close"),
+    stages: normaliseStages(parsed.stages),
+    moments: normaliseMoments(parsed.moments),
+    suggestions: normaliseSuggestions(parsed.suggestions),
   };
 }
 
@@ -174,12 +283,161 @@ function computeVoiceScore(transcript: string, durationSec?: number | null): Voi
   };
 }
 
+function detectMomentsFromTranscript(
+  transcript: string,
+  segments?: Array<{ speaker?: string; start_sec?: number; end_sec?: number; text?: string }>
+): CallMoment[] {
+  const sourceSegments = Array.isArray(segments) && segments.length > 0
+    ? segments
+    : String(transcript || "")
+        .split(/\n+/)
+        .map((text, i) => ({
+          speaker: i % 2 === 0 ? "Speaker 1" : "Speaker 2",
+          start_sec: i * 4,
+          end_sec: i * 4 + 4,
+          text,
+        }));
+
+  const moments: CallMoment[] = [];
+
+  for (const seg of sourceSegments) {
+    const text = String(seg?.text || "").trim();
+    if (!text) continue;
+
+    const lower = text.toLowerCase();
+    const timestamp =
+      typeof seg?.start_sec === "number" ? seg.start_sec : undefined;
+
+    if (
+      lower.includes("not interested") ||
+      lower.includes("we're okay") ||
+      lower.includes("we are okay") ||
+      lower.includes("no time") ||
+      lower.includes("outside help")
+    ) {
+      moments.push({
+        timestamp,
+        type: "objection",
+        text,
+        severity: "high",
+      });
+      continue;
+    }
+
+    if (
+      lower.includes("does that mean") ||
+      lower.includes("why") ||
+      lower.includes("how") ||
+      lower.includes("what happens")
+    ) {
+      moments.push({
+        timestamp,
+        type: "highlight",
+        text,
+        severity: "medium",
+      });
+      continue;
+    }
+
+    if (
+      lower.includes("call me back") ||
+      lower.includes("couple weeks") ||
+      lower.includes("send you an email") ||
+      lower.includes("revisit this")
+    ) {
+      moments.push({
+        timestamp,
+        type: "closing_attempt",
+        text,
+        severity: "medium",
+      });
+      continue;
+    }
+  }
+
+  // --- DEDUPE + CLEAN ---
+  const seen = new Set<string>();
+
+  const deduped = moments.filter((m) => {
+    const key = `${m.type}-${m.text.toLowerCase().slice(0, 60)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // Prioritise higher-severity moments first, then earlier timestamps.
+  deduped.sort((a, b) => {
+    const weight = { high: 3, medium: 2, low: 1 } as const;
+    const severityDiff = (weight[b.severity || "low"] || 1) - (weight[a.severity || "low"] || 1);
+    if (severityDiff !== 0) return severityDiff;
+
+    const aTs = typeof a.timestamp === "number" ? a.timestamp : Number.MAX_SAFE_INTEGER;
+    const bTs = typeof b.timestamp === "number" ? b.timestamp : Number.MAX_SAFE_INTEGER;
+    return aTs - bTs;
+  });
+
+  return deduped.slice(0, 6);
+}
+
+function buildSuggestionsFromAnalysis(args: {
+  overall: number;
+  stages: CallAnalysisStages;
+  moments: CallMoment[];
+}): string[] {
+  const suggestions: string[] = [];
+
+  if (args.stages.discovery.score < 60) {
+    suggestions.push("Ask 2 more discovery questions before pitching.");
+  }
+
+  if (args.stages.objection.score < 60) {
+    suggestions.push("Slow down and isolate the real objection before rebutting.");
+  }
+
+  if (args.stages.close.score < 60) {
+    suggestions.push("End with a clearer next step and a direct commitment ask.");
+  }
+
+  if (args.moments.some((m) => m.type === "objection")) {
+    suggestions.push("Review the objection moments and rehearse a tighter value reframe.");
+  }
+
+  if (args.overall >= 70 && suggestions.length === 0) {
+    suggestions.push("Keep the structure, but tighten follow-up questions to raise conversion odds.");
+  }
+
+  return suggestions.slice(0, 4);
+}
+
+
 async function updateCallScoreRow(
   supabase: SupabaseClient,
   callId: string,
   payload: Record<string, any>
 ) {
-  let { error } = await supabase.from("calls").update(payload).eq("id", callId);
+  const nextPayload = { ...payload };
+
+  // Preserve existing structured transcript / analysis data when scoring writes analysis_json.
+  if (nextPayload.analysis_json) {
+    try {
+      const { data: existingRow, error: existingErr } = await supabase
+        .from("calls")
+        .select("analysis_json")
+        .eq("id", callId)
+        .maybeSingle();
+
+      if (!existingErr) {
+        nextPayload.analysis_json = {
+          ...(((existingRow as any)?.analysis_json as Record<string, any> | null) ?? {}),
+          ...(nextPayload.analysis_json as Record<string, any>),
+        };
+      }
+    } catch {
+      // best effort only — do not block scoring if merge lookup fails
+    }
+  }
+
+  let { error } = await supabase.from("calls").update(nextPayload).eq("id", callId);
   if (!error) return;
 
   const msg = String((error as any)?.message ?? "").toLowerCase();
@@ -188,7 +446,7 @@ async function updateCallScoreRow(
     (msg.includes("column") || msg.includes("schema cache") || msg.includes("could not find"));
 
   if (missingVoiceCols) {
-    const retryPayload = { ...payload };
+    const retryPayload = { ...nextPayload };
     delete retryPayload.voice_score;
     delete retryPayload.voice_rubric;
 
@@ -198,6 +456,160 @@ async function updateCallScoreRow(
   }
 
   throw error;
+}
+
+// --- Rep Memory Helper Types & Functions ---
+type RepMemoryInput = {
+  userId: string;
+  companyId?: string | null;
+  callId: string;
+  overall: number;
+  stages: CallAnalysisStages;
+  voice?: VoiceScore | null;
+  moments: CallMoment[];
+};
+
+function uniqueStrings(items: string[]): string[] {
+  return Array.from(new Set(items.map((x) => String(x).trim()).filter(Boolean)));
+}
+
+function buildRepMemoryLabels(args: {
+  overall: number;
+  stages: CallAnalysisStages;
+  moments: CallMoment[];
+  voice?: VoiceScore | null;
+}) {
+  const strengths: string[] = [];
+  const weaknesses: string[] = [];
+  const coachingFocus: string[] = [];
+
+  const { stages, moments, voice } = args;
+
+  const stageEntries = [
+    { name: "Intro", score: stages.intro.score },
+    { name: "Discovery", score: stages.discovery.score },
+    { name: "Objection handling", score: stages.objection.score },
+    { name: "Close", score: stages.close.score },
+  ].sort((a, b) => b.score - a.score);
+
+  // Always keep the rep's strongest 1-2 stage areas, even if the overall call was weak.
+  for (const s of stageEntries.slice(0, 2)) {
+    if (s.score >= 40) strengths.push(s.name);
+  }
+
+  if ((voice?.clarity ?? 0) >= 70) strengths.push("Clarity");
+  if ((voice?.confidence ?? 0) >= 70) strengths.push("Confidence");
+
+  if (stages.intro.score < 45) weaknesses.push("Intro");
+  if (stages.discovery.score < 60) weaknesses.push("Discovery");
+  if (stages.objection.score < 60) weaknesses.push("Objection handling");
+  if (stages.close.score < 60) weaknesses.push("Close");
+  if ((voice?.clarity ?? 100) < 55) weaknesses.push("Clarity");
+  if ((voice?.confidence ?? 100) < 55) weaknesses.push("Confidence");
+  if ((voice?.pace ?? 100) < 50) weaknesses.push("Pace");
+
+  if (stages.discovery.score < 60) {
+    coachingFocus.push("Ask more discovery questions before pitching");
+  }
+  if (stages.objection.score < 60) {
+    coachingFocus.push("Slow down and isolate objections before rebutting");
+  }
+  if (stages.close.score < 60) {
+    coachingFocus.push("End with a clearer next step and direct commitment ask");
+  }
+  if (moments.some((m) => m.type === "objection")) {
+    coachingFocus.push("Rehearse objection handling around the flagged pushback moments");
+  }
+  if ((voice?.confidence ?? 100) < 60) {
+    coachingFocus.push("Improve vocal confidence and certainty in delivery");
+  }
+
+  return {
+    strengths: uniqueStrings(strengths).slice(0, 5),
+    weaknesses: uniqueStrings(weaknesses).slice(0, 5),
+    coachingFocus: uniqueStrings(coachingFocus).slice(0, 5),
+  };
+}
+
+async function upsertRepMemory(
+  supabase: SupabaseClient,
+  input: RepMemoryInput
+) {
+  const { userId, companyId, callId, overall, stages, voice, moments } = input;
+
+  const { data: existing, error: existingErr } = await supabase
+    .from("rep_memory")
+    .select("*")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (existingErr) throw existingErr;
+
+  const labels = buildRepMemoryLabels({
+    overall,
+    stages,
+    moments,
+    voice,
+  });
+
+  const nextCallCount = Number((existing as any)?.call_count ?? 0) + 1;
+
+  const rolling = (prev: any, next: number) => {
+    const prevNum = Number(prev ?? 0);
+    const countBefore = Math.max(0, nextCallCount - 1);
+    if (countBefore === 0) return next;
+    return Number((((prevNum * countBefore) + next) / nextCallCount).toFixed(2));
+  };
+
+  const avgScore = rolling((existing as any)?.avg_score, overall);
+  const introScore = rolling((existing as any)?.intro_score, stages.intro.score);
+  const discoveryScore = rolling((existing as any)?.discovery_score, stages.discovery.score);
+  const objectionScore = rolling((existing as any)?.objection_score, stages.objection.score);
+  const closeScore = rolling((existing as any)?.close_score, stages.close.score);
+
+  const trendOverall =
+    (existing as any)?.avg_score != null ? Number((overall - Number((existing as any).avg_score)).toFixed(2)) : 0;
+  const trendObjection =
+    (existing as any)?.objection_score != null ? Number((stages.objection.score - Number((existing as any).objection_score)).toFixed(2)) : 0;
+  const trendClose =
+    (existing as any)?.close_score != null ? Number((stages.close.score - Number((existing as any).close_score)).toFixed(2)) : 0;
+
+  const payload = {
+    user_id: userId,
+    company_id: companyId ?? null,
+    avg_score: avgScore,
+    intro_score: introScore,
+    discovery_score: discoveryScore,
+    objection_score: objectionScore,
+    close_score: closeScore,
+    trend_overall: trendOverall,
+    trend_objection: trendObjection,
+    trend_close: trendClose,
+    filler_word_rate: voice?.filler_density ?? null,
+    talk_ratio: null,
+    strengths: labels.strengths,
+    weaknesses: labels.weaknesses,
+    coaching_focus: labels.coachingFocus,
+    call_count: nextCallCount,
+    last_call_id: callId,
+    last_updated: new Date().toISOString(),
+  };
+
+  if ((existing as any)?.id) {
+    const { error: updateErr } = await supabase
+      .from("rep_memory")
+      .update(payload)
+      .eq("id", (existing as any).id);
+
+    if (updateErr) throw updateErr;
+    return;
+  }
+
+  const { error: insertErr } = await supabase
+    .from("rep_memory")
+    .insert(payload);
+
+  if (insertErr) throw insertErr;
 }
 
 function normaliseTranscriptForDeterminism(transcript: string): string {
@@ -335,10 +747,14 @@ export function heuristicScoreFallback(): LlmScore {
     model: "heuristic:v1",
     overall: s.score,
     summary: "Solid overall structure, but a fuller transcript is needed for a reliable coaching summary.",
-    intro: { ...s },
-    discovery: { ...s },
-    objection: { ...s },
-    close: { ...s },
+    stages: {
+      intro: { ...s },
+      discovery: { ...s },
+      objection: { ...s },
+      close: { ...s },
+    },
+    moments: [],
+    suggestions: [],
     voice,
   };
 }
@@ -443,7 +859,7 @@ export async function scoreWithLLM(opts: {
     // Pull minimal call meta (include duration for Slack; user_id to resolve rep)
     const { data: call, error: callErr } = await supabase
       .from("calls")
-      .select("id, filename, user_id, duration_sec, sha256, transcript")
+      .select("id, filename, user_id, duration_sec, sha256, transcript, analysis_json")
       .eq("id", callId)
       .single();
     if (callErr || !call) throw new Error("call_not_found");
@@ -457,16 +873,37 @@ export async function scoreWithLLM(opts: {
 
     const cached = await readScoreCache(supabase, deterministic.key);
     if (cached) {
-      const cachedModelVersion = String((cached as any)?.model || SCORING_MODEL_VERSION);
-      const voice = (cached as any)?.voice ?? computeVoiceScore(
+      const cachedScore = normaliseStoredScore(cached);
+      const cachedModelVersion = String(cachedScore.model || SCORING_MODEL_VERSION);
+      const voice = cachedScore.voice ?? computeVoiceScore(
         deterministic.transcript,
         (call as any)?.duration_sec ?? null
       );
+      const transcriptSegments =
+        (call as any)?.analysis_json?.transcript?.segments ?? [];
+
+      const derivedMoments =
+        cachedScore.moments?.length > 0
+          ? cachedScore.moments
+          : detectMomentsFromTranscript(
+              deterministic.transcript,
+              transcriptSegments
+            );
+
+      const derivedSuggestions =
+        cachedScore.suggestions?.length > 0
+          ? cachedScore.suggestions
+          : buildSuggestionsFromAnalysis({
+              overall: cachedScore.overall,
+              stages: cachedScore.stages,
+              moments: derivedMoments,
+            });
+
       const rubric = buildRubricWithMeta({
-        intro: cached.intro,
-        discovery: cached.discovery,
-        objection: cached.objection,
-        close: cached.close,
+        intro: cachedScore.stages.intro,
+        discovery: cachedScore.stages.discovery,
+        objection: cachedScore.stages.objection,
+        close: cachedScore.stages.close,
         callSha256: ((call as any)?.sha256 as string | null) ?? null,
         transcriptHash: deterministic.transcriptHash,
         transcriptPresent: Boolean(deterministic.transcript),
@@ -476,18 +913,26 @@ export async function scoreWithLLM(opts: {
       (rubric as any)._meta.voice = voice;
 
       await updateCallScoreRow(supabase, callId, {
-        score_overall: cached.overall,
-        summary: cached.summary,
+        score_overall: cachedScore.overall,
+        summary: cachedScore.summary,
         transcript: ((call as any)?.transcript as string | null) ?? null,
         voice_score: voice.overall,
         voice_rubric: voice,
         rubric,
+        analysis_json: {
+          overall: cachedScore.overall,
+          stages: cachedScore.stages,
+          moments: derivedMoments,
+          suggestions: derivedSuggestions,
+          summary: cachedScore.summary,
+          voice,
+        },
         ai_model: cachedModelVersion,
         rubric_version: RUBRIC_VERSION,
         scored_at: new Date().toISOString(),
       });
 
-      await writeScoreHistory(supabase, callId, cachedModelVersion, cached.overall, rubric);
+      await writeScoreHistory(supabase, callId, cachedModelVersion, cachedScore.overall, rubric);
 
       await notifySlack({
         supabase,
@@ -495,15 +940,30 @@ export async function scoreWithLLM(opts: {
         repIdFallback: (call as any)?.user_id ?? null,
         durationSec: (call as any)?.duration_sec ?? null,
         scores: {
-          intro: cached.intro.score,
-          discovery: cached.discovery.score,
-          objection: cached.objection.score,
-          close: cached.close.score,
-          overall: cached.overall,
+          intro: cachedScore.stages.intro.score,
+          discovery: cachedScore.stages.discovery.score,
+          objection: cachedScore.stages.objection.score,
+          close: cachedScore.stages.close.score,
+          overall: cachedScore.overall,
         },
       });
+      try {
+        await upsertRepMemory(supabase, {
+          userId: String((call as any)?.user_id),
+          companyId: (call as any)?.org_id ?? null,
+          callId,
+          overall: cachedScore.overall,
+          stages: cachedScore.stages,
+          voice,
+          moments: derivedMoments,
+        });
+      } catch (e: any) {
+        console.warn("[rep_memory] cache-hit update failed", e?.message || e);
+      }
       return {
-        ...cached,
+        ...cachedScore,
+        moments: derivedMoments,
+        suggestions: derivedSuggestions,
         voice,
       };
     }
@@ -522,8 +982,11 @@ export async function scoreWithLLM(opts: {
       "- Discovery: deep questions, pain/impact, budget/timeline, authority.",
       "- Objection: isolates true objection, reframes value, tests commitment.",
       "- Close: clear next step, assumptive/binary ask, time/date locked.",
-      "Also return a short coaching summary in 1-2 sentences (max 220 chars) that explains the main strength and main weakness of the call.",
-      "For identical transcripts, hashes, rubric versions, and prompt versions, return identical section scores, overall score, and materially consistent reasoning.",
+      "Return a short coaching summary in 1-2 sentences (max 220 chars) that explains the main strength and main weakness of the call.",
+      "Return stage scores under stages.intro, stages.discovery, stages.objection, and stages.close.",
+      "Return moments as an array of notable call moments using timestamps when possible. Focus on objections, mistakes, highlights, and closing attempts.",
+      "Return suggestions as an array of short actionable coaching suggestions based on the weakest stages and moments.",
+      "For identical transcripts, hashes, rubric versions, and prompt versions, return identical stage scores, overall score, moments, suggestions, and materially consistent reasoning.",
     ];
     const user = userLines.join("\n");
 
@@ -562,11 +1025,31 @@ export async function scoreWithLLM(opts: {
       voice,
     };
 
+    const transcriptSegments =
+      (call as any)?.analysis_json?.transcript?.segments ?? [];
+
+    const derivedMoments = detectMomentsFromTranscript(
+      deterministic.transcript,
+      transcriptSegments
+    );
+
+    const derivedSuggestions =
+      parsed.suggestions?.length > 0
+        ? parsed.suggestions
+        : buildSuggestionsFromAnalysis({
+            overall: parsed.overall,
+            stages: parsed.stages,
+            moments: derivedMoments,
+          });
+
+    parsed.moments = derivedMoments;
+    parsed.suggestions = derivedSuggestions;
+
     const rubric = buildRubricWithMeta({
-      intro: parsed.intro,
-      discovery: parsed.discovery,
-      objection: parsed.objection,
-      close: parsed.close,
+      intro: parsed.stages.intro,
+      discovery: parsed.stages.discovery,
+      objection: parsed.stages.objection,
+      close: parsed.stages.close,
       callSha256: ((call as any)?.sha256 as string | null) ?? null,
       transcriptHash: deterministic.transcriptHash,
       transcriptPresent: Boolean(deterministic.transcript),
@@ -583,6 +1066,14 @@ export async function scoreWithLLM(opts: {
       voice_score: voice.overall,
       voice_rubric: voice,
       rubric,
+      analysis_json: {
+        overall: parsed.overall,
+        stages: parsed.stages,
+        moments: parsed.moments,
+        suggestions: parsed.suggestions,
+        summary: parsed.summary,
+        voice,
+      },
       ai_model: SCORING_MODEL_VERSION,
       rubric_version: RUBRIC_VERSION,
       scored_at: new Date().toISOString(),
@@ -628,13 +1119,26 @@ export async function scoreWithLLM(opts: {
       repIdFallback: (call as any)?.user_id ?? null,
       durationSec: (call as any)?.duration_sec ?? null,
       scores: {
-        intro: parsed.intro.score,
-        discovery: parsed.discovery.score,
-        objection: parsed.objection.score,
-        close: parsed.close.score,
+        intro: parsed.stages.intro.score,
+        discovery: parsed.stages.discovery.score,
+        objection: parsed.stages.objection.score,
+        close: parsed.stages.close.score,
         overall: parsed.overall,
       },
     });
+    try {
+      await upsertRepMemory(supabase, {
+        userId: String((call as any)?.user_id),
+        companyId: (call as any)?.org_id ?? null,
+        callId,
+        overall: parsed.overall,
+        stages: parsed.stages,
+        voice,
+        moments: parsed.moments,
+      });
+    } catch (e: any) {
+      console.warn("[rep_memory] success update failed", e?.message || e);
+    }
 
     return parsed;
   } catch (err: any) {
@@ -649,12 +1153,37 @@ export async function scoreWithLLM(opts: {
 
     const fallbackVoice = computeVoiceScore("", null);
 
+    let transcriptSegments: any[] = [];
+    let transcriptText = "";
+
+    try {
+      const { data: callRow } = await opts.supabase
+        .from("calls")
+        .select("transcript, analysis_json")
+        .eq("id", opts.callId)
+        .maybeSingle();
+
+      transcriptText = String((callRow as any)?.transcript || "");
+      transcriptSegments = (callRow as any)?.analysis_json?.transcript?.segments ?? [];
+    } catch {}
+
+    const fallbackMoments = detectMomentsFromTranscript(
+      transcriptText,
+      transcriptSegments
+    );
+
+    const fallbackSuggestions = buildSuggestionsFromAnalysis({
+      overall: fb.overall,
+      stages: fb.stages,
+      moments: fallbackMoments,
+    });
+
     const fallbackModelVersion = `${fb.model}:${SCORING_PROMPT_VERSION}:${RUBRIC_VERSION}`;
     const rubric = buildRubricWithMeta({
-      intro: fb.intro,
-      discovery: fb.discovery,
-      objection: fb.objection,
-      close: fb.close,
+      intro: fb.stages.intro,
+      discovery: fb.stages.discovery,
+      objection: fb.stages.objection,
+      close: fb.stages.close,
       callSha256: null,
       transcriptHash: null,
       transcriptPresent: false,
@@ -669,6 +1198,14 @@ export async function scoreWithLLM(opts: {
       voice_score: fallbackVoice.overall,
       voice_rubric: fallbackVoice,
       rubric,
+      analysis_json: {
+        overall: fb.overall,
+        stages: fb.stages,
+        moments: fallbackMoments,
+        suggestions: fallbackSuggestions,
+        summary: fb.summary,
+        voice: fallbackVoice,
+      },
       ai_model: fallbackModelVersion,
       rubric_version: RUBRIC_VERSION,
       scored_at: new Date().toISOString(),
@@ -724,16 +1261,37 @@ export async function scoreWithLLM(opts: {
       repIdFallback: null,
       durationSec,
       scores: {
-        intro: fb.intro.score,
-        discovery: fb.discovery.score,
-        objection: fb.objection.score,
-        close: fb.close.score,
+        intro: fb.stages.intro.score,
+        discovery: fb.stages.discovery.score,
+        objection: fb.stages.objection.score,
+        close: fb.stages.close.score,
         overall: fb.overall,
       },
     });
+    try {
+      const { data: memoryCall } = await opts.supabase
+        .from("calls")
+        .select("user_id, org_id")
+        .eq("id", opts.callId)
+        .maybeSingle();
+
+      await upsertRepMemory(opts.supabase, {
+        userId: String((memoryCall as any)?.user_id),
+        companyId: (memoryCall as any)?.org_id ?? null,
+        callId: opts.callId,
+        overall: fb.overall,
+        stages: fb.stages,
+        voice: fallbackVoice,
+        moments: fallbackMoments,
+      });
+    } catch (e: any) {
+      console.warn("[rep_memory] fallback update failed", e?.message || e);
+    }
 
     return {
       ...fb,
+      moments: fallbackMoments,
+      suggestions: fallbackSuggestions,
       voice: fallbackVoice,
     };
   }

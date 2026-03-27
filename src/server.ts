@@ -907,10 +907,10 @@ app.post("/v1/admin/force-score/:id", requireAdmin, async (req, res) => {
         filename: call.filename,
         overall: result.overall,
         sections: {
-          intro: result.intro.score,
-          discovery: result.discovery.score,
-          objection: result.objection.score,
-          close: result.close.score,
+          intro: result.stages.intro.score,
+          discovery: result.stages.discovery.score,
+          objection: result.stages.objection.score,
+          close: result.stages.close.score,
         },
         siteUrl: WEB,
       });
@@ -1722,10 +1722,10 @@ async function simulateScore(jobId: string, callId: string) {
         model: result.model,
         overall: result.overall,
         sections: {
-          intro: result.intro.score,
-          discovery: result.discovery.score,
-          objection: result.objection.score,
-          close: result.close.score,
+          intro: result.stages.intro.score,
+          discovery: result.stages.discovery.score,
+          objection: result.stages.objection.score,
+          close: result.stages.close.score,
         },
       },
     });
@@ -1736,7 +1736,7 @@ async function simulateScore(jobId: string, callId: string) {
 
     // Activity: call scored (best-effort)
     try {
-      const summary = `Scored ${Math.round(result.overall)} — Intro ${Math.round(result.intro.score)} / Disc ${Math.round(result.discovery.score)} / Obj ${Math.round(result.objection.score)} / Close ${Math.round(result.close.score)}`;
+      const summary = `Scored ${Math.round(result.overall)} — Intro ${Math.round(result.stages.intro.score)} / Disc ${Math.round(result.stages.discovery.score)} / Obj ${Math.round(result.stages.objection.score)} / Close ${Math.round(result.stages.close.score)}`;
       await supabase.from("activities").insert({
         type: "call_scored",
         summary,
@@ -1763,10 +1763,10 @@ async function simulateScore(jobId: string, callId: string) {
         filename: callRow.filename,
         overall: result.overall,
         sections: {
-          intro: result.intro.score,
-          discovery: result.discovery.score,
-          objection: result.objection.score,
-          close: result.close.score,
+          intro: result.stages.intro.score,
+          discovery: result.stages.discovery.score,
+          objection: result.stages.objection.score,
+          close: result.stages.close.score,
         },
         siteUrl: WEB,
       });
@@ -1787,10 +1787,16 @@ async function simulateTranscription(jobId: string, callId: string, _storagePath
 
   await new Promise((r) => setTimeout(r, 300));
 
-  let transcriptResult: { model: string; text: string; words: any[] } = {
+  let transcriptResult: {
+    model: string;
+    text: string;
+    words: any[];
+    segments?: { speaker: string; start_sec: number; end_sec: number; text: string }[];
+  } = {
     model: "whisper-stub",
     text: "This is a stub transcript. Replace with real Whisper/Deepgram later.",
     words: [],
+    segments: [],
   };
 
   try {
@@ -1812,12 +1818,36 @@ async function simulateTranscription(jobId: string, callId: string, _storagePath
         model,
       });
 
-      const text = String((tx as any)?.text || "").trim();
-      if (text) {
+      const rawText = String((tx as any)?.text || "").trim();
+
+      if (rawText) {
+        // --- Cleanup ---
+        const cleaned = rawText
+          .replace(/\s+/g, " ")
+          .replace(/\.\s+/g, ".\n")
+          .trim();
+
+        // --- Basic segmentation (sentence-based fallback) ---
+        const sentences = cleaned.split("\n").filter(Boolean);
+
+        let cursor = 0;
+        const segments = sentences.map((s, i) => {
+          const duration = Math.max(2, Math.min(8, Math.ceil(s.length / 20)));
+          const seg = {
+            speaker: i % 2 === 0 ? "Rep" : "Prospect",
+            start_sec: cursor,
+            end_sec: cursor + duration,
+            text: s.trim(),
+          };
+          cursor += duration;
+          return seg;
+        });
+
         transcriptResult = {
           model,
-          text,
+          text: cleaned,
           words: [],
+          segments,
         };
       }
     }
@@ -1834,6 +1864,12 @@ async function simulateTranscription(jobId: string, callId: string, _storagePath
     .update({
       status: "processed",
       transcript: transcriptText || null,
+      analysis_json: {
+        transcript: {
+          text: transcriptText,
+          segments: transcriptResult.segments || [],
+        },
+      },
       updated_at: new Date().toISOString(),
     })
     .eq("id", callId);

@@ -756,7 +756,8 @@ router.get("/:id", async (req, res) => {
   summary,
   flags,
   transcript,
-  rubric
+  rubric,
+  analysis_json
 `;
 
     const extendedSelect = `
@@ -814,6 +815,7 @@ router.get("/:id", async (req, res) => {
       flags: call.flags ?? [],
       transcript: (call as any).transcript ?? null,
       rubric: (call as any).rubric ?? null,
+      analysis_json: (call as any).analysis_json ?? null,
       voice_score: (call as any).voice_score ?? null,
       voice_rubric: (call as any).voice_rubric ?? null,
       review_tags: (call as any).review_tags ?? null,

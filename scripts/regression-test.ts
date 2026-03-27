@@ -27,10 +27,21 @@ type ScoreResult = {
   model: string;
   overall: number;
   summary: string;
-  intro: SectionResult;
-  discovery: SectionResult;
-  objection: SectionResult;
-  close: SectionResult;
+  stages: Record<SectionKey, SectionResult>;
+  moments?: Array<{
+    timestamp?: number;
+    type: string;
+    text: string;
+    severity?: string;
+  }>;
+  suggestions?: string[];
+  voice?: {
+    clarity: number;
+    confidence: number;
+    filler_density: number;
+    pace: number;
+    overall: number;
+  };
 };
 
 const TEST_CASES: RegressionCase[] = [
@@ -131,7 +142,7 @@ async function runCase(supabase: SupabaseClient, testCase: RegressionCase) {
   for (const key of keys) {
     const expected = testCase.expectedSections?.[key];
     if (!expected) continue;
-    const actual = Number(result[key].score);
+    const actual = Number(result.stages?.[key]?.score);
     sectionChecks.push({
       key,
       expected,
