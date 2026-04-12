@@ -261,8 +261,8 @@ router.get('/leaderboard', async (req, res) => {
 
     // Completed drills per user (assignee)
     const { data: assigns, error: aErr } = await supabase
-      .from('coach_assignments')
-      .select('assignee_user_id, status, created_at')
+      .from('assignments')
+      .select('rep_id, status, created_at')
       .gte('created_at', since)
       .limit(50000);
     if (aErr && aErr.message && !/relation .* does not exist/i.test(aErr.message)) {
@@ -270,7 +270,7 @@ router.get('/leaderboard', async (req, res) => {
       throw aErr;
     }
     for (const a of assigns || []) {
-      const uid = String((a as any).assignee_user_id || '');
+      const uid = String((a as any).rep_id || '');
       const st = String((a as any).status || '');
       if (!uid) continue;
       const acc = byUser.get(uid) || { user_id: uid, sum: 0, calls: 0, xp: 0 };
@@ -380,9 +380,9 @@ router.get('/rep-summary', async (req, res) => {
 
     // Completed drills XP (+5 each) — skip silently if table not present
     let assignsQ = supabase
-      .from('coach_assignments')
+      .from('assignments')
       .select('status, created_at, org_id')
-      .eq('assignee_user_id', userId)
+      .eq('rep_id', userId)
       .gte('created_at', since)
       .limit(5000);
     if (orgId) assignsQ = assignsQ.eq('org_id', orgId);

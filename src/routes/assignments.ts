@@ -476,6 +476,82 @@ export function assignmentsRoutes() {
     }
   });
 
+  // PATCH /v1/assignments/manager/:id
+  // Manager can update assignments they created (ownership enforced)
+  r.patch("/manager/:id", async (req: Request, res: Response) => {
+    try {
+      const id = String(req.params.id || "").trim();
+      if (!id) return res.status(400).json({ ok: false, error: "missing_id" });
+
+      const managerId = req.header("x-user-id") || "";
+      if (!managerId) return res.status(401).json({ ok: false, error: "unauthorized" });
+
+      const supa = getSupaAdmin();
+      const { data: current, error: curErr } = await supa
+        .from("assignments")
+        .select("id, manager_id, rep_id, status, due_at, completed_at, completed_by, title, type")
+        .eq("id", id)
+        .maybeSingle();
+
+      if (curErr) throw curErr;
+      if (!current) return res.status(404).json({ ok: false, error: "not_found" });
+      if (String((current as any).manager_id || "") !== String(managerId)) {
+        return res.status(403).json({ ok: false, error: "forbidden" });
+      }
+
+      const body = (req.body || {}) as {
+        status?: string;
+        due_at?: string | null;
+        completed_at?: string | null;
+        completed_by?: string | null;
+        title?: string;
+      };
+
+      const patch: Record<string, any> = {};
+
+      if (typeof body.title === "string") {
+        patch.title = body.title.trim();
+      }
+
+      if (Object.prototype.hasOwnProperty.call(body, "due_at")) {
+        patch.due_at = body.due_at ?? null;
+      }
+
+      if (typeof body.status === "string" && body.status.trim()) {
+        patch.status = body.status.trim().toLowerCase();
+      }
+
+      if (Object.prototype.hasOwnProperty.call(body, "completed_at")) {
+        patch.completed_at = body.completed_at ?? null;
+      }
+
+      if (Object.prototype.hasOwnProperty.call(body, "completed_by")) {
+        patch.completed_by = body.completed_by ?? null;
+      }
+
+      if (patch.status === "completed") {
+        if (!Object.prototype.hasOwnProperty.call(patch, "completed_at")) {
+          patch.completed_at = new Date().toISOString();
+        }
+        if (!Object.prototype.hasOwnProperty.call(patch, "completed_by")) {
+          patch.completed_by = "manager";
+        }
+      }
+
+      const { data, error } = await supa
+        .from("assignments")
+        .update(patch as any)
+        .eq("id", id)
+        .select("id, rep_id, manager_id, type, target_id, title, status, due_at, created_at, completed_at, completed_by")
+        .maybeSingle();
+
+      if (error) throw error;
+      return res.json({ ok: true, assignment: data });
+    } catch (e: any) {
+      return res.status(400).json({ ok: false, error: e?.message || "patch_failed" });
+    }
+  });
+
   // DELETE /v1/assignments/:id
   // Manager can delete assignments they created (ownership enforced)
   r.delete("/:id", requireManager, async (req: Request, res: Response) => {
@@ -586,7 +662,7 @@ export function assignmentsRoutes() {
 
     const { data: rows, error } = await supa
       .from("assignments")
-      .select("rep_id,status,due_at,created_at,completed_at")
+      .select("rep_id,status,due_at,created_at,completed_at,completed_by")
       .eq("manager_id", managerId)
       .gte("created_at", thirtyDaysAgoIso)
       .order("created_at", { ascending: false });
@@ -603,10 +679,19 @@ export function assignmentsRoutes() {
       return String(a.due_at) < nowIso;
     }).length;
 
-    // Completion rate (last 7d): completed / assigned created within 7d
+    // Completion rate (last 7d): real completions only (exclude manager overrides)
     const created7d = list.filter((a) => String(a.created_at || "") >= sevenDaysAgoIso);
     const assigned_7d = created7d.length;
-    const completed_7d = created7d.filter((a) => String(a.status || "") === "completed").length;
+    const completed_7d = created7d.filter(
+      (a) =>
+        String(a.status || "") === "completed" &&
+        String(a.completed_by || "").toLowerCase() !== "manager"
+    ).length;
+    const manager_overrides_7d = created7d.filter(
+      (a) =>
+        String(a.status || "") === "completed" &&
+        String(a.completed_by || "").toLowerCase() === "manager"
+    ).length;
     const completion_rate_7d = assigned_7d > 0 ? Number((completed_7d / assigned_7d).toFixed(2)) : 0;
 
     // Stale reps = reps with at least 1 assignment in last 30d and 0 completions in last 7d
@@ -614,7 +699,12 @@ export function assignmentsRoutes() {
 
     const completedByRepLast7d = new Set(
       list
-        .filter((a) => String(a.status || "") === "completed" && String(a.completed_at || "") >= sevenDaysAgoIso)
+        .filter(
+          (a) =>
+            String(a.status || "") === "completed" &&
+            String(a.completed_at || "") >= sevenDaysAgoIso &&
+            String(a.completed_by || "").toLowerCase() !== "manager"
+        )
         .map((a) => String(a.rep_id || ""))
         .filter(Boolean)
     );
@@ -654,6 +744,7 @@ export function assignmentsRoutes() {
         overdue,
         assigned_7d,
         completed_7d,
+        manager_overrides_7d,
         completion_rate_7d,
         stale_reps_7d,
       },
@@ -712,8 +803,18 @@ export function assignmentsRoutes() {
       const created24 = list.filter((a) => inRange(a.created_at, since24h));
       const created7 = list;
 
-      const completed24 = list.filter((a) => inRange(a.completed_at, since24h));
-      const completed7 = list.filter((a) => inRange(a.completed_at, since7d));
+      const completed24 = list.filter(
+        (a) => inRange(a.completed_at, since24h) && String(a.completed_by || "").toLowerCase() !== "manager"
+      );
+      const completed7 = list.filter(
+        (a) => inRange(a.completed_at, since7d) && String(a.completed_by || "").toLowerCase() !== "manager"
+      );
+      const overrides24 = list.filter(
+        (a) => inRange(a.completed_at, since24h) && String(a.completed_by || "").toLowerCase() === "manager"
+      );
+      const overrides7 = list.filter(
+        (a) => inRange(a.completed_at, since7d) && String(a.completed_by || "").toLowerCase() === "manager"
+      );
 
       const isAuto = (a: any) => String(a.completed_by || "").toLowerCase() === "system";
       const auto24 = completed24.filter(isAuto);
@@ -818,6 +919,10 @@ export function assignmentsRoutes() {
         auto_completed: {
           auto_24h: auto24.length,
           auto_7d: auto7.length,
+        },
+        manager_overrides: {
+          overrides_24h: overrides24.length,
+          overrides_7d: overrides7.length,
         },
         stuck: {
           top_reason: topStuckReason,

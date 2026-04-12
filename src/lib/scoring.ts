@@ -10,10 +10,86 @@ import type {
   StageScore,
   VoiceAnalysis,
 } from "./types/call-analysis";
+import { cleanTranscript, buildSegments, findNearestSegment } from "./transcript";
+import { syncRepMemoryEmbedding, searchKnowledgeEmbeddings } from "./embeddings";
+async function getScoringKnowledgeContext(
+  supabase: SupabaseClient,
+  args: {
+    companyId?: string | null;
+    userId?: string | null;
+    transcript: string;
+  }
+) {
+  const query = String(args.transcript || "").trim();
+  if (!query) {
+    return {
+      playbookText: "",
+      repMemoryText: "",
+    };
+  }
+
+  let playbookMatches: any[] = [];
+  let repMatches: any[] = [];
+
+  try {
+    playbookMatches = await searchKnowledgeEmbeddings(supabase, {
+      companyId: args.companyId ?? null,
+      userId: null,
+      query,
+      sourceTypes: ["company_playbook"],
+      matchCount: 3,
+    });
+  } catch (e: any) {
+    console.warn("[knowledge] playbook search failed", e?.message || e);
+  }
+
+  try {
+    repMatches = await searchKnowledgeEmbeddings(supabase, {
+      companyId: args.companyId ?? null,
+      userId: args.userId ?? null,
+      query,
+      sourceTypes: ["rep_memory"],
+      matchCount: 2,
+    });
+  } catch (e: any) {
+    console.warn("[knowledge] rep memory search failed", e?.message || e);
+  }
+
+  const playbookText = playbookMatches.length
+    ? playbookMatches
+        .map((m, i) => {
+          return [
+            `Playbook ${i + 1}: ${m.title || "Untitled"}`,
+            `Stage: ${m.stage || "general"}`,
+            `Content: ${m.content || ""}`,
+          ].join("\n");
+        })
+        .join("\n\n")
+    : "";
+
+  const repMemoryText = repMatches.length
+    ? repMatches
+        .map((m, i) => {
+          return [
+            `Rep Memory ${i + 1}: ${m.title || "Rep profile"}`,
+            `Content: ${m.content || ""}`,
+          ].join("\n");
+        })
+        .join("\n\n")
+    : "";
+
+  return {
+    playbookText,
+    repMemoryText,
+  };
+}
 
 export const RUBRIC_VERSION = "v1"; // bump when rubric changes
 export const SCORING_PROMPT_VERSION = "v1";
+
 export const SCORING_MODEL_VERSION = `${AI_MODEL}:${SCORING_PROMPT_VERSION}:${RUBRIC_VERSION}`;
+const SKIP_SCORING_SIDE_EFFECTS = process.env.SKIP_SCORING_SIDE_EFFECTS === "1";
+
 
 function stableHash(input: string): string {
   let hash = 2166136261;
@@ -61,8 +137,14 @@ function momentsSchema() {
     type: "array",
     items: {
       type: "object",
+      additionalProperties: false,
       properties: {
-        timestamp: { type: "number" },
+        timestamp: {
+          anyOf: [
+            { type: "number" },
+            { type: "null" }
+          ]
+        },
         type: {
           type: "string",
           enum: ["objection", "mistake", "highlight", "closing_attempt"],
@@ -73,8 +155,7 @@ function momentsSchema() {
           enum: ["low", "medium", "high"],
         },
       },
-      required: ["type", "text"],
-      additionalProperties: false,
+      required: ["timestamp", "type", "text", "severity"]
     },
   };
 }
@@ -290,13 +371,13 @@ function detectMomentsFromTranscript(
   const sourceSegments = Array.isArray(segments) && segments.length > 0
     ? segments
     : String(transcript || "")
-        .split(/\n+/)
-        .map((text, i) => ({
-          speaker: i % 2 === 0 ? "Speaker 1" : "Speaker 2",
-          start_sec: i * 4,
-          end_sec: i * 4 + 4,
-          text,
-        }));
+      .split(/\n+/)
+      .map((text, i) => ({
+        speaker: i % 2 === 0 ? "Speaker 1" : "Speaker 2",
+        start_sec: i * 4,
+        end_sec: i * 4 + 4,
+        text,
+      }));
 
   const moments: CallMoment[] = [];
 
@@ -307,6 +388,11 @@ function detectMomentsFromTranscript(
     const lower = text.toLowerCase();
     const timestamp =
       typeof seg?.start_sec === "number" ? seg.start_sec : undefined;
+    const matchedSegment = findNearestSegment(sourceSegments as any, timestamp);
+    const alignedTimestamp =
+      typeof matchedSegment?.start_sec === "number"
+        ? matchedSegment.start_sec
+        : timestamp;
 
     if (
       lower.includes("not interested") ||
@@ -316,7 +402,7 @@ function detectMomentsFromTranscript(
       lower.includes("outside help")
     ) {
       moments.push({
-        timestamp,
+        timestamp: alignedTimestamp,
         type: "objection",
         text,
         severity: "high",
@@ -331,7 +417,7 @@ function detectMomentsFromTranscript(
       lower.includes("what happens")
     ) {
       moments.push({
-        timestamp,
+        timestamp: alignedTimestamp,
         type: "highlight",
         text,
         severity: "medium",
@@ -346,7 +432,7 @@ function detectMomentsFromTranscript(
       lower.includes("revisit this")
     ) {
       moments.push({
-        timestamp,
+        timestamp: alignedTimestamp,
         type: "closing_attempt",
         text,
         severity: "medium",
@@ -596,20 +682,39 @@ async function upsertRepMemory(
   };
 
   if ((existing as any)?.id) {
-    const { error: updateErr } = await supabase
+    const { data: updatedRow, error: updateErr } = await supabase
       .from("rep_memory")
       .update(payload)
-      .eq("id", (existing as any).id);
+      .eq("id", (existing as any).id)
+      .select()
+      .single();
 
     if (updateErr) throw updateErr;
-    return;
+
+    try {
+      await syncRepMemoryEmbedding(supabase, updatedRow as any);
+    } catch (e: any) {
+      console.warn("[rep_memory] embedding sync failed", e?.message || e);
+    }
+
+    return updatedRow;
   }
 
-  const { error: insertErr } = await supabase
+  const { data: insertedRow, error: insertErr } = await supabase
     .from("rep_memory")
-    .insert(payload);
+    .insert(payload)
+    .select()
+    .single();
 
   if (insertErr) throw insertErr;
+
+  try {
+    await syncRepMemoryEmbedding(supabase, insertedRow as any);
+  } catch (e: any) {
+    console.warn("[rep_memory] embedding sync failed", e?.message || e);
+  }
+
+  return insertedRow;
 }
 
 function normaliseTranscriptForDeterminism(transcript: string): string {
@@ -854,6 +959,7 @@ export async function scoreWithLLM(opts: {
   callId: string;
 }): Promise<LlmScore> {
   const { supabase, callId } = opts;
+  const t0 = Date.now();
 
   try {
     // Pull minimal call meta (include duration for Slack; user_id to resolve rep)
@@ -864,11 +970,23 @@ export async function scoreWithLLM(opts: {
       .single();
     if (callErr || !call) throw new Error("call_not_found");
 
+    const rawTranscript = String(((call as any)?.transcript as string | null) ?? "");
+    const cleanedTranscript = cleanTranscript(rawTranscript);
+    const storedSegments = Array.isArray((call as any)?.analysis_json?.transcript?.segments)
+      ? ((call as any)?.analysis_json?.transcript?.segments as Array<{
+          speaker?: string;
+          start_sec?: number;
+          end_sec?: number;
+          text?: string;
+        }>)
+      : [];
+    const cleanedSegments = storedSegments.length > 0 ? storedSegments : buildSegments(cleanedTranscript);
+
     const deterministic = buildDeterministicPromptKey({
       callId,
       filename: (call as any)?.filename ?? null,
       sha256: ((call as any)?.sha256 as string | null) ?? null,
-      transcript: ((call as any)?.transcript as string | null) ?? null,
+      transcript: cleanedTranscript,
     });
 
     const cached = await readScoreCache(supabase, deterministic.key);
@@ -879,25 +997,24 @@ export async function scoreWithLLM(opts: {
         deterministic.transcript,
         (call as any)?.duration_sec ?? null
       );
-      const transcriptSegments =
-        (call as any)?.analysis_json?.transcript?.segments ?? [];
+      const transcriptSegments = cleanedSegments;
 
       const derivedMoments =
         cachedScore.moments?.length > 0
           ? cachedScore.moments
           : detectMomentsFromTranscript(
-              deterministic.transcript,
-              transcriptSegments
-            );
+            deterministic.transcript,
+            transcriptSegments
+          );
 
       const derivedSuggestions =
         cachedScore.suggestions?.length > 0
           ? cachedScore.suggestions
           : buildSuggestionsFromAnalysis({
-              overall: cachedScore.overall,
-              stages: cachedScore.stages,
-              moments: derivedMoments,
-            });
+            overall: cachedScore.overall,
+            stages: cachedScore.stages,
+            moments: derivedMoments,
+          });
 
       const rubric = buildRubricWithMeta({
         intro: cachedScore.stages.intro,
@@ -912,10 +1029,11 @@ export async function scoreWithLLM(opts: {
 
       (rubric as any)._meta.voice = voice;
 
+      const dbWriteStart = Date.now();
       await updateCallScoreRow(supabase, callId, {
         score_overall: cachedScore.overall,
         summary: cachedScore.summary,
-        transcript: ((call as any)?.transcript as string | null) ?? null,
+        transcript: cleanedTranscript || null,
         voice_score: voice.overall,
         voice_rubric: voice,
         rubric,
@@ -926,40 +1044,54 @@ export async function scoreWithLLM(opts: {
           suggestions: derivedSuggestions,
           summary: cachedScore.summary,
           voice,
+          transcript: {
+            text: cleanedTranscript,
+            segments: cleanedSegments,
+          },
         },
         ai_model: cachedModelVersion,
         rubric_version: RUBRIC_VERSION,
         scored_at: new Date().toISOString(),
       });
 
+      console.log("[perf] db_write_ms", Date.now() - dbWriteStart, { callId, path: "cache" });
       await writeScoreHistory(supabase, callId, cachedModelVersion, cachedScore.overall, rubric);
 
-      await notifySlack({
-        supabase,
-        callId,
-        repIdFallback: (call as any)?.user_id ?? null,
-        durationSec: (call as any)?.duration_sec ?? null,
-        scores: {
-          intro: cachedScore.stages.intro.score,
-          discovery: cachedScore.stages.discovery.score,
-          objection: cachedScore.stages.objection.score,
-          close: cachedScore.stages.close.score,
-          overall: cachedScore.overall,
-        },
-      });
-      try {
-        await upsertRepMemory(supabase, {
-          userId: String((call as any)?.user_id),
-          companyId: (call as any)?.org_id ?? null,
+      if (!SKIP_SCORING_SIDE_EFFECTS) {
+        const slackStart = Date.now();
+        await notifySlack({
+          supabase,
           callId,
-          overall: cachedScore.overall,
-          stages: cachedScore.stages,
-          voice,
-          moments: derivedMoments,
+          repIdFallback: (call as any)?.user_id ?? null,
+          durationSec: (call as any)?.duration_sec ?? null,
+          scores: {
+            intro: cachedScore.stages.intro.score,
+            discovery: cachedScore.stages.discovery.score,
+            objection: cachedScore.stages.objection.score,
+            close: cachedScore.stages.close.score,
+            overall: cachedScore.overall,
+          },
         });
-      } catch (e: any) {
-        console.warn("[rep_memory] cache-hit update failed", e?.message || e);
+        console.log("[perf] slack_ms", Date.now() - slackStart, { callId });
       }
+      if (!SKIP_SCORING_SIDE_EFFECTS) {
+        try {
+          const repMemoryStart = Date.now();
+          await upsertRepMemory(supabase, {
+            userId: String((call as any)?.user_id),
+            companyId: (call as any)?.org_id ?? null,
+            callId,
+            overall: cachedScore.overall,
+            stages: cachedScore.stages,
+            voice,
+            moments: derivedMoments,
+          });
+          console.log("[perf] rep_memory_ms", Date.now() - repMemoryStart, { callId });
+        } catch (e: any) {
+          console.warn("[rep_memory] cache-hit update failed", e?.message || e);
+        }
+      }
+      console.log("[perf] total_score_ms", Date.now() - t0, { callId, path: "cache" });
       return {
         ...cachedScore,
         moments: derivedMoments,
@@ -968,6 +1100,11 @@ export async function scoreWithLLM(opts: {
       };
     }
 
+    const knowledge = await getScoringKnowledgeContext(supabase, {
+      companyId: (call as any)?.org_id ?? null,
+      userId: String((call as any)?.user_id ?? ""),
+      transcript: cleanedTranscript,
+    });
     // Build prompt
     const userLines = [
       `CALL META: filename="${call.filename || call.id}"`,
@@ -990,13 +1127,19 @@ export async function scoreWithLLM(opts: {
     ];
     const user = userLines.join("\n");
 
-    const system =
-      "You are a strict sales call evaluator. Score from 0–100 overall and for Intro, Discovery, Objection Handling, Close. Be concise. Also provide a short coaching summary. Treat the transcript and determinism key as the source of truth. Identical calls scored under the same rubric and prompt version must return the same result. Output must match the provided JSON schema exactly.";
+    const system = `You are a strict sales call evaluator. Score from 0–100 overall and for Intro, Discovery, Objection Handling, Close. Be concise. Also provide a short coaching summary. Treat the transcript and determinism key as the source of truth. Identical calls scored under the same rubric and prompt version must return the same result. Output must match the provided JSON schema exactly.
+
+Relevant company playbook:
+${knowledge.playbookText || "None"}
+
+Relevant rep memory:
+${knowledge.repMemoryText || "None"}`;
 
     const openai = getOpenAI();
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), OPENAI_TIMEOUT_MS);
 
+    const llmStart = Date.now();
     const resp = await openai.chat.completions.create(
       {
         model: AI_MODEL,
@@ -1010,6 +1153,7 @@ export async function scoreWithLLM(opts: {
       { signal: ctrl.signal }
     );
     clearTimeout(timer);
+    console.log("[perf] llm_ms", Date.now() - llmStart, { callId });
 
     const raw = resp.choices?.[0]?.message?.content;
     if (!raw) throw new Error("no_model_content");
@@ -1025,8 +1169,7 @@ export async function scoreWithLLM(opts: {
       voice,
     };
 
-    const transcriptSegments =
-      (call as any)?.analysis_json?.transcript?.segments ?? [];
+    const transcriptSegments = cleanedSegments;
 
     const derivedMoments = detectMomentsFromTranscript(
       deterministic.transcript,
@@ -1037,10 +1180,10 @@ export async function scoreWithLLM(opts: {
       parsed.suggestions?.length > 0
         ? parsed.suggestions
         : buildSuggestionsFromAnalysis({
-            overall: parsed.overall,
-            stages: parsed.stages,
-            moments: derivedMoments,
-          });
+          overall: parsed.overall,
+          stages: parsed.stages,
+          moments: derivedMoments,
+        });
 
     parsed.moments = derivedMoments;
     parsed.suggestions = derivedSuggestions;
@@ -1059,10 +1202,11 @@ export async function scoreWithLLM(opts: {
     (rubric as any)._meta.voice = voice;
 
     // Persist latest on calls
+    const dbWriteStart = Date.now();
     await updateCallScoreRow(supabase, callId, {
       score_overall: parsed.overall,
       summary: parsed.summary,
-      transcript: ((call as any)?.transcript as string | null) ?? null,
+      transcript: cleanedTranscript || null,
       voice_score: voice.overall,
       voice_rubric: voice,
       rubric,
@@ -1073,12 +1217,17 @@ export async function scoreWithLLM(opts: {
         suggestions: parsed.suggestions,
         summary: parsed.summary,
         voice,
+        transcript: {
+          text: cleanedTranscript,
+          segments: cleanedSegments,
+        },
       },
       ai_model: SCORING_MODEL_VERSION,
       rubric_version: RUBRIC_VERSION,
       scored_at: new Date().toISOString(),
     });
 
+    console.log("[perf] db_write_ms", Date.now() - dbWriteStart, { callId, path: "llm" });
     // History row (non-blocking)
     await writeScoreHistory(supabase, callId, SCORING_MODEL_VERSION, parsed.overall, rubric);
 
@@ -1112,34 +1261,43 @@ export async function scoreWithLLM(opts: {
       console.warn('[score] activity insert failed', e);
     }
 
-    // Slack (best-effort)
-    await notifySlack({
-      supabase,
-      callId,
-      repIdFallback: (call as any)?.user_id ?? null,
-      durationSec: (call as any)?.duration_sec ?? null,
-      scores: {
-        intro: parsed.stages.intro.score,
-        discovery: parsed.stages.discovery.score,
-        objection: parsed.stages.objection.score,
-        close: parsed.stages.close.score,
-        overall: parsed.overall,
-      },
-    });
-    try {
-      await upsertRepMemory(supabase, {
-        userId: String((call as any)?.user_id),
-        companyId: (call as any)?.org_id ?? null,
+    if (!SKIP_SCORING_SIDE_EFFECTS) {
+      const slackStart = Date.now();
+      await notifySlack({
+        supabase,
         callId,
-        overall: parsed.overall,
-        stages: parsed.stages,
-        voice,
-        moments: parsed.moments,
+        repIdFallback: (call as any)?.user_id ?? null,
+        durationSec: (call as any)?.duration_sec ?? null,
+        scores: {
+          intro: parsed.stages.intro.score,
+          discovery: parsed.stages.discovery.score,
+          objection: parsed.stages.objection.score,
+          close: parsed.stages.close.score,
+          overall: parsed.overall,
+        },
       });
-    } catch (e: any) {
-      console.warn("[rep_memory] success update failed", e?.message || e);
+      console.log("[perf] slack_ms", Date.now() - slackStart, { callId });
     }
 
+    if (!SKIP_SCORING_SIDE_EFFECTS) {
+      try {
+        const repMemoryStart = Date.now();
+        await upsertRepMemory(supabase, {
+          userId: String((call as any)?.user_id),
+          companyId: (call as any)?.org_id ?? null,
+          callId,
+          overall: parsed.overall,
+          stages: parsed.stages,
+          voice,
+          moments: parsed.moments,
+        });
+        console.log("[perf] rep_memory_ms", Date.now() - repMemoryStart, { callId });
+      } catch (e: any) {
+        console.warn("[rep_memory] success update failed", e?.message || e);
+      }
+    }
+
+    console.log("[perf] total_score_ms", Date.now() - t0, { callId, path: "llm" });
     return parsed;
   } catch (err: any) {
     console.warn(
@@ -1163,9 +1321,11 @@ export async function scoreWithLLM(opts: {
         .eq("id", opts.callId)
         .maybeSingle();
 
-      transcriptText = String((callRow as any)?.transcript || "");
-      transcriptSegments = (callRow as any)?.analysis_json?.transcript?.segments ?? [];
-    } catch {}
+      transcriptText = cleanTranscript(String((callRow as any)?.transcript || ""));
+      transcriptSegments = Array.isArray((callRow as any)?.analysis_json?.transcript?.segments)
+        ? (callRow as any)?.analysis_json?.transcript?.segments
+        : buildSegments(transcriptText);
+    } catch { }
 
     const fallbackMoments = detectMomentsFromTranscript(
       transcriptText,
@@ -1192,6 +1352,7 @@ export async function scoreWithLLM(opts: {
 
     (rubric as any)._meta.voice = fallbackVoice;
 
+    const dbWriteStart = Date.now();
     await updateCallScoreRow(opts.supabase, opts.callId, {
       score_overall: fb.overall,
       summary: fb.summary,
@@ -1205,12 +1366,17 @@ export async function scoreWithLLM(opts: {
         suggestions: fallbackSuggestions,
         summary: fb.summary,
         voice: fallbackVoice,
+        transcript: {
+          text: transcriptText,
+          segments: transcriptSegments,
+        },
       },
       ai_model: fallbackModelVersion,
       rubric_version: RUBRIC_VERSION,
       scored_at: new Date().toISOString(),
     });
 
+    console.log("[perf] db_write_ms", Date.now() - dbWriteStart, { callId: opts.callId, path: "fallback" });
     // History row (non-blocking)
     await writeScoreHistory(opts.supabase, opts.callId, fallbackModelVersion, fb.overall, rubric);
 
@@ -1254,40 +1420,49 @@ export async function scoreWithLLM(opts: {
       durationSec = (data as any)?.duration_sec ?? null;
     } catch { }
 
-    // Slack fallback
-    await notifySlack({
-      supabase: opts.supabase,
-      callId: opts.callId,
-      repIdFallback: null,
-      durationSec,
-      scores: {
-        intro: fb.stages.intro.score,
-        discovery: fb.stages.discovery.score,
-        objection: fb.stages.objection.score,
-        close: fb.stages.close.score,
-        overall: fb.overall,
-      },
-    });
-    try {
-      const { data: memoryCall } = await opts.supabase
-        .from("calls")
-        .select("user_id, org_id")
-        .eq("id", opts.callId)
-        .maybeSingle();
-
-      await upsertRepMemory(opts.supabase, {
-        userId: String((memoryCall as any)?.user_id),
-        companyId: (memoryCall as any)?.org_id ?? null,
+    if (!SKIP_SCORING_SIDE_EFFECTS) {
+      const slackStart = Date.now();
+      await notifySlack({
+        supabase: opts.supabase,
         callId: opts.callId,
-        overall: fb.overall,
-        stages: fb.stages,
-        voice: fallbackVoice,
-        moments: fallbackMoments,
+        repIdFallback: null,
+        durationSec,
+        scores: {
+          intro: fb.stages.intro.score,
+          discovery: fb.stages.discovery.score,
+          objection: fb.stages.objection.score,
+          close: fb.stages.close.score,
+          overall: fb.overall,
+        },
       });
-    } catch (e: any) {
-      console.warn("[rep_memory] fallback update failed", e?.message || e);
+      console.log("[perf] slack_ms", Date.now() - slackStart, { callId: opts.callId });
     }
 
+    if (!SKIP_SCORING_SIDE_EFFECTS) {
+      try {
+        const { data: memoryCall } = await opts.supabase
+          .from("calls")
+          .select("user_id, org_id")
+          .eq("id", opts.callId)
+          .maybeSingle();
+
+        const repMemoryStart = Date.now();
+        await upsertRepMemory(opts.supabase, {
+          userId: String((memoryCall as any)?.user_id),
+          companyId: (memoryCall as any)?.org_id ?? null,
+          callId: opts.callId,
+          overall: fb.overall,
+          stages: fb.stages,
+          voice: fallbackVoice,
+          moments: fallbackMoments,
+        });
+        console.log("[perf] rep_memory_ms", Date.now() - repMemoryStart, { callId: opts.callId });
+      } catch (e: any) {
+        console.warn("[rep_memory] fallback update failed", e?.message || e);
+      }
+    }
+
+    console.log("[perf] total_score_ms", Date.now() - t0, { callId: opts.callId, path: "fallback" });
     return {
       ...fb,
       moments: fallbackMoments,

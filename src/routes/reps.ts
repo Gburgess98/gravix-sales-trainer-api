@@ -93,7 +93,7 @@ repsRouter.get("/:id/overview", async (req: Request, res: Response) => {
 
     // ---- Totals (calls, avg score, win rate)
     const { data: callsAgg, error: callsAggErr } = await sb
-      .rpc("rep_calls_aggregate", { p_rep_id: repId }); 
+      .rpc("rep_calls_aggregate", { p_rep_id: repId });
     // ^ If you don’t have a RPC, you can approximate with:
     // const { data: calls, error: callsErr } = await sb
     //   .from("calls")
@@ -152,8 +152,8 @@ repsRouter.get("/:id/overview", async (req: Request, res: Response) => {
 
     const { data: recentCalls } = await sb
       .from("calls")
-      .select("id,created_at,final_score")
-      .eq("rep_id", repId)
+      .select("id,created_at,score_overall")
+      .eq("user_id", repId)
       .order("created_at", { ascending: false })
       .limit(5);
 
@@ -189,7 +189,7 @@ repsRouter.get("/:id/overview", async (req: Request, res: Response) => {
         calls: (recentCalls ?? []).map(c => ({
           id: c.id,
           created_at: c.created_at,
-          score: c.final_score ?? 0
+          score: c.score_overall ?? 0
         })),
         activity: recentActivity ?? []
       }

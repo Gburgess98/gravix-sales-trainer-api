@@ -1,6 +1,7 @@
+process.env.SKIP_SCORING_SIDE_EFFECTS = "1";
+
 import "dotenv/config";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { scoreWithLLM } from "../src/lib/scoring";
 
 type Range = {
   min: number;
@@ -43,6 +44,11 @@ type ScoreResult = {
     overall: number;
   };
 };
+
+type ScoreWithLLMFn = (args: {
+  supabase: SupabaseClient;
+  callId: string;
+}) => Promise<ScoreResult>;
 
 const TEST_CASES: RegressionCase[] = [
   {
@@ -117,7 +123,11 @@ function printDivider() {
   console.log("-".repeat(88));
 }
 
-async function runCase(supabase: SupabaseClient, testCase: RegressionCase) {
+async function runCase(
+  supabase: SupabaseClient,
+  testCase: RegressionCase,
+  scoreWithLLM: ScoreWithLLMFn
+) {
   const call = await getCallMeta(supabase, testCase.callId);
 
   if (!call.transcript || !call.transcript.trim()) {
@@ -172,6 +182,8 @@ async function main() {
     auth: { persistSession: false },
   });
 
+  const { scoreWithLLM } = await import("../src/lib/scoring");
+
   const runnableCases = TEST_CASES.filter(
     (x) => x.callId && x.callId !== "REPLACE_WITH_REAL_CALL_ID"
   );
@@ -198,7 +210,7 @@ async function main() {
     if (testCase.notes) console.log(`Notes: ${testCase.notes}`);
 
     try {
-      const outcome = await runCase(supabase, testCase);
+      const outcome = await runCase(supabase, testCase, scoreWithLLM as ScoreWithLLMFn);
       const { call, result, overallOk, sectionChecks, passed } = outcome;
 
       console.log(`File: ${call.filename || call.id}`);

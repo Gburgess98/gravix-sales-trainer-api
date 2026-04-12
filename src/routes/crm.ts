@@ -4361,6 +4361,82 @@ router.post("/unlink", async (req, res) => {
       }
     }
 
+        // 1b) Best-effort: clear linkage columns on crm_call_links (schema tolerant)
+    // This is the source used by GET /v1/crm/link for UUID calls, so if we only
+    // clear `calls.contact_id/account_id` the panel can still re-hydrate stale data.
+    {
+      const patchBase: any = {};
+
+      if (target === "contact") {
+        patchBase.contact_id = null;
+        patchBase.opportunity_id = null;
+      } else if (target === "account") {
+        patchBase.account_id = null;
+        patchBase.opportunity_id = null;
+      } else if (target === "opportunity") {
+        patchBase.opportunity_id = null;
+      } else {
+        patchBase.contact_id = null;
+        patchBase.account_id = null;
+        patchBase.opportunity_id = null;
+      }
+
+      const attempts: any[] = [
+        { ...patchBase },
+        (() => {
+          const p = { ...patchBase };
+          delete p.opportunity_id;
+          return p;
+        })(),
+        (() => {
+          const p = { ...patchBase };
+          delete p.account_id;
+          return p;
+        })(),
+        (() => {
+          const p = { ...patchBase };
+          delete p.contact_id;
+          return p;
+        })(),
+      ].filter((p) => Object.keys(p).length > 0);
+
+      let updatedLinkRow = false;
+
+      for (const p of attempts) {
+        const r = await supa
+          .from("crm_call_links")
+          .update(p)
+          .eq("call_id", callIdStr)
+          .select("call_id")
+          .maybeSingle();
+
+        if (!r.error) {
+          updatedLinkRow = true;
+          break;
+        }
+
+        const msg = String((r.error as any)?.message ?? "").toLowerCase();
+        const isMissingCol =
+          (msg.includes("column") && msg.includes("does not exist")) ||
+          msg.includes("could not find") ||
+          msg.includes("unknown column");
+
+        if (msg.includes("relation") && msg.includes("does not exist")) break;
+        if (isMissingCol) continue;
+        break;
+      }
+
+      // Fallback: if we couldn't safely update the row, deleting it is better than
+      // allowing stale link data to keep re-hydrating the UI.
+      if (!updatedLinkRow && (target === "contact" || target === "all")) {
+        try {
+          await supa.from("crm_call_links").delete().eq("call_id", callIdStr);
+        } catch {
+          // fail-soft
+        }
+      }
+    }
+
     // 2) Best-effort: clear linkage columns on calls (schema tolerant)
     {
       const patchBase: any = {};

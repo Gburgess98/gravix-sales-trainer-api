@@ -9,6 +9,7 @@ import { createClient } from "@supabase/supabase-js";
 import { randomUUID } from "crypto";
 import { postSlack, postAssignNotification /* , postScoreSummary */ } from "./lib/slack";
 import { scoreWithLLM } from "./lib/scoring";
+import { cleanTranscript, buildSegments } from "./lib/transcript";
 
 import callsRouter from "./routes/calls";
 import pinsRouter from "./routes/pins";
@@ -728,9 +729,21 @@ app.post("/v1/upload/finalize", async (req, res) => {
     // 2) Job row
     const jobId = crypto.randomUUID();
     const { error: dbErrJob } = await supabase.from("jobs").insert({
-      id: jobId, call_id: id, user_id: userId, kind: "transcribe", status: "queued",
+      id: jobId,
+      call_id: id,
+      user_id: userId,
+      kind: "transcribe",
+      status: "queued",
+      attempts: 0,
+      result: null,
+      error: null,
     });
     if (dbErrJob) return res.status(500).json({ ok: false, error: `Job insert failed: ${dbErrJob.message}` });
+    console.log("[UPLOAD] job created:", {
+      jobId,
+      callId: id,
+      path,
+    });
 
     // 3) Sim worker
     simulateTranscription(jobId, id, path, userId).catch((e) => console.error("Sim worker failed:", e.message));
@@ -808,9 +821,21 @@ app.post(
       // 3) Job row
       const jobId = crypto.randomUUID();
       const { error: dbErrJob } = await supabase.from("jobs").insert({
-        id: jobId, call_id: id, user_id: userId, kind: "transcribe", status: "queued",
+        id: jobId,
+        call_id: id,
+        user_id: userId,
+        kind: "transcribe",
+        status: "queued",
+        attempts: 0,
+        result: null,
+        error: null,
       });
       if (dbErrJob) return res.status(500).json({ ok: false, error: `Job insert failed: ${dbErrJob.message}` });
+      console.log("[UPLOAD] job created:", {
+        jobId,
+        callId: id,
+        path: key,
+      });
 
       // 4) Sim worker (stub)
       simulateTranscription(jobId, id, key, userId).catch((e) =>
@@ -852,9 +877,37 @@ app.head(["/health", "/v1/health"], (_req, res) => res.status(200).end());
 
 /* Jobs */
 app.get("/v1/jobs/:id", async (req, res) => {
-  const { data, error } = await supabase.from("jobs").select("*").eq("id", req.params.id).single();
-  if (error) return res.status(404).json({ ok: false, error: error.message });
-  res.json({ ok: true, job: data });
+  try {
+    const { data, error } = await supabase
+      .from("jobs")
+      .select("*")
+      .eq("id", req.params.id)
+      .single();
+
+    if (error || !data) {
+      return res.status(404).json({
+        ok: false,
+        error: error?.message || "job_not_found",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      job: {
+        id: data.id,
+        status: data.status || "pending",
+        result: data.result || null,
+        error: data.error || null,
+        attempts: data.attempts || 0,
+        updatedAt: data.updated_at || null,
+      },
+    });
+  } catch (e: any) {
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || "job_fetch_failed",
+    });
+  }
 });
 
 // --- ADD: CRM search stub ---
@@ -1065,16 +1118,40 @@ app.post("/v1/coach/assign", async (req, res) => {
       return res.status(400).json({ ok: false, error: "callId, assigneeUserId, drillId required" });
     }
 
+    const { data: callRow, error: callErr } = await supabase
+      .from("calls")
+      .select("id, org_id, user_id")
+      .eq("id", callId)
+      .maybeSingle();
+
+    if (callErr) {
+      return res.status(500).json({ ok: false, error: callErr.message || "call_lookup_failed" });
+    }
+    if (!callRow) {
+      return res.status(404).json({ ok: false, error: "call_not_found" });
+    }
+
+    const effectiveOrgId =
+      String(req.header("x-org-id") || "").trim() ||
+      String((callRow as any)?.org_id || "").trim() ||
+      String(DEFAULT_ORG_ID || "").trim() ||
+      null;
+
+    if (!effectiveOrgId) {
+      return res.status(500).json({ ok: false, error: "org_id_required_for_activity_write" });
+    }
+
     const { data, error } = await supabase
       .from("coach_assignments")
       .insert({
         call_id: callId,
         assignee_user_id: assigneeUserId,
         drill_id: drillId,
-        notes: notes || null,
-        org_id: req.header('x-org-id') || DEFAULT_ORG_ID,
+        notes: notes ?? null,
+        status: "open",
+        org_id: effectiveOrgId,
       })
-      .select("*")
+      .select("id, org_id, assignee_user_id, call_id, drill_id, status, created_at")
       .single();
 
     // Optional: notify assignee via Slack webhook (if configured)
@@ -1091,6 +1168,9 @@ app.post("/v1/coach/assign", async (req, res) => {
     }
 
     if (error) return res.status(500).json({ ok: false, error: error.message });
+    // Activity write temporarily disabled here.
+    // Reason: production DB still has legacy activities type constraints / trigger paths.
+    // Re-enable once activities_type_check and coach_assignments trigger behaviour are aligned.
     return res.json({ ok: true, assignment: data });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message || "assign_failed" });
@@ -1242,26 +1322,9 @@ app.patch("/v1/coach/assignments/:id", async (req, res) => {
     if (error) return res.status(500).json({ ok: false, error: error.message });
     if (!updated) return res.status(404).json({ ok: false, error: "not_found" });
 
-    // Activity log (best-effort)
-    try {
-      const type = status === "completed" ? "assign_completed" : "assign_reopened";
-      const summary =
-        status === "completed"
-          ? `✅ Drill completed: ${updated.drill_id}`
-          : `↩️ Drill reopened: ${updated.drill_id}`;
-
-      await supabase.from("activities").insert({
-        org_id: (updated as any)?.org_id ?? null,
-        user_id: (updated as any)?.assignee_user_id ?? null,
-        type,
-        summary,
-        call_id: updated.call_id,
-        // account_id/contact_id can be added later if you resolve them here
-        created_at: new Date().toISOString(),
-      });
-    } catch (e: any) {
-      console.warn("[coach.assignments.patch] activity insert failed:", e?.message || e);
-    }
+    // Activity write temporarily disabled here.
+    // Reason: production DB still has legacy activities type constraints / trigger paths.
+    // Re-enable once activities_type_check and coach_assignments trigger behaviour are aligned.
 
     return res.json({ ok: true, assignment: updated });
   } catch (e: any) {
@@ -1683,14 +1746,24 @@ app.use("/v1/debug", debugRouter);
 -------------------------------------------*/
 async function setJobStatus(
   jobId: string,
-  status: "queued" | "processing" | "succeeded" | "failed",
-  patch: Record<string, unknown> = {}
+  status: string,
+  extra: Record<string, any> = {}
 ) {
+  const payload = {
+    status,
+    ...extra,
+    updated_at: new Date().toISOString(),
+  };
+
   const { error } = await supabase
     .from("jobs")
-    .update({ status, ...patch, updated_at: new Date().toISOString() })
+    .update(payload)
     .eq("id", jobId);
-  if (error) throw new Error(`setJobStatus failed: ${error.message}`);
+
+  if (error) {
+    console.error("setJobStatus failed:", error.message);
+    throw new Error(`setJobStatus failed: ${error.message}`);
+  }
 }
 
 async function enqueueScoreJob(callId: string, userId: string) {
@@ -1698,7 +1771,14 @@ async function enqueueScoreJob(callId: string, userId: string) {
   console.log("[score] enqueue", { callId, userId, jobId });
 
   const { error } = await supabase.from("jobs").insert({
-    id: jobId, call_id: callId, user_id: userId, kind: "score", status: "queued",
+    id: jobId,
+    call_id: callId,
+    user_id: userId,
+    kind: "score",
+    status: "queued",
+    attempts: 0,
+    result: null,
+    error: null,
   });
   if (error) throw new Error(`enqueue score failed: ${error.message}`);
 
@@ -1712,7 +1792,7 @@ async function simulateScore(jobId: string, callId: string) {
 
   try {
     const { data: callRow, error: callErr } = await supabase
-      .from("calls").select("id, filename, status").eq("id", callId).single();
+      .from("calls").select("id, filename, status, user_id, org_id").eq("id", callId).single();
     if (callErr || !callRow) throw new Error(`score: call not found`);
 
     const result = await scoreWithLLM({ supabase, callId });
@@ -1738,6 +1818,8 @@ async function simulateScore(jobId: string, callId: string) {
     try {
       const summary = `Scored ${Math.round(result.overall)} — Intro ${Math.round(result.stages.intro.score)} / Disc ${Math.round(result.stages.discovery.score)} / Obj ${Math.round(result.stages.objection.score)} / Close ${Math.round(result.stages.close.score)}`;
       await supabase.from("activities").insert({
+        org_id: (callRow as any)?.org_id ?? DEFAULT_ORG_ID ?? null,
+        actor_user_id: (callRow as any)?.user_id ?? null,
         type: "call_scored",
         summary,
         call_id: callId,
@@ -1784,8 +1866,7 @@ async function simulateScore(jobId: string, callId: string) {
 async function simulateTranscription(jobId: string, callId: string, _storagePath: string, userId: string) {
   console.log("[transcribe] start", { jobId, callId });
   await setJobStatus(jobId, "processing", { attempts: 1 });
-
-  await new Promise((r) => setTimeout(r, 300));
+  await new Promise((r) => setTimeout(r, 800));
 
   let transcriptResult: {
     model: string;
@@ -1821,27 +1902,8 @@ async function simulateTranscription(jobId: string, callId: string, _storagePath
       const rawText = String((tx as any)?.text || "").trim();
 
       if (rawText) {
-        // --- Cleanup ---
-        const cleaned = rawText
-          .replace(/\s+/g, " ")
-          .replace(/\.\s+/g, ".\n")
-          .trim();
-
-        // --- Basic segmentation (sentence-based fallback) ---
-        const sentences = cleaned.split("\n").filter(Boolean);
-
-        let cursor = 0;
-        const segments = sentences.map((s, i) => {
-          const duration = Math.max(2, Math.min(8, Math.ceil(s.length / 20)));
-          const seg = {
-            speaker: i % 2 === 0 ? "Rep" : "Prospect",
-            start_sec: cursor,
-            end_sec: cursor + duration,
-            text: s.trim(),
-          };
-          cursor += duration;
-          return seg;
-        });
+        const cleaned = cleanTranscript(rawText);
+        const segments = buildSegments(cleaned);
 
         transcriptResult = {
           model,
