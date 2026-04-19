@@ -3,6 +3,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "@supabase/supabase-js";
 import { getOpenAI, AI_MODEL, OPENAI_TIMEOUT_MS } from "./openai";
 import { postScoreSummary } from "./slack";
+import { sendReviewFeedbackEmail } from "./email";
 import type {
   CallAnalysis,
   CallAnalysisStages,
@@ -57,25 +58,25 @@ async function getScoringKnowledgeContext(
 
   const playbookText = playbookMatches.length
     ? playbookMatches
-        .map((m, i) => {
-          return [
-            `Playbook ${i + 1}: ${m.title || "Untitled"}`,
-            `Stage: ${m.stage || "general"}`,
-            `Content: ${m.content || ""}`,
-          ].join("\n");
-        })
-        .join("\n\n")
+      .map((m, i) => {
+        return [
+          `Playbook ${i + 1}: ${m.title || "Untitled"}`,
+          `Stage: ${m.stage || "general"}`,
+          `Content: ${m.content || ""}`,
+        ].join("\n");
+      })
+      .join("\n\n")
     : "";
 
   const repMemoryText = repMatches.length
     ? repMatches
-        .map((m, i) => {
-          return [
-            `Rep Memory ${i + 1}: ${m.title || "Rep profile"}`,
-            `Content: ${m.content || ""}`,
-          ].join("\n");
-        })
-        .join("\n\n")
+      .map((m, i) => {
+        return [
+          `Rep Memory ${i + 1}: ${m.title || "Rep profile"}`,
+          `Content: ${m.content || ""}`,
+        ].join("\n");
+      })
+      .join("\n\n")
     : "";
 
   return {
@@ -954,6 +955,248 @@ async function notifySlack(opts: {
   }
 }
 
+async function lookupUserContactBestEffort(
+  supabase: SupabaseClient,
+  userId: string
+): Promise<{ email: string | null; name: string | null }> {
+  // PRIMARY: profiles keyed by user_id (this is what /v1/team/users reads from)
+  const primarySelects = [
+    "user_id,email,full_name",
+    "user_id,email,full_name,name",
+    "user_id,email,name",
+    "user_id,email",
+  ];
+
+  for (const select of primarySelects) {
+    try {
+      const r = await supabase
+        .from("profiles")
+        .select(select)
+        .eq("user_id", userId)
+        .maybeSingle();
+
+      if (r.error) {
+        const msg = String((r.error as any)?.message ?? "").toLowerCase();
+        if (
+          (msg.includes("relation") && msg.includes("does not exist")) ||
+          msg.includes("could not find the table") ||
+          (msg.includes("column") && msg.includes("does not exist")) ||
+          (msg.includes("schema cache") && msg.includes("column"))
+        ) {
+          continue;
+        }
+        continue;
+      }
+
+      const row: any = r.data;
+      if (!row) continue;
+
+      const email = String(row?.email ?? "").trim() || null;
+      const name = String(row?.full_name ?? row?.name ?? "").trim() || null;
+
+      if (email || name) {
+        return { email, name };
+      }
+    } catch (e) {
+      console.warn("[lookupUserContactBestEffort] profiles lookup failed", e);
+    }
+  }
+
+  const tablePlans: Array<{
+    table: string;
+    selects: string[];
+    predicates: Array<{ col: string; value: string }>;
+    emailKeys: string[];
+    nameKeys: string[];
+  }> = [
+    {
+      table: "profiles",
+      selects: [
+        "id,email,full_name,name",
+        "id,email,full_name",
+        "id,email,name",
+        "id,email",
+      ],
+      predicates: [{ col: "id", value: userId }],
+      emailKeys: ["email"],
+      nameKeys: ["full_name", "name"],
+    },
+    {
+      table: "users",
+      selects: [
+        "id,email,full_name,name",
+        "id,email,full_name",
+        "id,email,name",
+        "id,email",
+      ],
+      predicates: [{ col: "id", value: userId }],
+      emailKeys: ["email"],
+      nameKeys: ["full_name", "name"],
+    },
+    {
+      table: "reps",
+      selects: [
+        "id,email,full_name,name",
+        "id,email,full_name",
+        "id,email,name",
+        "id,email",
+      ],
+      predicates: [{ col: "id", value: userId }],
+      emailKeys: ["email"],
+      nameKeys: ["full_name", "name"],
+    },
+  ];
+
+  for (const plan of tablePlans) {
+    for (const select of plan.selects) {
+      let q = supabase.from(plan.table).select(select).limit(1);
+      for (const predicate of plan.predicates) {
+        q = q.eq(predicate.col, predicate.value);
+      }
+
+      const r = await q.maybeSingle();
+      if (r.error) {
+        const msg = String((r.error as any)?.message ?? "").toLowerCase();
+        if (
+          (msg.includes("relation") && msg.includes("does not exist")) ||
+          msg.includes("could not find the table") ||
+          (msg.includes("column") && msg.includes("does not exist")) ||
+          (msg.includes("schema cache") && msg.includes("column"))
+        ) {
+          continue;
+        }
+        continue;
+      }
+
+      const row: any = r.data;
+      if (!row) continue;
+
+      const email =
+        plan.emailKeys
+          .map((k) => String(row?.[k] ?? "").trim())
+          .find(Boolean) || null;
+
+      const name =
+        plan.nameKeys
+          .map((k) => String(row?.[k] ?? "").trim())
+          .find(Boolean) || null;
+
+      if (email || name) {
+        return { email, name };
+      }
+    }
+  }
+
+  return { email: null, name: null };
+}
+
+async function resolveReviewFeedbackContextForWorker(args: {
+  supabase: SupabaseClient;
+  callId: string;
+  repId: string;
+}) {
+  const { supabase, callId, repId } = args;
+
+  let managerId: string | null = null;
+  let assignmentId: string | null = null;
+
+  const fallback = await supabase
+    .from("assignments")
+    .select("id,rep_id,manager_id,target_id,type,status,created_at")
+    .eq("rep_id", repId)
+    .eq("type", "call_review")
+    .eq("target_id", callId)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (!fallback.error && fallback.data) {
+    managerId = fallback.data.manager_id ? String(fallback.data.manager_id) : null;
+    assignmentId = fallback.data.id ? String(fallback.data.id) : null;
+  }
+
+  return {
+    repId,
+    managerId,
+    assignmentId,
+  };
+}
+
+async function autoSendReviewFeedbackEmailForWorkerBestEffort(args: {
+  supabase: SupabaseClient;
+  callId: string;
+  repId: string;
+  scoreOverall: number;
+  voiceScore: number;
+  summary?: string | null;
+  reviewTags?: any;
+}) {
+  try {
+    const context = await resolveReviewFeedbackContextForWorker({
+      supabase: args.supabase,
+      callId: args.callId,
+      repId: args.repId,
+    });
+
+    const repContact = await lookupUserContactBestEffort(args.supabase, context.repId);
+    const managerContact = context.managerId
+      ? await lookupUserContactBestEffort(args.supabase, context.managerId)
+      : { email: null, name: null };
+
+    console.log("[review feedback email] attempting", {
+      callId: args.callId,
+      repId: context.repId,
+      managerId: context.managerId,
+      repEmail: repContact.email,
+      managerEmail: managerContact.email,
+      assignmentId: context.assignmentId,
+    });
+
+    if (!repContact.email && !managerContact.email) {
+      console.warn("[review feedback email] skipped: no email recipients", {
+        callId: args.callId,
+        repId: context.repId,
+        managerId: context.managerId,
+      });
+      return;
+    }
+
+    const result = await sendReviewFeedbackEmail({
+      repEmail: repContact.email,
+      managerEmail: managerContact.email,
+      repName: repContact.name,
+      managerName: managerContact.name,
+      callId: args.callId,
+      scoreOverall: args.scoreOverall,
+      voiceScore: args.voiceScore,
+      summary: args.summary ?? null,
+      weakClose: Boolean(args.reviewTags?.weak_close),
+      fillerCount: Number(args.reviewTags?.filler_count ?? 0),
+      fillerWords: Array.isArray(args.reviewTags?.filler_words) ? args.reviewTags.filler_words : [],
+      assignmentId: context.assignmentId,
+      appUrl: process.env.WEB_APP_URL || process.env.WEB_ORIGIN || "http://localhost:3000",
+    });
+
+    if (result?.ok) {
+      console.log("[review feedback email] sent", {
+        callId: args.callId,
+        messageId: result.id ?? null,
+        repEmail: repContact.email,
+        managerEmail: managerContact.email,
+      });
+    } else {
+      console.warn("[review feedback email] failed", {
+        callId: args.callId,
+        error: result?.error || "unknown_email_send_failure",
+        repEmail: repContact.email,
+        managerEmail: managerContact.email,
+      });
+    }
+  } catch (e: any) {
+    console.warn("[review feedback email] failed", e?.message || e);
+  }
+}
+
 export async function scoreWithLLM(opts: {
   supabase: SupabaseClient;
   callId: string;
@@ -974,11 +1217,11 @@ export async function scoreWithLLM(opts: {
     const cleanedTranscript = cleanTranscript(rawTranscript);
     const storedSegments = Array.isArray((call as any)?.analysis_json?.transcript?.segments)
       ? ((call as any)?.analysis_json?.transcript?.segments as Array<{
-          speaker?: string;
-          start_sec?: number;
-          end_sec?: number;
-          text?: string;
-        }>)
+        speaker?: string;
+        start_sec?: number;
+        end_sec?: number;
+        text?: string;
+      }>)
       : [];
     const cleanedSegments = storedSegments.length > 0 ? storedSegments : buildSegments(cleanedTranscript);
 
@@ -1073,6 +1316,20 @@ export async function scoreWithLLM(opts: {
           },
         });
         console.log("[perf] slack_ms", Date.now() - slackStart, { callId });
+
+        await autoSendReviewFeedbackEmailForWorkerBestEffort({
+          supabase,
+          callId,
+          repId: String((call as any)?.user_id ?? ""),
+          scoreOverall: cachedScore.overall,
+          voiceScore: voice.overall,
+          summary: cachedScore.summary ?? null,
+          reviewTags: {
+            weak_close: cachedScore.stages.close.score < 60,
+            filler_count: 0,
+            filler_words: [],
+          },
+        });
       }
       if (!SKIP_SCORING_SIDE_EFFECTS) {
         try {
@@ -1251,7 +1508,7 @@ ${knowledge.repMemoryText || "None"}`;
       const overall = typeof (callRow as any)?.score_overall === 'number' ? (callRow as any).score_overall : parsed.overall;
       const summary = `Scored ${Math.round(overall)}`;
 
-      await svc.from('activities').insert({
+      await svc.from('crm_activities').insert({
         type: 'score',
         summary,
         account_id: (callRow as any)?.account_id ?? null,
@@ -1277,6 +1534,20 @@ ${knowledge.repMemoryText || "None"}`;
         },
       });
       console.log("[perf] slack_ms", Date.now() - slackStart, { callId });
+
+      await autoSendReviewFeedbackEmailForWorkerBestEffort({
+        supabase,
+        callId,
+        repId: String((call as any)?.user_id ?? ""),
+        scoreOverall: parsed.overall,
+        voiceScore: voice.overall,
+        summary: parsed.summary ?? null,
+        reviewTags: {
+          weak_close: parsed.stages.close.score < 60,
+          filler_count: 0,
+          filler_words: [],
+        },
+      });
     }
 
     if (!SKIP_SCORING_SIDE_EFFECTS) {
@@ -1399,7 +1670,7 @@ ${knowledge.repMemoryText || "None"}`;
       const overall = typeof (callRow as any)?.score_overall === 'number' ? (callRow as any).score_overall : fb.overall;
       const summary = `Scored ${Math.round(overall)}`;
 
-      await svc.from('activities').insert({
+      await svc.from('crm_activities').insert({
         type: 'score',
         summary,
         account_id: (callRow as any)?.account_id ?? null,
@@ -1420,6 +1691,16 @@ ${knowledge.repMemoryText || "None"}`;
       durationSec = (data as any)?.duration_sec ?? null;
     } catch { }
 
+    let memoryCall: any = null;
+    try {
+      const lookup = await opts.supabase
+        .from("calls")
+        .select("user_id, org_id")
+        .eq("id", opts.callId)
+        .maybeSingle();
+      memoryCall = lookup.data ?? null;
+    } catch { }
+
     if (!SKIP_SCORING_SIDE_EFFECTS) {
       const slackStart = Date.now();
       await notifySlack({
@@ -1436,16 +1717,24 @@ ${knowledge.repMemoryText || "None"}`;
         },
       });
       console.log("[perf] slack_ms", Date.now() - slackStart, { callId: opts.callId });
+
+      await autoSendReviewFeedbackEmailForWorkerBestEffort({
+        supabase: opts.supabase,
+        callId: opts.callId,
+        repId: String((memoryCall as any)?.user_id ?? ""),
+        scoreOverall: fb.overall,
+        voiceScore: fallbackVoice.overall,
+        summary: fb.summary ?? null,
+        reviewTags: {
+          weak_close: fb.stages.close.score < 60,
+          filler_count: 0,
+          filler_words: [],
+        },
+      });
     }
 
     if (!SKIP_SCORING_SIDE_EFFECTS) {
       try {
-        const { data: memoryCall } = await opts.supabase
-          .from("calls")
-          .select("user_id, org_id")
-          .eq("id", opts.callId)
-          .maybeSingle();
-
         const repMemoryStart = Date.now();
         await upsertRepMemory(opts.supabase, {
           userId: String((memoryCall as any)?.user_id),

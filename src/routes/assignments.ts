@@ -67,6 +67,19 @@ async function sendSlackWebhook(text: string) {
 
 const MANAGER_ROLES = new Set(["Manager", "Admin", "Owner"]);
 
+function parseTargetIds(value: unknown): string[] {
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+  return Array.from(
+    new Set(
+      raw
+        .split(",")
+        .map((v) => v.trim())
+        .filter(Boolean)
+    )
+  ).slice(0, 100);
+}
+
 async function isManagerUser(userId: string) {
   const supa = getSupaAdmin();
 
@@ -115,6 +128,119 @@ export function assignmentsRoutes() {
   const SELECT_FIELDS =
     "id,rep_id,manager_id,type,target_id,title,status,due_at,created_at,completed_at,completed_by";
 
+  function normalizeAssignment(row: any) {
+    return {
+      id: String(row?.id || ""),
+      rep_id: row?.rep_id ? String(row.rep_id) : null,
+      manager_id: row?.manager_id ? String(row.manager_id) : null,
+      type: row?.type ? String(row.type) : null,
+      target_id: row?.target_id ? String(row.target_id) : null,
+      title: row?.title ? String(row.title) : "",
+      status: row?.status ? String(row.status) : "assigned",
+      due_at: row?.due_at ?? null,
+      created_at: row?.created_at ?? null,
+      completed_at: row?.completed_at ?? null,
+      completed_by: row?.completed_by ?? null,
+    };
+  }
+
+  function sortOpenAssignments(rows: any[]) {
+    return rows.slice().sort((a, b) => {
+      const aDue = a?.due_at ? new Date(a.due_at).getTime() : Number.MAX_SAFE_INTEGER;
+      const bDue = b?.due_at ? new Date(b.due_at).getTime() : Number.MAX_SAFE_INTEGER;
+      if (aDue !== bDue) return aDue - bDue;
+
+      const aCreated = a?.created_at ? new Date(a.created_at).getTime() : 0;
+      const bCreated = b?.created_at ? new Date(b.created_at).getTime() : 0;
+      return bCreated - aCreated;
+    });
+  }
+
+  function buildAssignmentsSummary(rows: any[]) {
+    const now = Date.now();
+    const normalized = rows.map(normalizeAssignment);
+    const open = normalized.filter((r) => String(r.status || "").toLowerCase() !== "completed");
+    const completed = normalized.filter((r) => String(r.status || "").toLowerCase() === "completed");
+    const overdue = open.filter((r) => {
+      if (!r.due_at) return false;
+      const t = new Date(String(r.due_at)).getTime();
+      return Number.isFinite(t) && t < now;
+    });
+
+    const todayFocus = sortOpenAssignments(open)[0] || null;
+
+    return {
+      total: normalized.length,
+      open: open.length,
+      completed: completed.length,
+      overdue: overdue.length,
+      today_focus: todayFocus,
+    };
+  }
+
+  // GET /v1/assignments/by-target?target_ids=<id1,id2,...>&type=call_review
+  // Batch lookup used by the call library to decorate cards with assignment state.
+  // Manager sees assignments they created. Rep sees assignments assigned to them.
+  r.get("/by-target", async (req: Request, res: Response) => {
+    try {
+      const supa = getSupaAdmin();
+
+      const userId = getUserId(req);
+      if (!userId) return res.status(401).json({ ok: false, error: "missing_user" });
+
+      const targetIds = parseTargetIds(req.query.target_ids);
+      if (targetIds.length === 0) {
+        return res.json({ ok: true, items: [] });
+      }
+
+      const type = String((req.query.type as string) || "call_review").trim().toLowerCase() || "call_review";
+      const manager = await isManagerUser(userId);
+
+      let q = supa
+        .from("assignments")
+        .select("id,target_id,status,rep_id,manager_id,type,created_at,completed_at")
+        .in("target_id", targetIds)
+        .eq("type", type)
+        .order("created_at", { ascending: false });
+
+      if (manager) q = q.eq("manager_id", userId);
+      else q = q.eq("rep_id", userId);
+
+      const { data, error } = await q;
+      if (error) return res.status(500).json({ ok: false, error: error.message });
+
+      const grouped = new Map<string, any[]>();
+      for (const row of (data || []) as any[]) {
+        const key = String(row?.target_id || "").trim();
+        if (!key) continue;
+        if (!grouped.has(key)) grouped.set(key, []);
+        grouped.get(key)!.push(row);
+      }
+
+      const items = targetIds.map((target_id) => {
+        const rows = grouped.get(target_id) || [];
+        const open = rows.find((r) => String(r?.status || "").toLowerCase() !== "completed") || null;
+        const completed = rows.find((r) => String(r?.status || "").toLowerCase() === "completed") || null;
+        const latest = rows[0] || null;
+
+        return {
+          target_id,
+          has_any: rows.length > 0,
+          has_open: Boolean(open),
+          has_completed: Boolean(completed),
+          latest_status: latest ? String(latest.status || "") : null,
+          latest_assignment_id: latest ? String(latest.id || "") : null,
+          open_assignment_id: open ? String(open.id || "") : null,
+          completed_assignment_id: completed ? String(completed.id || "") : null,
+        };
+      });
+
+      return res.json({ ok: true, items });
+    } catch (e: any) {
+      return res.status(500).json({ ok: false, error: e?.message || "assignments_by_target_failed" });
+    }
+  });
+
   // Rep view: list my assignments (or manager can pass ?repId=)
   // GET /v1/assignments?repId=<uuid>
   r.get("/", async (req: Request, res: Response) => {
@@ -160,7 +286,70 @@ export function assignmentsRoutes() {
     const { data, error } = await q;
 
     if (error) return res.status(500).json({ ok: false, error: error.message });
-    return res.json({ ok: true, repId, assignments: data || [] });
+
+    const items = (data || []).map(normalizeAssignment);
+    const summary = buildAssignmentsSummary(items);
+
+    return res.json({
+      ok: true,
+      repId,
+      items,
+      assignments: items,
+      summary,
+      today_focus: summary.today_focus,
+    });
+
+  // GET /v1/assignments/summary?repId=<uuid>
+  // Unified lightweight summary for rep dashboard and assignment widgets.
+  r.get("/summary", async (req: Request, res: Response) => {
+    const supa = getSupaAdmin();
+
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user" });
+
+    const repIdFromQuery = String((req.query.repId as string) || "").trim();
+    const repId = repIdFromQuery || userId;
+
+    if (repId !== userId) {
+      try {
+        const ok = await isManagerUser(userId);
+        if (!ok) {
+          return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        (req as any).authUserId = userId;
+      } catch (e: any) {
+        return res.status(500).json({ ok: false, error: e?.message || "manager_gate_failed" });
+      }
+    }
+
+    let q = supa
+      .from("assignments")
+      .select(SELECT_FIELDS)
+      .eq("rep_id", repId)
+      .order("created_at", { ascending: false });
+
+    if (repId !== userId) {
+      const managerId = String((req as any).authUserId || "").trim();
+      if (managerId) {
+        q = q.eq("manager_id", managerId);
+      }
+    }
+
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ ok: false, error: error.message });
+
+    const items = (data || []).map(normalizeAssignment);
+    const summary = buildAssignmentsSummary(items);
+
+    return res.json({
+      ok: true,
+      repId,
+      summary,
+      today_focus: summary.today_focus,
+      items,
+      assignments: items,
+    });
+  });
   });
 
 
@@ -238,7 +427,8 @@ export function assignmentsRoutes() {
       due_at: (data as any)?.due_at ?? null,
     });
 
-    return res.json({ ok: true, assignment: data });
+    const item = normalizeAssignment(data);
+    return res.json({ ok: true, item, assignment: item });
   });
 
   // PATCH /v1/assignments/:id/complete
@@ -280,7 +470,8 @@ export function assignmentsRoutes() {
 
       if (curErr) return res.status(500).json({ ok: false, error: curErr.message });
       if (!current) return res.status(404).json({ ok: false, error: "not_found" });
-      return res.json({ ok: true, assignment: current });
+      const item = normalizeAssignment(current);
+      return res.json({ ok: true, item, assignment: item });
     }
 
     const { data, error } = await supa
@@ -338,7 +529,8 @@ export function assignmentsRoutes() {
       completed_by: "rep",
     });
 
-    return res.json({ ok: true, assignment: data });
+    const item = normalizeAssignment(data);
+    return res.json({ ok: true, item, assignment: item });
   });
 
   // POST /v1/assignments/:id/nudge
@@ -546,7 +738,8 @@ export function assignmentsRoutes() {
         .maybeSingle();
 
       if (error) throw error;
-      return res.json({ ok: true, assignment: data });
+      const item = normalizeAssignment(data);
+      return res.json({ ok: true, item, assignment: item });
     } catch (e: any) {
       return res.status(400).json({ ok: false, error: e?.message || "patch_failed" });
     }
@@ -630,7 +823,7 @@ export function assignmentsRoutes() {
     if (error) return res.status(500).json({ ok: false, error: error.message });
 
     const rows = (data || []) as any[];
-    const page = rows.slice(0, limit);
+    const page = rows.slice(0, limit).map(normalizeAssignment);
 
     const last = page.length ? page[page.length - 1] : null;
     const nextCursor = rows.length > limit && last
@@ -643,6 +836,7 @@ export function assignmentsRoutes() {
       managerId,
       items: page,
       assignments: page,
+      summary: buildAssignmentsSummary(page),
       nextCursor,
     });
   });

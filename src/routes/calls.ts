@@ -3,6 +3,7 @@ import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { postSlack } from "../lib/slack";
 import { completeAssignmentsForTarget } from "../lib/assignmentsComplete";
+import { sendReviewFeedbackEmail } from "../lib/email";
 import 'dotenv/config';
 
 const router = Router();
@@ -52,6 +53,52 @@ function getUserIdHeader(req: any): string {
     throw new Error("Missing or invalid x-user-id");
   }
   return uid;
+}
+
+async function getRequesterOrgId(requester: string): Promise<string | null> {
+  const { data, error } = await supa
+    .from("calls")
+    .select("org_id")
+    .eq("user_id", requester)
+    .not("org_id", "is", null)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data?.org_id ?? null;
+}
+
+async function canAccessCall(requester: string, callUserId: string, callOrgId: string | null) {
+  if (callUserId === requester) return true;
+  if (!callOrgId) return false;
+
+  const requesterOrgId = await getRequesterOrgId(requester);
+  return !!requesterOrgId && requesterOrgId === callOrgId;
+}
+
+async function getOpenAssignmentCallIds(callIds: string[]): Promise<Set<string>> {
+  const ids = Array.from(new Set(callIds.map((x) => String(x || "").trim()).filter(Boolean)));
+  if (!ids.length) return new Set();
+
+  const { data, error } = await supa
+    .from("assignments")
+    .select("target_id,type,status")
+    .in("target_id", ids)
+    .eq("type", "call_review")
+    .in("status", ["open", "assigned", "todo", "in_progress"]);
+
+  if (error) {
+    console.warn("[calls] open assignment lookup failed", error.message || error);
+    return new Set();
+  }
+
+  const out = new Set<string>();
+  for (const row of data ?? []) {
+    const targetId = String((row as any)?.target_id ?? "").trim();
+    if (targetId) out.add(targetId);
+  }
+  return out;
 }
 
 const FILLER_WORDS = [
@@ -123,6 +170,7 @@ function detectWeakClose(args: { closeScore: number | null; text: string }) {
   return false;
 }
 
+
 function buildVoiceScore(args: {
   transcriptText: string;
   closeScore: number | null;
@@ -158,6 +206,329 @@ function buildVoiceScore(args: {
   };
 
   return { voice_score, voice_rubric, review_tags };
+}
+
+function compactText(value: unknown, max = 240) {
+  const s = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+
+async function resolveReviewFeedbackContext(args: {
+  assignmentId?: string | null;
+  callId: string;
+  repId: string;
+}) {
+  const { assignmentId, callId, repId } = args;
+
+  let managerId: string | null = null;
+  let resolvedAssignmentId: string | null = assignmentId ?? null;
+
+  if (assignmentId) {
+    const r = await supa
+      .from("assignments")
+      .select("id,rep_id,manager_id,target_id,type,status")
+      .eq("id", assignmentId)
+      .maybeSingle();
+
+    if (!r.error && r.data) {
+      managerId = r.data.manager_id ? String(r.data.manager_id) : null;
+      resolvedAssignmentId = r.data.id ? String(r.data.id) : assignmentId;
+    }
+  }
+
+  if (!managerId) {
+    const fallback = await supa
+      .from("assignments")
+      .select("id,rep_id,manager_id,target_id,type,status,created_at")
+      .eq("rep_id", repId)
+      .eq("type", "call_review")
+      .eq("target_id", callId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!fallback.error && fallback.data) {
+      managerId = fallback.data.manager_id ? String(fallback.data.manager_id) : null;
+      resolvedAssignmentId = fallback.data.id ? String(fallback.data.id) : resolvedAssignmentId;
+    }
+  }
+
+  return {
+    repId,
+    managerId,
+    assignmentId: resolvedAssignmentId,
+  };
+}
+
+async function lookupUserContactBestEffort(userId: string): Promise<{ email: string | null; name: string | null }> {
+  const tablePlans: Array<{
+    table: string;
+    selects: string[];
+    predicates: Array<{ col: string; value: string }>;
+    emailKeys: string[];
+    nameKeys: string[];
+  }> = [
+      {
+        table: "profiles",
+        selects: [
+          "id,email,full_name,name",
+          "id,email,full_name",
+          "id,email,name",
+          "id,email",
+        ],
+        predicates: [{ col: "id", value: userId }],
+        emailKeys: ["email"],
+        nameKeys: ["full_name", "name"],
+      },
+      {
+        table: "users",
+        selects: [
+          "id,email,full_name,name",
+          "id,email,full_name",
+          "id,email,name",
+          "id,email",
+        ],
+        predicates: [{ col: "id", value: userId }],
+        emailKeys: ["email"],
+        nameKeys: ["full_name", "name"],
+      },
+      {
+        table: "team_users",
+        selects: [
+          "id,email,full_name,name",
+          "id,email,full_name",
+          "id,email,name",
+          "id,email",
+        ],
+        predicates: [{ col: "id", value: userId }],
+        emailKeys: ["email"],
+        nameKeys: ["full_name", "name"],
+      },
+      {
+        table: "reps",
+        selects: [
+          "id,email,full_name,name",
+          "id,email,full_name",
+          "id,email,name",
+          "id,email",
+        ],
+        predicates: [{ col: "id", value: userId }],
+        emailKeys: ["email"],
+        nameKeys: ["full_name", "name"],
+      },
+    ];
+
+  for (const plan of tablePlans) {
+    for (const select of plan.selects) {
+      let q = supa.from(plan.table).select(select).limit(1);
+      for (const predicate of plan.predicates) {
+        q = q.eq(predicate.col, predicate.value);
+      }
+
+      const r = await q.maybeSingle();
+      if (r.error) {
+        const msg = String((r.error as any)?.message ?? "").toLowerCase();
+        if (
+          (msg.includes("relation") && msg.includes("does not exist")) ||
+          msg.includes("could not find the table") ||
+          (msg.includes("column") && msg.includes("does not exist")) ||
+          (msg.includes("schema cache") && msg.includes("column"))
+        ) {
+          continue;
+        }
+        continue;
+      }
+
+      const row: any = r.data;
+      if (!row) continue;
+
+      const email = plan.emailKeys
+        .map((k) => String(row?.[k] ?? "").trim())
+        .find(Boolean) || null;
+
+      const name = plan.nameKeys
+        .map((k) => String(row?.[k] ?? "").trim())
+        .find(Boolean) || null;
+
+      if (email || name) {
+        return { email, name };
+      }
+    }
+  }
+
+  return { email: null, name: null };
+}
+
+async function autoSendReviewFeedbackEmailBestEffort(args: {
+  callId: string;
+  repId: string;
+  assignmentId?: string | null;
+  scoreOverall: number;
+  voiceScore: number;
+  summary?: string | null;
+  reviewTags?: any;
+}) {
+  try {
+    const context = await resolveReviewFeedbackContext({
+      assignmentId: args.assignmentId ?? null,
+      callId: args.callId,
+      repId: args.repId,
+    });
+
+    const repContact = await lookupUserContactBestEffort(context.repId);
+    const managerContact = context.managerId
+      ? await lookupUserContactBestEffort(context.managerId)
+      : { email: null, name: null };
+
+    console.log("[review feedback email] attempting", {
+      callId: args.callId,
+      repId: context.repId,
+      managerId: context.managerId,
+      repEmail: repContact.email,
+      managerEmail: managerContact.email,
+      assignmentId: context.assignmentId,
+    });
+
+    if (!repContact.email && !managerContact.email) {
+      console.warn("[review feedback email] skipped: no email recipients", {
+        repId: context.repId,
+        managerId: context.managerId,
+        callId: args.callId,
+      });
+      return;
+    }
+
+    const result = await sendReviewFeedbackEmail({
+      repEmail: repContact.email,
+      managerEmail: managerContact.email,
+      repName: repContact.name,
+      managerName: managerContact.name,
+      callId: args.callId,
+      scoreOverall: args.scoreOverall,
+      voiceScore: args.voiceScore,
+      summary: args.summary ?? null,
+      weakClose: Boolean(args.reviewTags?.weak_close),
+      fillerCount: Number(args.reviewTags?.filler_count ?? 0),
+      fillerWords: Array.isArray(args.reviewTags?.filler_words) ? args.reviewTags.filler_words : [],
+      assignmentId: context.assignmentId,
+      appUrl: process.env.WEB_APP_URL || process.env.WEB_ORIGIN || "http://localhost:3000",
+    });
+
+    if (result?.ok) {
+      console.log("[review feedback email] sent", {
+        callId: args.callId,
+        messageId: result.id ?? null,
+        repEmail: repContact.email,
+        managerEmail: managerContact.email,
+      });
+    } else {
+      console.warn("[review feedback email] send failed", {
+        callId: args.callId,
+        error: result?.error || "unknown_email_send_failure",
+        repEmail: repContact.email,
+        managerEmail: managerContact.email,
+      });
+    }
+  } catch (e: any) {
+    console.warn("[review feedback email] failed", e?.message || e);
+  }
+}
+
+async function autoSendReviewFeedbackBestEffort(args: {
+  callId: string;
+  repId: string;
+  assignmentId?: string | null;
+  scoreOverall: number;
+  voiceScore: number;
+  summary?: string | null;
+  reviewTags?: any;
+}) {
+  try {
+    const context = await resolveReviewFeedbackContext({
+      assignmentId: args.assignmentId ?? null,
+      callId: args.callId,
+      repId: args.repId,
+    });
+
+    const appUrl =
+      process.env.WEB_APP_URL || process.env.WEB_ORIGIN || "http://localhost:3000";
+    const callUrl = `${appUrl}/calls/${args.callId}`;
+    const score = Number.isFinite(args.scoreOverall) ? Math.round(args.scoreOverall) : 0;
+    const voice = Number.isFinite(args.voiceScore) ? Math.round(args.voiceScore) : 0;
+    const weakClose = Boolean(args.reviewTags?.weak_close);
+    const fillerCount = Number(args.reviewTags?.filler_count ?? 0);
+    const fillerWords = Array.isArray(args.reviewTags?.filler_words)
+      ? args.reviewTags.filler_words.slice(0, 5).join(", ")
+      : "";
+
+    const audience = [
+      `Rep: ${context.repId}`,
+      context.managerId ? `Manager: ${context.managerId}` : null,
+      context.assignmentId ? `Assignment: ${context.assignmentId}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const coachingFlags = [
+      weakClose ? "Weak close" : null,
+      fillerCount > 0 ? `Fillers: ${fillerCount}` : null,
+      fillerWords ? `Top fillers: ${fillerWords}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    await postSlack(`Review complete · score ${score} · rep ${context.repId}`, [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `*Review complete*\n${audience || `Rep: ${context.repId}`}`,
+        },
+      },
+      {
+        type: "section",
+        fields: [
+          { type: "mrkdwn", text: `*Call score*\n${score}` },
+          { type: "mrkdwn", text: `*Voice score*\n${voice}` },
+        ],
+      },
+      ...(coachingFlags
+        ? [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `*Coaching flags*\n${coachingFlags}`,
+            },
+          } as const,
+        ]
+        : []),
+      ...(compactText(args.summary)
+        ? [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `*Summary*\n${compactText(args.summary)}`,
+            },
+          } as const,
+        ]
+        : []),
+      {
+        type: "actions",
+        elements: [
+          {
+            type: "button",
+            text: { type: "plain_text", text: "Open reviewed call" },
+            url: callUrl,
+          },
+        ],
+      },
+    ]);
+  } catch (e: any) {
+    console.warn("[review feedback dispatch] failed", e?.message || e);
+  }
 }
 
 
@@ -246,22 +617,95 @@ router.post("/", async (req, res) => {
 ------------------------------------------------------------ */
 router.get("/", async (req, res) => {
   try {
-    const userId = String(req.query.userId ?? "");
-    const limit = Math.min(Number(req.query.limit ?? 10), 50);
+    const requester = getUserIdHeader(req);
+    const rawLimit = Number(req.query.limit ?? 10);
+    const limit = Math.min(Math.max(rawLimit, 1), 50);
+    const search = (req.query.q as string | undefined)?.trim() ?? "";
 
-    if (!userId) return res.status(400).json({ ok: false, error: "userId required" });
+    const scope = String(req.query.scope ?? "mine").toLowerCase() === "company" ? "company" : "mine";
+    const requesterOrgId =
+      scope === "company"
+        ? (await getRequesterOrgId(requester)) ??
+        (process.env.NODE_ENV !== "production" ? process.env.DEFAULT_ORG_ID ?? null : null)
+        : null;
 
-    const { data, error } = await supa
+    console.log("[calls/list]", {
+      requester,
+      scope,
+      requesterOrgId,
+      search,
+      limit,
+    });
+
+    let q = supa
       .from("calls")
-      .select("*")
-      .eq("user_id", userId)
+      .select(`
+        id,
+        user_id,
+        org_id,
+        filename,
+        storage_path,
+        status,
+        created_at,
+        duration_sec,
+        duration_ms,
+        score_overall,
+        ai_model,
+        rep_name,
+        tags,
+        summary,
+        flags
+      `)
       .order("created_at", { ascending: false })
       .limit(limit);
 
+    if (scope === "company") {
+      if (!requesterOrgId) {
+        return res.status(403).json({ ok: false, error: "missing_org_scope" });
+      }
+      q = q.eq("org_id", requesterOrgId);
+    } else {
+      q = q.eq("user_id", requester);
+    }
+
+    if (search) {
+      q = q.or(`filename.ilike.%${search}%,summary.ilike.%${search}%`);
+    }
+
+    const { data, error } = await q;
     if (error) throw error;
-    res.json({ ok: true, calls: data });
+
+    const openAssignmentCallIds = await getOpenAssignmentCallIds(
+      (data ?? []).map((c: any) => String(c.id ?? ""))
+    );
+
+    const calls = (data ?? []).map((c: any) => ({
+      id: c.id,
+      filename: c.filename,
+      status: c.status,
+      created_at: c.created_at,
+      duration_sec: c.duration_sec,
+      duration_ms: c.duration_ms ?? null,
+      score_overall: c.score_overall,
+      ai_model: c.ai_model,
+      type: c.storage_path ? "upload" : "live",
+      rep_name: c.rep_name ?? null,
+      tags: c.tags ?? null,
+      summary: c.summary ?? null,
+      flags: c.flags ?? [],
+      has_open_assignment: openAssignmentCallIds.has(String(c.id)),
+    }));
+
+    console.log("[calls/list/result]", {
+      scope,
+      requester,
+      requesterOrgId,
+      returned: calls.length,
+    });
+
+    res.json({ ok: true, calls });
   } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message });
+    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
 });
 
@@ -275,6 +719,22 @@ router.get("/paged", async (req, res) => {
     const limit = Math.min(Math.max(rawLimit, 1), 50);
     const cursor = req.query.cursor ? String(req.query.cursor) : null;
     const search = (req.query.q as string | undefined)?.trim() ?? "";
+
+    const scope = String(req.query.scope ?? "mine").toLowerCase() === "company" ? "company" : "mine";
+    const requesterOrgId =
+      scope === "company"
+        ? (await getRequesterOrgId(requester)) ??
+        (process.env.NODE_ENV !== "production" ? process.env.DEFAULT_ORG_ID ?? null : null)
+        : null;
+
+    console.log("[calls/paged]", {
+      requester,
+      scope,
+      requesterOrgId,
+      search,
+      cursor,
+      limit,
+    });
 
     let q = supa
       .from("calls")
@@ -297,9 +757,17 @@ router.get("/paged", async (req, res) => {
           flags
         `
       )
-      .eq("user_id", requester)
       .order("created_at", { ascending: false })
       .limit(limit + 1);
+
+    if (scope === "company") {
+      if (!requesterOrgId) {
+        return res.status(403).json({ ok: false, error: "missing_org_scope" });
+      }
+      q = q.eq("org_id", requesterOrgId);
+    } else {
+      q = q.eq("user_id", requester);
+    }
 
     // cursor-based pagination (keep existing behaviour)
     if (cursor) {
@@ -331,6 +799,10 @@ router.get("/paged", async (req, res) => {
       items = items.slice(0, limit);
     }
 
+    const openAssignmentCallIds = await getOpenAssignmentCallIds(
+      items.map((c: any) => String(c.id ?? ""))
+    );
+
     // Shape payload for web: keep existing fields, add new UX bits
     const mapped = items.map((c) => ({
       id: c.id,
@@ -346,8 +818,16 @@ router.get("/paged", async (req, res) => {
       tags: c.tags ?? null,
       summary: c.summary ?? null,
       flags: c.flags ?? [],
+      has_open_assignment: openAssignmentCallIds.has(String(c.id)),
     }));
 
+    console.log("[calls/paged/result]", {
+      scope,
+      requester,
+      requesterOrgId,
+      returned: mapped.length,
+      nextCursor,
+    });
     return res.json({ ok: true, calls: mapped, nextCursor });
   } catch (e: any) {
     console.error(e);
@@ -371,12 +851,13 @@ router.get("/:id/signed-audio", async (req, res) => {
     // ensure call exists and belongs to requester
     const { data: call, error } = await supa
       .from("calls")
-      .select("user_id,audio_path")
+      .select("user_id,org_id,audio_path")
       .eq("id", id)
       .single();
 
     if (error || !call) return res.status(404).json({ ok: false, error: "not_found" });
-    if (call.user_id !== requester) {
+    const allowed = await canAccessCall(requester, call.user_id, call.org_id ?? null);
+    if (!allowed) {
       return res.status(403).json({ ok: false, error: "forbidden" });
     }
     if (!call.audio_path) {
@@ -580,6 +1061,30 @@ router.post("/:id/score", async (req, res) => {
     }
 
     // ---------------------------------------------------------
+    // DAY 64 — AUTO FEEDBACK DISPATCH (fail-soft)
+    // Sends reviewed-call feedback to the shared feedback channel with
+    // rep/manager context when an assignment relationship exists.
+    // ---------------------------------------------------------
+    await autoSendReviewFeedbackBestEffort({
+      callId: id,
+      repId: call.user_id,
+      assignmentId: effectiveAssignmentId || null,
+      scoreOverall: body.score_overall,
+      voiceScore: voice_score,
+      summary: typeof body.summary === "string" ? body.summary : patch.summary ?? null,
+      reviewTags,
+    });
+    console.log("[score route] feedback email dispatch attempted", { callId: id, repId: call.user_id });
+    await autoSendReviewFeedbackEmailBestEffort({
+      callId: id,
+      repId: call.user_id,
+      assignmentId: effectiveAssignmentId || null,
+      scoreOverall: body.score_overall,
+      voiceScore: voice_score,
+      summary: typeof body.summary === "string" ? body.summary : patch.summary ?? null,
+      reviewTags,
+    });
+    // ---------------------------------------------------------
     // DAY 52 — AUTO COACHING TRIGGERS
     // Detect weak close / objection and auto-create CRM tasks
     // Future-safe: include coaching_reason metadata when schema supports it
@@ -703,12 +1208,13 @@ router.get("/:id/scores", async (req, res) => {
     // verify ownership
     const { data: call, error: callErr } = await supa
       .from("calls")
-      .select("id,user_id")
+      .select("id,user_id,org_id")
       .eq("id", id)
       .single();
 
     if (callErr || !call) return res.status(404).json({ ok: false, error: "not_found" });
-    if (call.user_id !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
+    const allowed = await canAccessCall(requester, call.user_id, call.org_id ?? null);
+    if (!allowed) return res.status(403).json({ ok: false, error: "forbidden" });
 
     const { data, error } = await supa
       .from("call_scores")
@@ -795,7 +1301,8 @@ router.get("/:id", async (req, res) => {
       return res.status(404).json({ ok: false, error: "not_found" });
     }
 
-    if (call.user_id !== requester) {
+    const allowed = await canAccessCall(requester, call.user_id, call.org_id ?? null);
+    if (!allowed) {
       return res.status(403).json({ ok: false, error: "forbidden" });
     }
 

@@ -459,6 +459,38 @@ async function listCrmActivityRowsBestEffort(limit = 5000) {
   return [];
 }
 
+async function listLatestCallsForControlCentreBestEffort(limit = 2000) {
+  const selectCandidates = [
+    "id, user_id, created_at, tags, flags",
+    "id, user_id, created_at, tags",
+    "id, user_id, created_at, flags",
+    "id, user_id, created_at",
+    "id, user_id",
+  ];
+
+  for (const sel of selectCandidates) {
+    const r = await supa
+      .from("calls")
+      .select(sel)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (!r.error) return (r.data as any[]) ?? [];
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    if ((msg.includes("relation") && msg.includes("does not exist")) || msg.includes("could not find the table")) {
+      return [];
+    }
+    if (msg.includes("column") && msg.includes("does not exist")) {
+      continue;
+    }
+
+    throw new Error((r.error as any)?.message ?? "calls_fetch_failed");
+  }
+
+  return [];
+}
+
 const ManagerAutoAssignRunBodySchema = z.object({
   mode: z.enum(["dry_run", "execute"]).optional(),
   limit_reps: z.number().int().min(1).max(100).optional(),
@@ -1205,6 +1237,331 @@ router.get("/manager/overview", async (req, res) => {
     return res.status(400).json({ ok: false, error: msg });
   }
 
+
+});
+
+// ------------------------------
+// Rep Control Centre helpers and route
+// ------------------------------
+function daysSinceIso(value: string | null | undefined) {
+  if (!value) return null;
+  const ms = new Date(String(value)).getTime();
+  if (!Number.isFinite(ms)) return null;
+  return Math.max(0, Math.floor((Date.now() - ms) / 86400000));
+}
+
+function newerIso(a: string | null | undefined, b: string | null | undefined) {
+  const ta = a ? new Date(String(a)).getTime() : NaN;
+  const tb = b ? new Date(String(b)).getTime() : NaN;
+  if (!Number.isFinite(ta) && !Number.isFinite(tb)) return null;
+  if (!Number.isFinite(ta)) return b ?? null;
+  if (!Number.isFinite(tb)) return a ?? null;
+  return ta >= tb ? String(a) : String(b);
+}
+
+function computeActivityScore(args: { lastLoginAt?: string | null; lastCallAt?: string | null }) {
+  const latest = newerIso(args.lastLoginAt ?? null, args.lastCallAt ?? null);
+  const days = daysSinceIso(latest);
+  if (days === null) {
+    return { score: 0, label: "No activity data", latest_at: null, days_since: null };
+  }
+  if (days <= 1) return { score: 100, label: "Active in last 24h", latest_at: latest, days_since: days };
+  if (days <= 3) return { score: 80, label: `Active ${days}d ago`, latest_at: latest, days_since: days };
+  if (days <= 7) return { score: 60, label: `Active ${days}d ago`, latest_at: latest, days_since: days };
+  if (days <= 14) return { score: 35, label: `Inactive ${days}d`, latest_at: latest, days_since: days };
+  return { score: 10, label: `Inactive ${days}d`, latest_at: latest, days_since: days };
+}
+
+function readRubricMetricAliases(rubric: any, aliases: string[]) {
+  for (const key of aliases) {
+    const n = readRubricNumber(rubric, key);
+    if (n !== null) return n;
+  }
+  return null;
+}
+
+function inferWeakestSkillFromRubric(rubric: any): string | null {
+  if (!rubric || typeof rubric !== "object") return null;
+
+  const skillCandidates: Array<{ label: string; value: number | null }> = [
+    { label: "Intro", value: readRubricMetricAliases(rubric, ["intro", "intro_score", "opening", "opener_score"]) },
+    { label: "Discovery", value: readRubricMetricAliases(rubric, ["discovery", "discovery_score"]) },
+    { label: "Objection handling", value: readRubricMetricAliases(rubric, ["objection", "objection_score", "objection_handling", "objection_handling_score"]) },
+    { label: "Closing", value: readRubricMetricAliases(rubric, ["close", "close_score", "closing", "closing_score"]) },
+  ].filter((x) => x.value !== null) as Array<{ label: string; value: number }>;
+
+  if (!skillCandidates.length) return null;
+  skillCandidates.sort((a, b) => a.value - b.value);
+  return skillCandidates[0]?.label ?? null;
+}
+
+function buildCoachingReasons(args: { latestCall: any; rubric: any; weakestSkill: string | null }) {
+  const reasons = new Set<string>();
+  const tags = Array.isArray(args.latestCall?.tags) ? args.latestCall.tags : [];
+  const flags = Array.isArray(args.latestCall?.flags) ? args.latestCall.flags : [];
+  const blobs = [...tags, ...flags].map((x) => String(x || "").trim().toLowerCase());
+
+  for (const value of blobs) {
+    if (!value) continue;
+    if (value.includes("price")) reasons.add("price_objection");
+    if (value.includes("objection")) reasons.add("objection_handling");
+    if (value.includes("weak close") || value.includes("closing")) reasons.add("weak_close");
+    if (value.includes("discovery")) reasons.add("discovery");
+    if (value.includes("intro") || value.includes("opening") || value.includes("opener")) reasons.add("intro");
+    if (value.includes("next step")) reasons.add("next_steps");
+  }
+
+  if (readRubricBoolean(args.rubric, "weak_close") === true) {
+    reasons.add("weak_close");
+    reasons.add("next_steps");
+  }
+
+  if (args.weakestSkill === "Objection handling") reasons.add("objection_handling");
+  if (args.weakestSkill === "Closing") reasons.add("weak_close");
+  if (args.weakestSkill === "Discovery") reasons.add("discovery");
+  if (args.weakestSkill === "Intro") reasons.add("intro");
+
+  return Array.from(reasons);
+}
+
+function deriveWeakestSkillFromReasons(reasons: string[]): string | null {
+  const joined = reasons.map((x) => String(x || "").trim().toLowerCase()).filter(Boolean).join(" | ");
+  if (!joined) return null;
+
+  if (joined.includes("objection")) return "Objection handling";
+  if (joined.includes("weak_close") || joined.includes("closing") || joined.includes("next_steps")) return "Closing";
+  if (joined.includes("discovery")) return "Discovery";
+  if (joined.includes("intro") || joined.includes("opening") || joined.includes("opener")) return "Intro";
+  if (joined.includes("price")) return "Price handling";
+  return null;
+}
+
+function buildRepControlCentreRow(args: {
+  rep: any;
+  counts: { open: number; overdue: number; completed_today: number };
+  latestCall: any | null;
+  latestScore: any | null;
+}) {
+  const { rep, counts, latestCall, latestScore } = args;
+
+  const repId = String(rep?.id ?? "").trim();
+  const repNameRaw = String(rep?.name ?? "").trim();
+
+  const lastLoginAt = rep?.last_active_at ?? null;
+  const lastCallAt = latestCall?.created_at ?? null;
+  const activity = computeActivityScore({ lastLoginAt, lastCallAt });
+
+  const rubric = latestScore?.rubric ?? null;
+  const weakestFromRubric = inferWeakestSkillFromRubric(rubric);
+
+  const coachingReasons = buildCoachingReasons({
+    latestCall,
+    rubric,
+    weakestSkill: weakestFromRubric,
+  });
+
+  const weakestFromReasons = deriveWeakestSkillFromReasons(coachingReasons);
+
+  let weakestSkill: string | null = null;
+  let weakestSkillSource: string = "activity_fallback";
+
+  if (weakestFromRubric) {
+    weakestSkill = weakestFromRubric;
+    weakestSkillSource = "rubric";
+  } else if (weakestFromReasons) {
+    weakestSkill = weakestFromReasons;
+    weakestSkillSource = "reasons";
+  } else {
+    weakestSkill = "Consistency";
+    weakestSkillSource = "activity_fallback";
+  }
+
+  const inactiveDays = activity.days_since;
+  const overdue = Number(counts?.overdue ?? 0);
+  const open = Number(counts?.open ?? 0);
+  const completedToday = Number(counts?.completed_today ?? 0);
+
+  const reasons: string[] = [...coachingReasons];
+  let riskScore = 0;
+
+  if (overdue > 0) {
+    reasons.push(`overdue_${overdue}`);
+    riskScore += overdue * 100;
+  }
+
+  if (open >= 8) {
+    reasons.push("workload_open_actions");
+    riskScore += 80;
+  } else if (open >= 4) {
+    reasons.push("follow_up_open_actions");
+    riskScore += 35;
+  }
+
+  if (typeof inactiveDays === "number" && inactiveDays >= 7) {
+    reasons.push("inactive_7d");
+    riskScore += 90;
+  } else if (typeof inactiveDays === "number" && inactiveDays >= 3) {
+    reasons.push("inactive_3d");
+    riskScore += 40;
+  }
+
+  if (completedToday === 0 && open > 0 && weakestSkillSource === "activity_fallback") {
+    reasons.push("no_activity_today");
+    riskScore += 15;
+  }
+
+  let band: "ok" | "watch" | "at_risk" = "ok";
+  if (overdue > 0 || riskScore >= 120) band = "at_risk";
+  else if (riskScore >= 50) band = "watch";
+
+  return {
+    rep_id: repId,
+    rep_name: repNameRaw || `Rep ${repId.slice(0, 8)}`,
+    band,
+    risk_score: riskScore,
+    reasons,
+    counts: {
+      open,
+      overdue,
+      completed_today: completedToday,
+    },
+    weakest_skill: weakestSkill,
+    weakest_skill_source: weakestSkillSource,
+    activity_score: activity.score,
+    activity_label: activity.label,
+    meta: {
+      tier: rep?.tier ?? null,
+      org_id: rep?.org_id ?? null,
+      last_active_at: activity.latest_at,
+      last_login_at: lastLoginAt,
+      last_call_at: lastCallAt,
+      created_at: rep?.created_at ?? null,
+      inactive_days: inactiveDays,
+      weakest_skill: weakestSkill,
+      weakest_skill_source: weakestSkillSource,
+      activity_score: activity.score,
+      activity_label: activity.label,
+    },
+  };
+}
+
+router.get("/manager/control-centre", async (req, res) => {
+  try {
+    const { requester, orgId, bypassed } = await requireManagerOrg(req);
+
+    const okManager = await isManagerUser(requester);
+    if (!okManager) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    }
+
+    const repRows = await listRepDirectoryBestEffort();
+    const activityRows = await listCrmActivityRowsBestEffort();
+    const latestCallRows = await listLatestCallsForControlCentreBestEffort();
+    const latestScoreRows = await listLatestCallScoresBestEffort();
+
+    const visibleReps = repRows.filter((rep: any) => {
+      const repId = String(rep?.id ?? "").trim();
+      if (!repId) return false;
+      if (repId === requester) return false;
+      if (bypassed) return true;
+      return String(rep?.org_id ?? "") === orgId;
+    });
+
+    const nowMs = Date.now();
+    const countsByUser = new Map<string, { open: number; overdue: number; completed_today: number }>();
+
+    for (const row of activityRows) {
+      const uid = String((row as any)?.user_id ?? "").trim();
+      if (!uid) continue;
+
+      const bucket = countsByUser.get(uid) ?? { open: 0, overdue: 0, completed_today: 0 };
+
+      const completedAt = (row as any)?.completed_at ?? null;
+      const dueAt = (row as any)?.due_at ?? null;
+      const status = String((row as any)?.status ?? "").trim().toLowerCase();
+      const isCompleted = !!completedAt || status === "done" || status === "completed" || status === "closed";
+
+      if (isCompleted) {
+        const completedMs = completedAt ? new Date(String(completedAt)).getTime() : NaN;
+        if (Number.isFinite(completedMs) && completedMs >= nowMs - 86400000) {
+          bucket.completed_today += 1;
+        }
+      } else {
+        bucket.open += 1;
+        const dueMs = dueAt ? new Date(String(dueAt)).getTime() : NaN;
+        if (Number.isFinite(dueMs) && dueMs < nowMs) {
+          bucket.overdue += 1;
+        }
+      }
+
+      countsByUser.set(uid, bucket);
+    }
+
+    const latestCallByUser = new Map<string, any>();
+    for (const row of latestCallRows) {
+      const uid = String((row as any)?.user_id ?? "").trim();
+      if (!uid) continue;
+      if (latestCallByUser.has(uid)) continue;
+      latestCallByUser.set(uid, row);
+    }
+
+    const latestScoreByUser = new Map<string, any>();
+    for (const row of latestScoreRows) {
+      const uid = String((row as any)?.user_id ?? "").trim();
+      if (!uid) continue;
+      if (latestScoreByUser.has(uid)) continue;
+      latestScoreByUser.set(uid, row);
+    }
+
+    const repsAll = visibleReps
+      .map((rep: any) => {
+        const repId = String(rep?.id ?? "").trim();
+        return buildRepControlCentreRow({
+          rep,
+          counts: countsByUser.get(repId) ?? { open: 0, overdue: 0, completed_today: 0 },
+          latestCall: latestCallByUser.get(repId) ?? null,
+          latestScore: latestScoreByUser.get(repId) ?? null,
+        });
+      })
+      .sort((a, b) => {
+        const riskDelta = Number(b.risk_score ?? 0) - Number(a.risk_score ?? 0);
+        if (riskDelta !== 0) return riskDelta;
+        const overdueDelta = Number(b.counts?.overdue ?? 0) - Number(a.counts?.overdue ?? 0);
+        if (overdueDelta !== 0) return overdueDelta;
+        const openDelta = Number(b.counts?.open ?? 0) - Number(a.counts?.open ?? 0);
+        if (openDelta !== 0) return openDelta;
+        return String(a.rep_name ?? "").localeCompare(String(b.rep_name ?? ""));
+      });
+
+    const repsAtRisk = repsAll.filter((r) => r.band === "at_risk");
+    const repsWatch = repsAll.filter((r) => r.band === "watch");
+    const repsOk = repsAll.filter((r) => r.band === "ok");
+
+    const headline = {
+      reps_total: repsAll.length,
+      reps_at_risk: repsAtRisk.length,
+      reps_watch: repsWatch.length,
+      reps_ok: repsOk.length,
+      open_actions_total: repsAll.reduce((sum, r) => sum + Number(r.counts?.open ?? 0), 0),
+      overdue_actions_total: repsAll.reduce((sum, r) => sum + Number(r.counts?.overdue ?? 0), 0),
+    };
+
+    return res.json({
+      ok: true,
+      mode: bypassed ? "fallback" : "org",
+      headline,
+      reps_all: repsAll,
+      reps_at_risk: repsAtRisk,
+      reps_watch: repsWatch,
+      reps_ok: repsOk,
+      items: repsAll,
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "bad_request");
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: msg });
+    if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
+    return res.status(400).json({ ok: false, error: msg });
+  }
 });
 
 router.post("/manager/auto-assign/run", async (req, res) => {
@@ -4361,7 +4718,7 @@ router.post("/unlink", async (req, res) => {
       }
     }
 
-        // 1b) Best-effort: clear linkage columns on crm_call_links (schema tolerant)
+    // 1b) Best-effort: clear linkage columns on crm_call_links (schema tolerant)
     // This is the source used by GET /v1/crm/link for UUID calls, so if we only
     // clear `calls.contact_id/account_id` the panel can still re-hydrate stale data.
     {

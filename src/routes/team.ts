@@ -12,16 +12,16 @@ const supa = createClient(
 
 // ----- Users list (schema-agnostic) ----------------------------------------
 const CANDIDATES: { select: string; searchCols: string[] }[] = [
-  { select: "id, full_name", searchCols: ["full_name"] },
-  { select: "id:user_id, full_name", searchCols: ["full_name"] },
-  { select: "id, full_name:name", searchCols: ["name"] },
-  { select: "id:user_id, full_name:name", searchCols: ["name"] },
-  { select: "id, full_name, email", searchCols: ["full_name", "email"] },
-  { select: "id:user_id, full_name, email", searchCols: ["full_name", "email"] },
-  { select: "id, full_name:name, email", searchCols: ["name", "email"] },
-  { select: "id:user_id, full_name:name, email", searchCols: ["name", "email"] },
-  { select: "id", searchCols: [] },
-  { select: "id:user_id", searchCols: [] },
+  { select: "id, full_name, role, manager_id", searchCols: ["full_name"] },
+  { select: "id:user_id, full_name, role, manager_id", searchCols: ["full_name"] },
+  { select: "id, full_name:name, role, manager_id", searchCols: ["name"] },
+  { select: "id:user_id, full_name:name, role, manager_id", searchCols: ["name"] },
+  { select: "id, full_name, email, role, manager_id", searchCols: ["full_name", "email"] },
+  { select: "id:user_id, full_name, email, role, manager_id", searchCols: ["full_name", "email"] },
+  { select: "id, full_name:name, email, role, manager_id", searchCols: ["name", "email"] },
+  { select: "id:user_id, full_name:name, email, role, manager_id", searchCols: ["name", "email"] },
+  { select: "id, role, manager_id", searchCols: [] },
+  { select: "id:user_id, role, manager_id", searchCols: [] },
 ];
 
 async function trySelect(selectClause: string, searchCols: string[], q: string, limit: number) {
@@ -53,7 +53,9 @@ router.get("/users", async (req, res) => {
       const email = typeof u.email === "string" ? u.email : null;
       const fullName = typeof u.full_name === "string" ? u.full_name : null;
       const name = fullName || email || id;
-      return { id, name, email };
+      const role = typeof u.role === "string" ? u.role : null;
+      const manager_id = u.manager_id ?? null;
+      return { id, name, email, role, manager_id };
     }).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
 
     return res.json({ ok: true, items });
