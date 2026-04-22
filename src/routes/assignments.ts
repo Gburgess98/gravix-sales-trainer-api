@@ -167,6 +167,18 @@ export function assignmentsRoutes() {
       return Number.isFinite(t) && t < now;
     });
 
+    const dueToday = open.filter((r) => {
+      if (!r.due_at) return false;
+      const d = new Date(String(r.due_at));
+      if (Number.isNaN(d.getTime())) return false;
+      const today = new Date();
+      return (
+        d.getFullYear() === today.getFullYear() &&
+        d.getMonth() === today.getMonth() &&
+        d.getDate() === today.getDate()
+      );
+    });
+
     const todayFocus = sortOpenAssignments(open)[0] || null;
 
     return {
@@ -174,6 +186,10 @@ export function assignmentsRoutes() {
       open: open.length,
       completed: completed.length,
       overdue: overdue.length,
+      open_count: open.length,
+      completed_count: completed.length,
+      overdue_count: overdue.length,
+      due_today_count: dueToday.length,
       today_focus: todayFocus,
     };
   }
@@ -198,7 +214,7 @@ export function assignmentsRoutes() {
 
       let q = supa
         .from("assignments")
-        .select("id,target_id,status,rep_id,manager_id,type,created_at,completed_at")
+        .select("id,target_id,status,rep_id,manager_id,type,created_at,completed_at,due_at")
         .in("target_id", targetIds)
         .eq("type", type)
         .order("created_at", { ascending: false });
@@ -225,10 +241,14 @@ export function assignmentsRoutes() {
 
         return {
           target_id,
-          has_any: rows.length > 0,
+          has_assignment: rows.length > 0,
           has_open: Boolean(open),
           has_completed: Boolean(completed),
-          latest_status: latest ? String(latest.status || "") : null,
+          status: open
+            ? "assigned"
+            : completed
+            ? "completed"
+            : null,
           latest_assignment_id: latest ? String(latest.id || "") : null,
           open_assignment_id: open ? String(open.id || "") : null,
           completed_assignment_id: completed ? String(completed.id || "") : null,
@@ -298,6 +318,7 @@ export function assignmentsRoutes() {
       summary,
       today_focus: summary.today_focus,
     });
+  });
 
   // GET /v1/assignments/summary?repId=<uuid>
   // Unified lightweight summary for rep dashboard and assignment widgets.
@@ -349,7 +370,6 @@ export function assignmentsRoutes() {
       items,
       assignments: items,
     });
-  });
   });
 
 

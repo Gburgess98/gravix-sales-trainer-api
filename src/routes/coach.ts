@@ -2,6 +2,8 @@ import { Router } from "express";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 
+console.log("[coach.ts] module loaded", new Date().toISOString());
+
 const r = Router();
 const supa = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, { auth: { persistSession: false } });
 
@@ -13,12 +15,19 @@ const Create = z.object({
   notes: z.string().max(500).optional(),
 });
 
-function uid(req:any){ const v=(req.header("x-user-id")||"").trim(); if(!v) throw new Error("Missing x-user-id"); return v; }
+function uid(req: any) { const v = (req.header("x-user-id") || "").trim(); if (!v) throw new Error("Missing x-user-id"); return v; }
 
 r.post("/assign", async (req, res) => {
   try {
     const body = Create.parse(req.body);
     const requester = uid(req);
+    let activityDebug: any = { attempted: false, ok: false, error: null };
+
+    console.log("[coach/assign] handler reached", {
+      callId: body.callId,
+      assigneeUserId: body.assigneeUserId,
+      requester,
+    });
 
     // verify requester owns the call OR is same org (simplest: owner only)
     const { data: call, error } = await supa
@@ -26,19 +35,55 @@ r.post("/assign", async (req, res) => {
       .select("id,user_id,org_id")
       .eq("id", body.callId)
       .single();
-    if (error || !call) return res.status(404).json({ ok:false, error:"not_found" });
-    if (call.user_id !== requester) return res.status(403).json({ ok:false, error:"forbidden" });
+    if (error || !call) return res.status(404).json({ ok: false, error: "not_found" });
+    if (call.user_id !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
 
-    const { data, error: insErr } = await supa.from("coach_assignments").insert({
+    const assignmentPayload = {
       call_id: body.callId,
       assignee_user_id: body.assigneeUserId,
       drill_id: body.drillId,
       notes: body.notes ?? null,
-      created_by: requester,
-    }).select().single();
-    if (insErr) throw insErr;
+      org_id: (call as any)?.org_id ?? null,
+      status: "open",
+    } as any;
 
-    // Day 64/63 stability: write linked CRM activity with org_id + call_id + rep_id
+    console.log("[coach/assign] inserting assignment", assignmentPayload);
+
+    let { data, error: insErr } = await supa
+      .from("coach_assignments")
+      .insert(assignmentPayload)
+      .select()
+      .single();
+
+    if (insErr) {
+      const msg = String((insErr as any)?.message ?? "").toLowerCase();
+      const missingOrg = msg.includes("org_id") && msg.includes("schema cache");
+      const fallbackPayload = {
+        call_id: body.callId,
+        assignee_user_id: body.assigneeUserId,
+        drill_id: body.drillId,
+        notes: body.notes ?? null,
+        status: "open",
+      } as any;
+
+      if (missingOrg) {
+        console.warn("[coach/assign] retrying assignment insert without org_id");
+        const retry = await supa
+          .from("coach_assignments")
+          .insert(fallbackPayload)
+          .select()
+          .single();
+        data = retry.data as any;
+        insErr = retry.error as any;
+      }
+    }
+
+    if (insErr) {
+      console.error("[coach/assign] coach_assignments insert failed", insErr);
+      throw insErr;
+    }
+
+    // Day 64/65: write linked CRM activity with full linkage fields
     try {
       const activityPayload = {
         org_id: (call as any)?.org_id ?? null,
@@ -47,52 +92,32 @@ r.post("/assign", async (req, res) => {
         call_id: body.callId,
         type: "coach_assignment",
         title: "Coach assignment created",
-        description: body.notes ?? `Assigned drill: ${body.drillId}`,
         status: "open",
         source: "coach_assignment",
         meta: {
           coach_assignment_id: (data as any)?.id ?? null,
           drill_id: body.drillId,
-          created_by: requester,
           requester,
           assignee_user_id: body.assigneeUserId,
+          notes: body.notes ?? null,
         },
       } as any;
 
-      const insertWithRep = await supa.from("crm_activities").insert(activityPayload);
-      if (insertWithRep.error) {
-        const msg = String((insertWithRep.error as any)?.message ?? "").toLowerCase();
-        const missingOrg = msg.includes("org_id") && msg.includes("does not exist");
-        const missingRep = msg.includes("rep_id") && msg.includes("does not exist");
-        const missingMeta = msg.includes("meta") && msg.includes("does not exist");
-        const missingSource = msg.includes("source") && msg.includes("does not exist");
+      activityDebug.attempted = true;
+      console.log("[coach/assign] inserting activity", activityPayload);
 
-        if (missingOrg || missingRep || missingMeta || missingSource) {
-          const fallbackPayload = {
-            user_id: body.assigneeUserId,
-            call_id: body.callId,
-            type: "coach_assignment",
-            title: "Coach assignment created",
-            description: body.notes ?? `Assigned drill: ${body.drillId}`,
-            status: "open",
-          } as any;
-
-          console.warn("[coach/assign] crm_activities retrying with fallback payload", {
-            missingOrg,
-            missingRep,
-            missingMeta,
-            missingSource,
-          });
-
-          const retry = await supa.from("crm_activities").insert(fallbackPayload);
-          if (retry.error) {
-            console.warn("[coach/assign] crm_activities fallback insert failed", retry.error);
-          }
-        } else {
-          console.warn("[coach/assign] crm_activities insert failed", insertWithRep.error);
-        }
+      const insertRes = await supa.from("crm_activities").insert(activityPayload);
+      if (insertRes.error) {
+        activityDebug.ok = false;
+        activityDebug.error = String((insertRes.error as any)?.message ?? insertRes.error);
+        console.warn("[coach/assign] crm_activities insert failed", insertRes.error);
+      } else {
+        activityDebug.ok = true;
       }
-    } catch (activityErr) {
+    } catch (activityErr: any) {
+      activityDebug.attempted = true;
+      activityDebug.ok = false;
+      activityDebug.error = String(activityErr?.message ?? activityErr);
       console.warn("[coach/assign] activity write failed", activityErr);
     }
 
@@ -103,9 +128,10 @@ r.post("/assign", async (req, res) => {
       rep_id: body.assigneeUserId,
       created_by: requester,
     });
-    res.json({ ok:true, item:data });
-  } catch (e:any) {
-    res.status(400).json({ ok:false, error: e?.message || "bad_request" });
+    res.json({ ok: true, item: data, activity_debug: activityDebug });
+  } catch (e: any) {
+    console.error("[coach/assign] failed", e);
+    res.status(400).json({ ok: false, error: e?.message || "bad_request" });
   }
 });
 
