@@ -32,11 +32,75 @@ r.post("/assign", async (req, res) => {
     // verify requester owns the call OR is same org (simplest: owner only)
     const { data: call, error } = await supa
       .from("calls")
-      .select("id,user_id,org_id")
+      .select("id,user_id,org_id,analysis_json,score_overall")
       .eq("id", body.callId)
       .single();
     if (error || !call) return res.status(404).json({ ok: false, error: "not_found" });
     if (call.user_id !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
+
+    const reviewFlags = Array.isArray((call as any)?.analysis_json?.review_flags)
+      ? (call as any).analysis_json.review_flags
+      : [];
+    const thresholdBand =
+      typeof (call as any)?.analysis_json?.threshold_band === "string"
+        ? String((call as any).analysis_json.threshold_band)
+        : null;
+    const needsManagerReview = Boolean((call as any)?.analysis_json?.needs_manager_review);
+    const isFlaggedCall = reviewFlags.length > 0 || Boolean(thresholdBand) || needsManagerReview;
+
+    const assignmentSource = isFlaggedCall ? "flagged_call" : "manual";
+    const activityTitle = isFlaggedCall ? "Flagged call coaching assignment created" : "Coach assignment created";
+    const activitySummary = isFlaggedCall
+      ? `Created coaching assignment from flagged call (${thresholdBand || "flagged"})`
+      : "Created manual coaching assignment";
+
+    const duplicateCheck = await supa
+      .from("coach_assignments")
+      .select("id,call_id,assignee_user_id,drill_id,notes,org_id,status,source,meta,created_at")
+      .eq("call_id", body.callId)
+      .eq("assignee_user_id", body.assigneeUserId)
+      .eq("drill_id", body.drillId)
+      .neq("status", "completed")
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (duplicateCheck.error) {
+      const msg = String((duplicateCheck.error as any)?.message ?? "").toLowerCase();
+      const schemaCacheIssue = msg.includes("schema cache") || msg.includes("could not find");
+      if (!schemaCacheIssue) {
+        console.warn("[coach/assign] duplicate check failed", duplicateCheck.error);
+      }
+    }
+
+    if (!duplicateCheck.error && duplicateCheck.data) {
+      console.log("[coach/assign] skipped duplicate open assignment", {
+        existingId: (duplicateCheck.data as any)?.id ?? null,
+        call_id: body.callId,
+        assignee_user_id: body.assigneeUserId,
+      });
+
+      return res.json({
+        ok: true,
+        deduped: true,
+        item: duplicateCheck.data,
+        reporting: {
+          assignment_origin: String((duplicateCheck.data as any)?.source || assignmentSource),
+          flagged_call: Boolean((duplicateCheck.data as any)?.meta?.flagged_call ?? isFlaggedCall),
+          threshold_band: (duplicateCheck.data as any)?.meta?.threshold_band ?? thresholdBand,
+          review_flag_count: Array.isArray((duplicateCheck.data as any)?.meta?.review_flags)
+            ? (duplicateCheck.data as any).meta.review_flags.length
+            : reviewFlags.length,
+          needs_manager_review: Boolean((duplicateCheck.data as any)?.meta?.needs_manager_review ?? needsManagerReview),
+        },
+        activity_debug: {
+          attempted: false,
+          ok: true,
+          error: null,
+          skipped: "duplicate_open_assignment",
+        },
+      });
+    }
 
     const assignmentPayload = {
       call_id: body.callId,
@@ -45,6 +109,21 @@ r.post("/assign", async (req, res) => {
       notes: body.notes ?? null,
       org_id: (call as any)?.org_id ?? null,
       status: "open",
+      source: assignmentSource,
+      meta: {
+        source: assignmentSource,
+        action_type: "assignment_created",
+        assignment_origin: assignmentSource,
+        dedupe_key: `${body.callId}:${body.assigneeUserId}:${body.drillId}`,
+        flagged_call: isFlaggedCall,
+        threshold_band: thresholdBand,
+        needs_manager_review: needsManagerReview,
+        review_flags: reviewFlags,
+        score_overall: (call as any)?.score_overall ?? null,
+        // NEW: tracking fields for analytics
+        flag_sections: reviewFlags.map((f: any) => f.section).filter(Boolean),
+        score_before: (call as any)?.score_overall ?? null,
+      },
     } as any;
 
     console.log("[coach/assign] inserting assignment", assignmentPayload);
@@ -64,6 +143,18 @@ r.post("/assign", async (req, res) => {
         drill_id: body.drillId,
         notes: body.notes ?? null,
         status: "open",
+        source: assignmentSource,
+        meta: {
+          source: assignmentSource,
+          action_type: "assignment_created",
+          assignment_origin: assignmentSource,
+          dedupe_key: `${body.callId}:${body.assigneeUserId}:${body.drillId}`,
+          flagged_call: isFlaggedCall,
+          threshold_band: thresholdBand,
+          needs_manager_review: needsManagerReview,
+          review_flags: reviewFlags,
+          score_overall: (call as any)?.score_overall ?? null,
+        },
       } as any;
 
       if (missingOrg) {
@@ -91,7 +182,8 @@ r.post("/assign", async (req, res) => {
         rep_id: body.assigneeUserId,
         call_id: body.callId,
         type: "coach_assignment",
-        title: "Coach assignment created",
+        title: activityTitle,
+        summary: activitySummary,
         status: "open",
         source: "coach_assignment",
         meta: {
@@ -100,6 +192,19 @@ r.post("/assign", async (req, res) => {
           requester,
           assignee_user_id: body.assigneeUserId,
           notes: body.notes ?? null,
+          source: assignmentSource,
+          action_type: "assignment_created",
+          assignment_origin: assignmentSource,
+          dedupe_key: `${body.callId}:${body.assigneeUserId}:${body.drillId}`,
+          flagged_call: isFlaggedCall,
+          threshold_band: thresholdBand,
+          needs_manager_review: needsManagerReview,
+          review_flags: reviewFlags,
+          review_flag_count: reviewFlags.length,
+          score_overall: (call as any)?.score_overall ?? null,
+          // NEW: tracking fields for analytics
+          flag_sections: reviewFlags.map((f: any) => f.section).filter(Boolean),
+          score_before: (call as any)?.score_overall ?? null,
         },
       } as any;
 
@@ -127,8 +232,23 @@ r.post("/assign", async (req, res) => {
       org_id: (call as any)?.org_id ?? null,
       rep_id: body.assigneeUserId,
       created_by: requester,
+      flagged_call: isFlaggedCall,
+      threshold_band: thresholdBand,
+      review_flag_count: reviewFlags.length,
     });
-    res.json({ ok: true, item: data, activity_debug: activityDebug });
+    res.json({
+      ok: true,
+      item: data,
+      reporting: {
+        assignment_origin: assignmentSource,
+        flagged_call: isFlaggedCall,
+        threshold_band: thresholdBand,
+        review_flag_count: reviewFlags.length,
+        needs_manager_review: needsManagerReview,
+        deduped: false,
+      },
+      activity_debug: activityDebug,
+    });
   } catch (e: any) {
     console.error("[coach/assign] failed", e);
     res.status(400).json({ ok: false, error: e?.message || "bad_request" });

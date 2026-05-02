@@ -498,6 +498,82 @@ const ManagerAutoAssignRunBodySchema = z.object({
   max_total_contacts: z.number().int().min(1).max(1000).optional(),
 });
 
+async function listCrmAccountsBestEffort(args: { userIds: string[]; limit?: number }) {
+  const { userIds, limit = 5000 } = args;
+  if (!userIds.length) return [];
+
+  const selectCandidates = [
+    "id, user_id, name, created_at, updated_at",
+    "id, user_id, name, created_at",
+    "id, user_id, name",
+    "id, user_id",
+    "id",
+  ];
+
+  for (const sel of selectCandidates) {
+    const r = await supa
+      .from("crm_accounts")
+      .select(sel)
+      .in("user_id", userIds)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (!r.error) return (r.data as any[]) ?? [];
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    if ((msg.includes("relation") && msg.includes("does not exist")) || msg.includes("could not find the table")) {
+      return [];
+    }
+    if (msg.includes("column") && msg.includes("does not exist")) continue;
+
+    throw new Error((r.error as any)?.message ?? "crm_accounts_fetch_failed");
+  }
+
+  return [];
+}
+
+async function listCrmOpportunitiesBestEffort(args: { userIds: string[]; limit?: number }) {
+  const { userIds, limit = 5000 } = args;
+  if (!userIds.length) return [];
+
+  const selectCandidates = [
+    "id, user_id, stage, amount, close_date, account_id, contact_id, created_at, updated_at",
+    "id, user_id, stage, amount, close_date, account_id, contact_id, created_at",
+    "id, user_id, stage, amount, close_date, created_at",
+    "id, user_id, stage, amount, created_at",
+    "id, user_id, stage, created_at",
+    "id, user_id, stage",
+    "id, user_id",
+    "id",
+  ];
+
+  for (const sel of selectCandidates) {
+    const r = await supa
+      .from("crm_opportunities")
+      .select(sel)
+      .in("user_id", userIds)
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (!r.error) return (r.data as any[]) ?? [];
+
+    const msg = String((r.error as any)?.message ?? "").toLowerCase();
+    if ((msg.includes("relation") && msg.includes("does not exist")) || msg.includes("could not find the table")) {
+      return [];
+    }
+    if (msg.includes("column") && msg.includes("does not exist")) continue;
+
+    throw new Error((r.error as any)?.message ?? "crm_opportunities_fetch_failed");
+  }
+
+  return [];
+}
+
+function normaliseOpportunityStage(value: any) {
+  const v = String(value ?? "").trim().toLowerCase();
+  return v || "new";
+}
+
 async function listCrmContactsForUserBestEffort(args: { userId: string; limit: number }) {
   const { userId, limit } = args;
 
@@ -1143,6 +1219,121 @@ async function upsertTeamSettingsBestEffort(args: {
   };
 }
 
+router.get("/reporting-summary", async (req, res) => {
+  try {
+    const { requester, orgId, bypassed } = await requireManagerOrg(req);
+
+    const okManager = await isManagerUser(requester);
+    if (!okManager) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    }
+
+    const repRows = await listRepDirectoryBestEffort(2000);
+    const visibleReps = repRows.filter((rep: any) => {
+      const repId = String(rep?.id ?? "").trim();
+      if (!repId) return false;
+      if (bypassed) return true;
+      return String(rep?.org_id ?? "") === orgId;
+    });
+    const userIds = visibleReps.map((rep: any) => String(rep?.id ?? "").trim()).filter(Boolean);
+
+    const [contacts, accounts, opportunities] = await Promise.all([
+      Promise.all(userIds.map((userId) => listCrmContactsForUserBestEffort({ userId, limit: 500 }))).then((chunks) => chunks.flat()),
+      listCrmAccountsBestEffort({ userIds, limit: 5000 }),
+      listCrmOpportunitiesBestEffort({ userIds, limit: 5000 }),
+    ]);
+
+    const contactRows = (contacts || []) as any[];
+    const accountRows = (accounts || []) as any[];
+    const opportunityRows = (opportunities || []) as any[];
+
+    const contactsAtRisk = contactRows.filter((contact) => {
+      const health = computeContactHealthV1({
+        last_contacted_at: contact?.last_contacted_at ?? null,
+        open_actions: 0,
+        overdue_actions: 0,
+        has_notes: false,
+        has_recent_call: false,
+      });
+      return health.band === "at_risk";
+    }).length;
+
+    const opportunitiesByStage = opportunityRows.reduce((acc, row) => {
+      const stage = normaliseOpportunityStage((row as any)?.stage);
+      acc[stage] = (acc[stage] ?? 0) + 1;
+      return acc;
+    }, {} as Record<string, number>);
+
+    const openOpportunityStages = new Set(["new", "qualified", "proposal", "negotiation"]);
+    const openOpportunities = opportunityRows.filter((row) => openOpportunityStages.has(normaliseOpportunityStage((row as any)?.stage))).length;
+    const wonOpportunities = opportunityRows.filter((row) => normaliseOpportunityStage((row as any)?.stage) === "won").length;
+    const lostOpportunities = opportunityRows.filter((row) => normaliseOpportunityStage((row as any)?.stage) === "lost").length;
+
+    const pipelineAmount = opportunityRows.reduce((sum, row) => {
+      const raw = (row as any)?.amount;
+      const n = typeof raw === "number" ? raw : Number(raw);
+      return Number.isFinite(n) ? sum + n : sum;
+    }, 0);
+
+    const contactsByRep = new Map<string, number>();
+    const oppsByRep = new Map<string, number>();
+    const accountsByRep = new Map<string, number>();
+
+    for (const row of contactRows) {
+      const repId = String((row as any)?.user_id ?? "").trim();
+      if (!repId) continue;
+      contactsByRep.set(repId, (contactsByRep.get(repId) ?? 0) + 1);
+    }
+    for (const row of opportunityRows) {
+      const repId = String((row as any)?.user_id ?? "").trim();
+      if (!repId) continue;
+      oppsByRep.set(repId, (oppsByRep.get(repId) ?? 0) + 1);
+    }
+    for (const row of accountRows) {
+      const repId = String((row as any)?.user_id ?? "").trim();
+      if (!repId) continue;
+      accountsByRep.set(repId, (accountsByRep.get(repId) ?? 0) + 1);
+    }
+
+    const reps = visibleReps.map((rep: any) => {
+      const repId = String(rep?.id ?? "").trim();
+      return {
+        rep_id: repId,
+        rep_name: String(rep?.name ?? "").trim() || `Rep ${repId.slice(0, 8)}`,
+        contacts: contactsByRep.get(repId) ?? 0,
+        accounts: accountsByRep.get(repId) ?? 0,
+        opportunities: oppsByRep.get(repId) ?? 0,
+      };
+    }).sort((a, b) => {
+      if (b.opportunities !== a.opportunities) return b.opportunities - a.opportunities;
+      if (b.contacts !== a.contacts) return b.contacts - a.contacts;
+      return a.rep_name.localeCompare(b.rep_name);
+    });
+
+    return res.json({
+      ok: true,
+      mode: bypassed ? "fallback" : "org",
+      company: {
+        contacts_total: contactRows.length,
+        contacts_at_risk: contactsAtRisk,
+        accounts_total: accountRows.length,
+        opportunities_total: opportunityRows.length,
+        opportunities_open: openOpportunities,
+        opportunities_won: wonOpportunities,
+        opportunities_lost: lostOpportunities,
+        pipeline_amount: pipelineAmount,
+        opportunities_by_stage: opportunitiesByStage,
+      },
+      reps,
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "bad_request");
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: msg });
+    if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
+    return res.status(400).json({ ok: false, error: msg });
+  }
+});
+
 // --- Inserted: manager overview route ---
 router.get("/manager/overview", async (req, res) => {
   try {
@@ -1236,8 +1427,6 @@ router.get("/manager/overview", async (req, res) => {
     if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
     return res.status(400).json({ ok: false, error: msg });
   }
-
-
 });
 
 // ------------------------------

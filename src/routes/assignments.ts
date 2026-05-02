@@ -47,6 +47,62 @@ function safeTypeNudgeLabel(t: string) {
   return "task";
 }
 
+// 🔥 DRILL MEMORY AGGREGATION
+async function getRepSectionMemory(supa: any, repId: string) {
+  const { data, error } = await supa
+    .from("crm_activities")
+    .select("meta, created_at")
+    .eq("type", "drill_memory")
+    .eq("rep_id", repId)
+    .limit(2000);
+
+  if (error) throw error;
+
+  const memory: Record<string, any> = {};
+
+  for (const row of data || []) {
+    const m = row.meta || {};
+    const section = m.section || "general";
+
+    if (!memory[section]) {
+      memory[section] = {
+        attempts: 0,
+        successes: 0,
+        last_completed_at: null,
+      };
+    }
+
+    memory[section].attempts++;
+
+    if (m.completed) {
+      memory[section].successes++;
+      memory[section].last_completed_at = row.created_at;
+    }
+  }
+
+  return memory;
+}
+
+// 🔥 IMPROVEMENT SCORE
+function getImprovementScore(sectionMemory: any) {
+  if (!sectionMemory) return 0;
+
+  const { attempts, successes } = sectionMemory;
+  if (!attempts) return 0;
+
+  return successes / attempts;
+}
+
+// 🔥 AUTO DIFFICULTY ENGINE
+function getNextDifficulty(sectionMemory: any) {
+  const score = getImprovementScore(sectionMemory);
+
+  if (score >= 0.8) return "brutal";
+  if (score >= 0.5) return "hard";
+  if (score >= 0.25) return "medium";
+  return "easy";
+}
+
 async function sendSlackWebhook(text: string) {
   const url = String(process.env.SLACK_WEBHOOK_URL || "").trim();
   if (!url) throw new Error("missing_slack_webhook_url");
@@ -126,9 +182,25 @@ export function assignmentsRoutes() {
   const r = Router();
 
   const SELECT_FIELDS =
-    "id,rep_id,manager_id,type,target_id,title,status,due_at,created_at,completed_at,completed_by";
+    "id,rep_id,manager_id,type,target_id,title,status,due_at,created_at,completed_at,completed_by,source,meta";
 
   function normalizeAssignment(row: any) {
+    const meta = row && typeof row.meta === "object" && row.meta ? row.meta : null;
+    const thresholdBand =
+      typeof row?.threshold_band === "string"
+        ? String(row.threshold_band)
+        : typeof meta?.threshold_band === "string"
+          ? String(meta.threshold_band)
+          : null;
+    const needsManagerReview =
+      typeof row?.needs_manager_review === "boolean"
+        ? Boolean(row.needs_manager_review)
+        : Boolean(meta?.needs_manager_review);
+    const flaggedCall =
+      typeof row?.flagged_call === "boolean"
+        ? Boolean(row.flagged_call)
+        : Boolean(meta?.flagged_call);
+
     return {
       id: String(row?.id || ""),
       rep_id: row?.rep_id ? String(row.rep_id) : null,
@@ -141,11 +213,49 @@ export function assignmentsRoutes() {
       created_at: row?.created_at ?? null,
       completed_at: row?.completed_at ?? null,
       completed_by: row?.completed_by ?? null,
+
+      // 🔥 CORE SOURCE TRACKING
+      source: row?.source
+        ? String(row.source)
+        : (typeof meta?.assignment_origin === "string"
+          ? String(meta.assignment_origin)
+          : null),
+
+      meta,
+
+      // 🔥 FLAG + SCORING SIGNALS
+      flagged_call: flaggedCall,
+      threshold_band: thresholdBand,
+      needs_manager_review: needsManagerReview,
+
+      // 🔥 NEW — ANALYTICS FIELDS (CRITICAL)
+      assignment_origin:
+        typeof meta?.assignment_origin === "string"
+          ? String(meta.assignment_origin)
+          : null,
+
+      flag_section:
+        typeof meta?.flag_section === "string"
+          ? String(meta.flag_section)
+          : null,
+
+      score_before:
+        typeof meta?.score_before === "number"
+          ? meta.score_before
+          : null,
     };
   }
 
   function sortOpenAssignments(rows: any[]) {
     return rows.slice().sort((a, b) => {
+      const aCritical = a?.needs_manager_review || a?.threshold_band === "critical" ? 1 : 0;
+      const bCritical = b?.needs_manager_review || b?.threshold_band === "critical" ? 1 : 0;
+      if (aCritical !== bCritical) return bCritical - aCritical;
+
+      const aFlagged = a?.flagged_call || a?.threshold_band ? 1 : 0;
+      const bFlagged = b?.flagged_call || b?.threshold_band ? 1 : 0;
+      if (aFlagged !== bFlagged) return bFlagged - aFlagged;
+
       const aDue = a?.due_at ? new Date(a.due_at).getTime() : Number.MAX_SAFE_INTEGER;
       const bDue = b?.due_at ? new Date(b.due_at).getTime() : Number.MAX_SAFE_INTEGER;
       if (aDue !== bDue) return aDue - bDue;
@@ -179,6 +289,13 @@ export function assignmentsRoutes() {
       );
     });
 
+    const flagged = normalized.filter(
+      (r) => Boolean(r.flagged_call) || Boolean(r.threshold_band) || Boolean(r.needs_manager_review)
+    );
+    const critical = normalized.filter(
+      (r) => r.threshold_band === "critical" || Boolean(r.needs_manager_review)
+    );
+
     const todayFocus = sortOpenAssignments(open)[0] || null;
 
     return {
@@ -186,10 +303,25 @@ export function assignmentsRoutes() {
       open: open.length,
       completed: completed.length,
       overdue: overdue.length,
+
+      flagged: flagged.length,
+      critical: critical.length,
+
       open_count: open.length,
       completed_count: completed.length,
       overdue_count: overdue.length,
       due_today_count: dueToday.length,
+
+      flagged_count: flagged.length,
+      critical_count: critical.length,
+
+      auto_created_count: normalized.filter(r => String(r.source || '').toLowerCase() === 'flagged_call_auto').length,
+      manual_created_count: normalized.filter(r => String(r.source || '').toLowerCase() !== 'flagged_call_auto').length,
+
+      completion_rate: normalized.length
+        ? Math.round((completed.length / normalized.length) * 100)
+        : 0,
+
       today_focus: todayFocus,
     };
   }
@@ -206,7 +338,7 @@ export function assignmentsRoutes() {
 
       const targetIds = parseTargetIds(req.query.target_ids);
       if (targetIds.length === 0) {
-        return res.json({ ok: true, items: [] });
+        return res.json({ ok: true, items: [], assignments: [], summary: buildAssignmentsSummary([]), today_focus: null });
       }
 
       const type = String((req.query.type as string) || "call_review").trim().toLowerCase() || "call_review";
@@ -247,15 +379,21 @@ export function assignmentsRoutes() {
           status: open
             ? "assigned"
             : completed
-            ? "completed"
-            : null,
+              ? "completed"
+              : null,
           latest_assignment_id: latest ? String(latest.id || "") : null,
           open_assignment_id: open ? String(open.id || "") : null,
           completed_assignment_id: completed ? String(completed.id || "") : null,
         };
       });
 
-      return res.json({ ok: true, items });
+      return res.json({
+        ok: true,
+        items,
+        assignments: items,
+        summary: buildAssignmentsSummary([]),
+        today_focus: null,
+      });
     } catch (e: any) {
       return res.status(500).json({ ok: false, error: e?.message || "assignments_by_target_failed" });
     }
@@ -384,7 +522,15 @@ export function assignmentsRoutes() {
     if (!managerId) {
       return res.status(401).json({ ok: false, error: "missing_user" });
     }
-    const { rep_id, type, target_id, title, due_at } = req.body ?? {};
+    const {
+      rep_id,
+      type,
+      target_id,
+      title,
+      due_at,
+      source,
+      meta
+    } = req.body ?? {};
 
     if (!rep_id || typeof rep_id !== "string") {
       return res.status(400).json({ ok: false, error: "rep_id_required" });
@@ -419,12 +565,98 @@ export function assignmentsRoutes() {
       cleanDueAt = parsed.toISOString();
     }
 
+    const safeMeta = typeof meta === "object" && meta ? meta : {};
+
+    // 🧠 ADVANCED MEMORY-BASED DIFFICULTY
+    let difficulty = "easy";
+    let sectionMemory: any = null;
+
+    try {
+      const repMemory = await getRepSectionMemory(supa, rep_id);
+      sectionMemory = repMemory[safeMeta?.flag_section || "general"];
+
+      difficulty = getNextDifficulty(sectionMemory);
+    } catch (e) {
+      console.log("[memory.fetch.failed]", e);
+    }
+
+    // 🔥 STEP 1 — Derive drill type from section
+    const drillType =
+      safeMeta?.flag_section === "objection"
+        ? "objection_handling"
+        : safeMeta?.flag_section === "close"
+          ? "closing"
+          : safeMeta?.flag_section === "discovery"
+            ? "discovery"
+            : "general";
+
+    // 🔥 STEP 2 — Build uniqueness key (prevents duplicate drills)
+    const uniquenessKey = [
+      rep_id,
+      safeMeta?.flag_section || "general",
+      drillType,
+    ].join(":");
+
+    // 🔥 STEP 3 — Check for existing active assignment (same weakness)
+    const { data: existing } = await supa
+      .from("assignments")
+      .select("id,status,meta")
+      .eq("rep_id", rep_id)
+      .neq("status", "completed")
+      .limit(20);
+
+    const alreadyExists = (existing || []).some((a: any) => {
+      const m = a.meta || {};
+      return (
+        m?.flag_section === safeMeta?.flag_section &&
+        m?.drill_type === drillType
+      );
+    });
+
+    if (alreadyExists) {
+      return res.json({
+        ok: true,
+        skipped: true,
+        reason: "duplicate_active_drill",
+      });
+    }
+
+    // 🔥 STEP 4 — Final payload
     const payload: any = {
       rep_id,
       manager_id: managerId,
       type,
       title: cleanTitle,
       status: "assigned",
+      source: source || safeMeta?.assignment_origin || "manual",
+      meta: {
+        ...safeMeta,
+        // CORE
+        assignment_origin: safeMeta?.assignment_origin || source || "manual",
+        flag_section: safeMeta?.flag_section || null,
+        score_before: safeMeta?.score_before ?? null,
+        // 🔥 DRILL INTELLIGENCE
+        drill_type: drillType,
+        uniqueness_key: uniquenessKey,
+        // FLAGS
+        threshold_band: safeMeta?.threshold_band ?? null,
+        needs_manager_review: safeMeta?.needs_manager_review ?? false,
+        flagged_call: safeMeta?.flagged_call ?? false,
+
+        // 🧠 MEMORY TRACKING
+        failure_count:
+          (safeMeta?.failure_count ?? 1) +
+          (sectionMemory?.attempts || 0),
+        last_failure_at: new Date().toISOString(),
+        difficulty,
+
+        // 🎯 SPARRING FEED
+        sparring_context: {
+          section: safeMeta?.flag_section || "general",
+          difficulty,
+          scenario_seed: `${safeMeta?.flag_section || "general"}_${Date.now()}`
+        },
+      },
     };
 
     if (target_id !== undefined) payload.target_id = target_id;
@@ -437,6 +669,25 @@ export function assignmentsRoutes() {
       .single();
 
     if (error) return res.status(500).json({ ok: false, error: error.message });
+
+    // 🔥 FAILURE TRACKING (CRITICAL)
+    try {
+      const section = payload?.meta?.flag_section || "general";
+
+      await supa.from("crm_activities").insert({
+        type: "drill_memory",
+        rep_id: rep_id,
+        meta: {
+          section,
+          completed: false,
+          created_from_assignment: true,
+          assignment_id: (data as any)?.id,
+          created_at: new Date().toISOString(),
+        },
+      });
+    } catch (e) {
+      console.log("[memory.failure.track.failed]", e);
+    }
 
     console.log("[assign.lifecycle]", {
       event: "created",
@@ -506,6 +757,24 @@ export function assignmentsRoutes() {
       .single();
 
     if (error) return res.status(500).json({ ok: false, error: error.message });
+
+    // MEMORY TRACKING: Insert drill_memory activity for this section
+    try {
+      const section = (data as any)?.meta?.flag_section;
+      if (section) {
+        await supa.from("crm_activities").insert({
+          type: "drill_memory",
+          rep_id: userId,
+          meta: {
+            section,
+            completed: true,
+            completed_at: new Date().toISOString(),
+          },
+        });
+      }
+    } catch (e) {
+      console.log("[memory.update.failed]", e);
+    }
 
     // -------------------------------
     // XP (best-effort; never block completion)
@@ -1145,6 +1414,85 @@ export function assignmentsRoutes() {
       });
     } catch (e: any) {
       return res.status(500).json({ ok: false, error: e?.message || "trust_failed" });
+    }
+  });
+
+  // GET /v1/assignments/reporting
+  // Aggregated assignment reporting (rep + company level)
+  r.get("/reporting", async (req: Request, res: Response) => {
+    try {
+      const supa = getSupaAdmin();
+
+      const userId = getUserId(req);
+      if (!userId) return res.status(401).json({ ok: false, error: "missing_user" });
+
+      const isManager = await isManagerUser(userId);
+
+      let q = supa
+        .from("assignments")
+        .select(SELECT_FIELDS)
+        .order("created_at", { ascending: false })
+        .limit(5000);
+
+      if (!isManager) {
+        q = q.eq("rep_id", userId);
+      }
+
+      const { data, error } = await q;
+      if (error) return res.status(500).json({ ok: false, error: error.message });
+
+      const rows = (data || []).map(normalizeAssignment);
+
+      const byRep = new Map<string, any>();
+
+      for (const r of rows) {
+        const repId = String(r.rep_id || "");
+        if (!repId) continue;
+
+        if (!byRep.has(repId)) {
+          byRep.set(repId, {
+            rep_id: repId,
+            total: 0,
+            open: 0,
+            completed: 0,
+            overdue: 0,
+            flagged: 0,
+            critical: 0,
+            auto_created: 0,
+            by_section: {},
+          });
+        }
+
+        const item = byRep.get(repId);
+
+        item.total++;
+
+        if (String(r.status).toLowerCase() === "completed") item.completed++;
+        else item.open++;
+
+        if (r.due_at && new Date(r.due_at).getTime() < Date.now()) item.overdue++;
+
+        if (r.flagged_call || r.threshold_band || r.needs_manager_review) item.flagged++;
+        if (r.threshold_band === "critical" || r.needs_manager_review) item.critical++;
+
+        if (String(r.source || "").toLowerCase() === "flagged_call_auto") item.auto_created++;
+      }
+
+      const reps = Array.from(byRep.values()).map((r) => ({
+        ...r,
+        completion_rate: r.total ? Math.round((r.completed / r.total) * 100) : 0,
+      }));
+
+      const company = buildAssignmentsSummary(rows);
+
+      return res.json({
+        ok: true,
+        scope: isManager ? "company" : "rep",
+        reps,
+        company,
+      });
+    } catch (e: any) {
+      return res.status(500).json({ ok: false, error: e?.message || "assignment_reporting_failed" });
     }
   });
 

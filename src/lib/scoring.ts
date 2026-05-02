@@ -865,6 +865,329 @@ export function heuristicScoreFallback(): LlmScore {
   };
 }
 
+// --- SCORING THRESHOLD HELPERS ---
+async function getScoringThresholds(supabase: SupabaseClient): Promise<{
+  low: number;
+  critical: number;
+}> {
+  try {
+    const { data, error } = await supabase
+      .from("admin_config")
+      .select("low_score_threshold, critical_score_threshold")
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    const low = Number((data as any)?.low_score_threshold);
+    const critical = Number((data as any)?.critical_score_threshold);
+
+    return {
+      low: Number.isFinite(low) ? low : 65,
+      critical: Number.isFinite(critical) ? critical : 45,
+    };
+  } catch {
+    return { low: 65, critical: 45 };
+  }
+}
+
+function buildScoreThresholdFlags(args: {
+  overall: number;
+  stages: CallAnalysisStages;
+  thresholds: { low: number; critical: number };
+  moments?: CallMoment[];
+}): Array<{
+  flag_key: string;
+  type: string;
+  category: "score";
+  label: string;
+  severity: "low" | "critical";
+  section: string;
+  score: number;
+  threshold_triggered: "low" | "critical";
+  timestamp: number | null;
+  source: "scoring_engine";
+  created_at: string;
+}> {
+  const now = new Date().toISOString();
+
+  const flags: any[] = [];
+
+  const bandFor = (score: number): "low" | "critical" | null => {
+    if (score <= args.thresholds.critical) return "critical";
+    if (score <= args.thresholds.low) return "low";
+    return null;
+  };
+
+  const timestampForSection = (section: string): number | null => {
+    const moments = Array.isArray(args.moments) ? args.moments : [];
+    const match = moments.find((m) => {
+      const type = String((m as any)?.type || "").toLowerCase();
+      const text = String((m as any)?.text || "").toLowerCase();
+
+      if (section === "overall") return true;
+      if (section === "objection") return type === "objection" || text.includes("too expensive");
+      if (section === "close") return type === "closing_attempt" || text.includes("call me back");
+      if (section === "discovery") return text.includes("why") || text.includes("how");
+      if (section === "intro") return text.includes("intro") || type === "mistake";
+
+      return false;
+    });
+
+    return typeof (match as any)?.timestamp === "number" ? (match as any).timestamp : null;
+  };
+
+  const pushFlag = (
+    key: string,
+    label: string,
+    section: string,
+    score: number,
+    severity: "low" | "critical"
+  ) => {
+    flags.push({
+      flag_key: key,
+      type: key,
+      category: "score",
+      label,
+      severity,
+      section,
+      score,
+      threshold_triggered: severity,
+      timestamp: timestampForSection(section),
+      source: "scoring_engine",
+      created_at: now,
+    });
+  };
+
+  const overallBand = bandFor(args.overall);
+  if (overallBand) {
+    pushFlag(
+      "overall_low_score",
+      "Overall score below threshold",
+      "overall",
+      args.overall,
+      overallBand
+    );
+  }
+
+  const sections = [
+    { key: "intro", score: args.stages.intro.score },
+    { key: "discovery", score: args.stages.discovery.score },
+    { key: "objection", score: args.stages.objection.score },
+    { key: "close", score: args.stages.close.score },
+  ] as const;
+
+  for (const section of sections) {
+    const band = bandFor(section.score);
+    if (!band) continue;
+
+    pushFlag(
+      `${section.key}_weak`,
+      `${section.key} performance below threshold`,
+      section.key,
+      section.score,
+      band
+    );
+  }
+
+  return flags;
+}
+
+function shouldCreateAssignment(args: {
+  reviewFlags: Array<{ severity: "low" | "critical"; section: string }>;
+  overall: number;
+  thresholdBand: string | null;
+}) {
+  // Only create if critical
+  if (args.thresholdBand !== "critical") return false;
+
+  // Require at least one meaningful section failure (avoid noise)
+  const meaningful = args.reviewFlags.some(f =>
+    f.severity === "critical" &&
+    ["close", "objection", "discovery"].includes(f.section)
+  );
+
+  return meaningful;
+}
+
+async function ensureCriticalCallAssignment(args: {
+  supabase: SupabaseClient;
+  callId: string;
+  orgId?: string | null;
+  assigneeUserId?: string | null;
+  overall: number;
+  thresholdBand: string | null;
+  reviewFlags: Array<{ type: string; severity: "low" | "critical"; section: string; score: number; timestamp?: number | null }>;
+  source: "scoring_engine" | "scoring_engine_fallback";
+}) {
+  const hasCriticalFlag = args.reviewFlags.some(f => f.severity === "critical");
+
+  // 🔥 NEW FILTERING LAYER
+  if (!shouldCreateAssignment({
+    reviewFlags: args.reviewFlags,
+    overall: args.overall,
+    thresholdBand: args.thresholdBand,
+  })) return null;
+
+  if (!hasCriticalFlag) return null;
+  if (!args.assigneeUserId) return null;
+
+  try {
+    const svc = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+    // Intelligent drill mapping based on flags
+    const mapFlagsToDrillId = (
+      flags: Array<{ type: string; severity: "low" | "critical"; section: string }>
+    ): string => {
+
+      // 1. PRIORITISE CRITICAL FLAGS
+      const criticalFlags = flags.filter(f => f.severity === "critical");
+
+      // 2. PRIORITISE BY SECTION IMPORTANCE (closing > objection > discovery > intro)
+      const priorityOrder = ["close", "objection", "discovery", "intro"];
+
+      const sorted = (criticalFlags.length ? criticalFlags : flags).sort((a, b) => {
+        return priorityOrder.indexOf(a.section) - priorityOrder.indexOf(b.section);
+      });
+
+      const target = sorted[0];
+
+      if (!target) return "critical-call-review";
+
+      switch (target.section) {
+        case "close":
+          return "closing-drill";
+
+        case "objection":
+          return "objection-handling-drill";
+
+        case "discovery":
+          return "discovery-drill";
+
+        case "intro":
+          return "intro-drill";
+
+        default:
+          return "critical-call-review";
+      }
+    };
+
+    const drillId = mapFlagsToDrillId(args.reviewFlags);
+    const dedupeKey = `${args.callId}:${args.assigneeUserId}:${drillId}`;
+
+    const existing = await svc
+      .from("coach_assignments")
+      .select("id,status")
+      .eq("call_id", args.callId)
+      .eq("assignee_user_id", args.assigneeUserId)
+      .eq("drill_id", drillId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (!existing.error && existing.data) {
+      const status = String((existing.data as any)?.status || "").toLowerCase();
+      if (status !== "completed") {
+        return { ok: true, skipped: true, reason: "existing_open_assignment", id: (existing.data as any)?.id ?? null };
+      }
+    }
+
+    const payload = {
+      call_id: args.callId,
+      assignee_user_id: args.assigneeUserId,
+      drill_id: drillId,
+      notes: "Auto-created from critical flagged call.",
+      org_id: args.orgId ?? null,
+      status: "open",
+      source: "flagged_call_auto",
+      meta: {
+        source: "flagged_call_auto",
+        action_type: "assignment_created",
+        assignment_origin: "flagged_call_auto",
+        dedupe_key: dedupeKey,
+        flagged_call: true,
+        threshold_band: args.thresholdBand,
+        needs_manager_review: true,
+        review_flags: args.reviewFlags,
+        score_overall: args.overall,
+        flag_sections: args.reviewFlags.map(f => f.section),
+        primary_flag: args.reviewFlags[0]?.type ?? null,
+      },
+    } as any;
+
+    const inserted = await svc
+      .from("coach_assignments")
+      .insert(payload)
+      .select("id")
+      .single();
+
+    if (inserted.error) {
+      const msg = String((inserted.error as any)?.message ?? "").toLowerCase();
+      const missingOrg = msg.includes("org_id") && msg.includes("schema cache");
+      if (missingOrg) {
+        const retryPayload = {
+          call_id: args.callId,
+          assignee_user_id: args.assigneeUserId,
+          drill_id: drillId,
+          notes: "Auto-created from critical flagged call.",
+          status: "open",
+          source: "flagged_call_auto",
+          meta: {
+            source: "flagged_call_auto",
+            action_type: "assignment_created",
+            assignment_origin: "flagged_call_auto",
+            dedupe_key: dedupeKey,
+            flagged_call: true,
+            threshold_band: args.thresholdBand,
+            needs_manager_review: true,
+            review_flags: args.reviewFlags,
+            score_overall: args.overall,
+          },
+        } as any;
+
+        const retry = await svc
+          .from("coach_assignments")
+          .insert(retryPayload)
+          .select("id")
+          .single();
+
+        if (retry.error) throw retry.error;
+        return { ok: true, skipped: false, id: (retry.data as any)?.id ?? null };
+      }
+      throw inserted.error;
+    }
+
+    try {
+      await svc.from("crm_activities").insert({
+        type: "coach_assignment_created",
+        summary: "Auto-created critical call review assignment",
+        org_id: args.orgId ?? null,
+        rep_id: args.assigneeUserId,
+        call_id: args.callId,
+        source: args.source,
+        meta: {
+          source: "flagged_call_auto",
+          action_type: "assignment_created",
+          assignment_origin: "flagged_call_auto",
+          dedupe_key: dedupeKey,
+          flagged_call: true,
+          threshold_band: args.thresholdBand,
+          review_flags: args.reviewFlags,
+          score_overall: args.overall,
+          coach_assignment_id: (inserted.data as any)?.id ?? null,
+          drill_id: drillId,
+        },
+      });
+    } catch (e) {
+      console.warn("[score] auto assignment crm_activities insert failed", e);
+    }
+
+    return { ok: true, skipped: false, id: (inserted.data as any)?.id ?? null };
+  } catch (e) {
+    console.warn("[score] auto critical assignment failed", e);
+    return null;
+  }
+}
+
 /** Write a score row into call_scores (non-blocking if table missing) */
 async function writeScoreHistory(
   supabase: SupabaseClient,
@@ -1002,6 +1325,7 @@ async function lookupUserContactBestEffort(
     }
   }
 
+
   const tablePlans: Array<{
     table: string;
     selects: string[];
@@ -1009,43 +1333,43 @@ async function lookupUserContactBestEffort(
     emailKeys: string[];
     nameKeys: string[];
   }> = [
-    {
-      table: "profiles",
-      selects: [
-        "id,email,full_name,name",
-        "id,email,full_name",
-        "id,email,name",
-        "id,email",
-      ],
-      predicates: [{ col: "id", value: userId }],
-      emailKeys: ["email"],
-      nameKeys: ["full_name", "name"],
-    },
-    {
-      table: "users",
-      selects: [
-        "id,email,full_name,name",
-        "id,email,full_name",
-        "id,email,name",
-        "id,email",
-      ],
-      predicates: [{ col: "id", value: userId }],
-      emailKeys: ["email"],
-      nameKeys: ["full_name", "name"],
-    },
-    {
-      table: "reps",
-      selects: [
-        "id,email,full_name,name",
-        "id,email,full_name",
-        "id,email,name",
-        "id,email",
-      ],
-      predicates: [{ col: "id", value: userId }],
-      emailKeys: ["email"],
-      nameKeys: ["full_name", "name"],
-    },
-  ];
+      {
+        table: "profiles",
+        selects: [
+          "id,email,full_name,name",
+          "id,email,full_name",
+          "id,email,name",
+          "id,email",
+        ],
+        predicates: [{ col: "id", value: userId }],
+        emailKeys: ["email"],
+        nameKeys: ["full_name", "name"],
+      },
+      {
+        table: "users",
+        selects: [
+          "id,email,full_name,name",
+          "id,email,full_name",
+          "id,email,name",
+          "id,email",
+        ],
+        predicates: [{ col: "id", value: userId }],
+        emailKeys: ["email"],
+        nameKeys: ["full_name", "name"],
+      },
+      {
+        table: "reps",
+        selects: [
+          "id,email,full_name,name",
+          "id,email,full_name",
+          "id,email,name",
+          "id,email",
+        ],
+        predicates: [{ col: "id", value: userId }],
+        emailKeys: ["email"],
+        nameKeys: ["full_name", "name"],
+      },
+    ];
 
   for (const plan of tablePlans) {
     for (const select of plan.selects) {
@@ -1208,7 +1532,7 @@ export async function scoreWithLLM(opts: {
     // Pull minimal call meta (include duration for Slack; user_id to resolve rep)
     const { data: call, error: callErr } = await supabase
       .from("calls")
-      .select("id, filename, user_id, duration_sec, sha256, transcript, analysis_json")
+      .select("id, filename, user_id, org_id, duration_sec, sha256, transcript, analysis_json")
       .eq("id", callId)
       .single();
     if (callErr || !call) throw new Error("call_not_found");
@@ -1241,6 +1565,7 @@ export async function scoreWithLLM(opts: {
         (call as any)?.duration_sec ?? null
       );
       const transcriptSegments = cleanedSegments;
+      const thresholds = await getScoringThresholds(supabase);
 
       const derivedMoments =
         cachedScore.moments?.length > 0
@@ -1258,6 +1583,19 @@ export async function scoreWithLLM(opts: {
             stages: cachedScore.stages,
             moments: derivedMoments,
           });
+
+      const reviewFlags = buildScoreThresholdFlags({
+        overall: cachedScore.overall,
+        stages: cachedScore.stages,
+        thresholds,
+        moments: derivedMoments,
+      });
+      const thresholdBand =
+        cachedScore.overall <= thresholds.critical
+          ? "critical"
+          : cachedScore.overall <= thresholds.low
+            ? "low"
+            : null;
 
       const rubric = buildRubricWithMeta({
         intro: cachedScore.stages.intro,
@@ -1287,6 +1625,9 @@ export async function scoreWithLLM(opts: {
           suggestions: derivedSuggestions,
           summary: cachedScore.summary,
           voice,
+          review_flags: reviewFlags,
+          threshold_band: thresholdBand,
+          needs_manager_review: thresholdBand === "critical",
           transcript: {
             text: cleanedTranscript,
             segments: cleanedSegments,
@@ -1299,6 +1640,54 @@ export async function scoreWithLLM(opts: {
 
       console.log("[perf] db_write_ms", Date.now() - dbWriteStart, { callId, path: "cache" });
       await writeScoreHistory(supabase, callId, cachedModelVersion, cachedScore.overall, rubric);
+
+      // CRM Activity: record a score event for cache hit (best-effort; non-blocking)
+      try {
+        const svc = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+        const { data: callRow } = await svc
+          .from('calls')
+          .select('id, account_id, contact_id, score_overall')
+          .eq('id', callId)
+          .single();
+
+        const overall = typeof (callRow as any)?.score_overall === 'number' ? (callRow as any).score_overall : cachedScore.overall;
+        const summary = `Scored ${Math.round(overall)}`;
+
+        await svc.from('crm_activities').insert({
+          type: 'score',
+          summary,
+          org_id: (call as any)?.org_id ?? null,
+          rep_id: (call as any)?.user_id ?? null,
+          call_id: callId,
+          source: 'scoring_engine_cache',
+          meta: {
+            action_type: 'score_recorded',
+            overall,
+            stage_scores: cachedScore.stages,
+            threshold_band: thresholdBand,
+            needs_manager_review: thresholdBand === 'critical',
+            review_flag_count: reviewFlags.length,
+            review_flags: reviewFlags,
+          },
+          account_id: (callRow as any)?.account_id ?? null,
+          contact_id: (callRow as any)?.contact_id ?? null,
+        });
+      } catch (e) {
+        console.warn('[score] activity insert failed (cache)', e);
+      }
+
+      // CRM Activity: review_flag best-effort
+
+      await ensureCriticalCallAssignment({
+        supabase,
+        callId,
+        orgId: (call as any)?.org_id ?? null,
+        assigneeUserId: (call as any)?.user_id ?? null,
+        overall: cachedScore.overall,
+        thresholdBand,
+        reviewFlags,
+        source: "scoring_engine",
+      });
 
       if (!SKIP_SCORING_SIDE_EFFECTS) {
         const slackStart = Date.now();
@@ -1420,6 +1809,7 @@ ${knowledge.repMemoryText || "None"}`;
       deterministic.transcript,
       (call as any)?.duration_sec ?? null
     );
+    const thresholds = await getScoringThresholds(supabase);
     const parsed: LlmScore = {
       ...validated,
       model: AI_MODEL,
@@ -1444,6 +1834,19 @@ ${knowledge.repMemoryText || "None"}`;
 
     parsed.moments = derivedMoments;
     parsed.suggestions = derivedSuggestions;
+
+    const reviewFlags = buildScoreThresholdFlags({
+      overall: parsed.overall,
+      stages: parsed.stages,
+      thresholds,
+      moments: derivedMoments,
+    });
+    const thresholdBand =
+      parsed.overall <= thresholds.critical
+        ? "critical"
+        : parsed.overall <= thresholds.low
+          ? "low"
+          : null;
 
     const rubric = buildRubricWithMeta({
       intro: parsed.stages.intro,
@@ -1474,6 +1877,9 @@ ${knowledge.repMemoryText || "None"}`;
         suggestions: parsed.suggestions,
         summary: parsed.summary,
         voice,
+        review_flags: reviewFlags,
+        threshold_band: thresholdBand,
+        needs_manager_review: thresholdBand === "critical",
         transcript: {
           text: cleanedTranscript,
           segments: cleanedSegments,
@@ -1498,7 +1904,7 @@ ${knowledge.repMemoryText || "None"}`;
     // CRM Activity: record a score event (best-effort; non-blocking)
     try {
       const svc = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
-      // fetch linkage for account/contact so the activity appears on their timelines
+      // fetch linkage for account/contact so the activity appears on tfheir timelines
       const { data: callRow } = await svc
         .from('calls')
         .select('id, account_id, contact_id, score_overall')
@@ -1511,12 +1917,76 @@ ${knowledge.repMemoryText || "None"}`;
       await svc.from('crm_activities').insert({
         type: 'score',
         summary,
+        org_id: (call as any)?.org_id ?? null,
+        rep_id: (call as any)?.user_id ?? null,
+        call_id: callId,
+        source: 'scoring_engine',
+        meta: {
+          action_type: 'score_recorded',
+          overall,
+          stage_scores: parsed.stages,
+          threshold_band: thresholdBand,
+          needs_manager_review: thresholdBand === 'critical',
+          review_flag_count: reviewFlags.length,
+          review_flags: reviewFlags,
+        },
         account_id: (callRow as any)?.account_id ?? null,
         contact_id: (callRow as any)?.contact_id ?? null,
       });
     } catch (e) {
       console.warn('[score] activity insert failed', e);
     }
+
+    // CRM Activity: review_flag (structured fallback)
+    try {
+      if (reviewFlags.length > 0) {
+        const svc = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+        await svc.from('crm_activities').insert(
+          reviewFlags.map((flag) => ({
+            type: 'review_flag',
+
+            // ✅ CORE FIELDS
+            summary: `${flag.type} (${flag.severity})`,
+            org_id: (memoryCall as any)?.org_id ?? null,
+            rep_id: (memoryCall as any)?.user_id ?? null,
+            call_id: opts.callId,
+            source: 'scoring_engine_fallback',
+
+            // 🚀 NEW ANALYTICS FIELDS
+            flag_key: flag.type,
+            flag_category: 'score_threshold',
+            flag_severity: flag.severity,
+            flag_section: flag.section,
+
+            // 🧠 FLEXIBLE META
+            meta: {
+              score: flag.score,
+              timestamp: flag.timestamp ?? null,
+              threshold_band: flag.severity,
+              thresholds: {
+                low: thresholds.low,
+                critical: thresholds.critical,
+              },
+              needs_manager_review: flag.severity === 'critical',
+            },
+          }))
+        );
+      }
+    } catch (e) {
+      console.warn('[score] review_flag activity insert failed (fallback)', e);
+    }
+
+    await ensureCriticalCallAssignment({
+      supabase,
+      callId,
+      orgId: (call as any)?.org_id ?? null,
+      assigneeUserId: (call as any)?.user_id ?? null,
+      overall: parsed.overall,
+      thresholdBand,
+      reviewFlags,
+      source: "scoring_engine",
+    });
 
     if (!SKIP_SCORING_SIDE_EFFECTS) {
       const slackStart = Date.now();
@@ -1581,6 +2051,7 @@ ${knowledge.repMemoryText || "None"}`;
     const fb = heuristicScoreFallback();
 
     const fallbackVoice = computeVoiceScore("", null);
+    const thresholds = await getScoringThresholds(opts.supabase);
 
     let transcriptSegments: any[] = [];
     let transcriptText = "";
@@ -1608,6 +2079,29 @@ ${knowledge.repMemoryText || "None"}`;
       stages: fb.stages,
       moments: fallbackMoments,
     });
+
+    const reviewFlags = buildScoreThresholdFlags({
+      overall: fb.overall,
+      stages: fb.stages,
+      thresholds,
+      moments: fallbackMoments,
+    });
+    const thresholdBand =
+      fb.overall <= thresholds.critical
+        ? "critical"
+        : fb.overall <= thresholds.low
+          ? "low"
+          : null;
+
+    let memoryCall: any = null;
+    try {
+      const lookup = await opts.supabase
+        .from("calls")
+        .select("user_id, org_id")
+        .eq("id", opts.callId)
+        .maybeSingle();
+      memoryCall = lookup.data ?? null;
+    } catch { }
 
     const fallbackModelVersion = `${fb.model}:${SCORING_PROMPT_VERSION}:${RUBRIC_VERSION}`;
     const rubric = buildRubricWithMeta({
@@ -1637,6 +2131,9 @@ ${knowledge.repMemoryText || "None"}`;
         suggestions: fallbackSuggestions,
         summary: fb.summary,
         voice: fallbackVoice,
+        review_flags: reviewFlags,
+        threshold_band: thresholdBand,
+        needs_manager_review: thresholdBand === "critical",
         transcript: {
           text: transcriptText,
           segments: transcriptSegments,
@@ -1673,12 +2170,76 @@ ${knowledge.repMemoryText || "None"}`;
       await svc.from('crm_activities').insert({
         type: 'score',
         summary,
+        org_id: (memoryCall as any)?.org_id ?? null,
+        rep_id: (memoryCall as any)?.user_id ?? null,
+        call_id: opts.callId,
+        source: 'scoring_engine_fallback',
+        meta: {
+          action_type: 'score_recorded',
+          overall,
+          stage_scores: fb.stages,
+          threshold_band: thresholdBand,
+          needs_manager_review: thresholdBand === 'critical',
+          review_flag_count: reviewFlags.length,
+          review_flags: reviewFlags,
+        },
         account_id: (callRow as any)?.account_id ?? null,
         contact_id: (callRow as any)?.contact_id ?? null,
       });
     } catch (e) {
       console.warn('[score] activity insert failed (fallback)', e);
     }
+
+    // CRM Activity: review_flag (structured + analytics-ready)
+    try {
+      if (reviewFlags.length > 0) {
+        const svc = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
+
+        await svc.from('crm_activities').insert(
+          reviewFlags.map((flag) => ({
+            type: 'review_flag',
+
+            // ✅ CORE FIELDS
+            summary: `${flag.type} (${flag.severity})`,
+            org_id: (call as any)?.org_id ?? null,
+            rep_id: (call as any)?.user_id ?? null,
+            call_id: callId,
+            source: 'scoring_engine',
+
+            // 🚀 NEW ANALYTICS FIELDS
+            flag_key: flag.type,
+            flag_category: 'score_threshold',
+            flag_severity: flag.severity,
+            flag_section: flag.section,
+
+            // 🧠 FLEXIBLE META
+            meta: {
+              score: flag.score,
+              timestamp: flag.timestamp ?? null,
+              threshold_band: flag.severity,
+              thresholds: {
+                low: thresholds.low,
+                critical: thresholds.critical,
+              },
+              needs_manager_review: flag.severity === 'critical',
+            },
+          }))
+        );
+      }
+    } catch (e) {
+      console.warn('[score] review_flag activity insert failed', e);
+    }
+
+    await ensureCriticalCallAssignment({
+      supabase: opts.supabase,
+      callId: opts.callId,
+      orgId: (memoryCall as any)?.org_id ?? null,
+      assigneeUserId: (memoryCall as any)?.user_id ?? null,
+      overall: fb.overall,
+      thresholdBand,
+      reviewFlags,
+      source: "scoring_engine_fallback",
+    });
 
     // Grab duration if present for Slack
     let durationSec: number | null = null;
@@ -1689,16 +2250,6 @@ ${knowledge.repMemoryText || "None"}`;
         .eq("id", opts.callId)
         .single();
       durationSec = (data as any)?.duration_sec ?? null;
-    } catch { }
-
-    let memoryCall: any = null;
-    try {
-      const lookup = await opts.supabase
-        .from("calls")
-        .select("user_id, org_id")
-        .eq("id", opts.callId)
-        .maybeSingle();
-      memoryCall = lookup.data ?? null;
     } catch { }
 
     if (!SKIP_SCORING_SIDE_EFFECTS) {

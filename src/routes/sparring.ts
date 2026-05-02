@@ -320,6 +320,72 @@ type EmotionalState = {
   trust: number;    // 0–100
 };
 
+type PersonaMutationState = {
+  volatility: number; // how quickly persona mood shifts
+  resistance: number; // how hard they push back
+  unpredictability: number; // chance to switch behaviour mid-call
+};
+
+function getPersonaMutationState(personaId: string, difficulty: string): PersonaMutationState {
+  const base: PersonaMutationState = {
+    volatility: 40,
+    resistance: 40,
+    unpredictability: 30,
+  };
+
+  // 🔥 Difficulty scaling
+  const difficultyBoost =
+    difficulty === "nightmare"
+      ? 30
+      : difficulty === "hard"
+        ? 20
+        : 0;
+
+  switch (personaId) {
+    case "angry":
+      return {
+        volatility: 70 + difficultyBoost,
+        resistance: 80 + difficultyBoost,
+        unpredictability: 50 + difficultyBoost,
+      };
+
+    case "silent":
+      return {
+        volatility: 30 + difficultyBoost,
+        resistance: 60 + difficultyBoost,
+        unpredictability: 65 + difficultyBoost,
+      };
+
+    case "price_sensitive":
+      return {
+        volatility: 50 + difficultyBoost,
+        resistance: 70 + difficultyBoost,
+        unpredictability: 45 + difficultyBoost,
+      };
+
+    case "cfo":
+      return {
+        volatility: 35 + difficultyBoost,
+        resistance: 85 + difficultyBoost,
+        unpredictability: 25 + difficultyBoost,
+      };
+
+    case "procurement":
+      return {
+        volatility: 45 + difficultyBoost,
+        resistance: 75 + difficultyBoost,
+        unpredictability: 40 + difficultyBoost,
+      };
+
+    default:
+      return {
+        volatility: base.volatility + difficultyBoost,
+        resistance: base.resistance + difficultyBoost,
+        unpredictability: base.unpredictability + difficultyBoost,
+      };
+  }
+}
+
 function clampEmotion(n: number): number {
   if (!Number.isFinite(n)) return 0;
   return Math.max(0, Math.min(100, Math.round(n)));
@@ -429,10 +495,33 @@ function applyEmotionalDelta(
     next.boredom = clampEmotion(next.boredom - 1);
   }
 
+  // 🔥 escalate if rep keeps failing
+  if (prev.trust < 30 && prev.anger > 50) {
+    next.anger = clampEmotion(next.anger + 3);
+    next.boredom = clampEmotion(next.boredom + 2);
+  }
+
   // Generic "salesy" language → small trust drop + anger bump
   if (/\b(deal|sign up|discount|offer|promotion)\b/i.test(lower)) {
     next.trust = clampEmotion(next.trust - 2);
     next.anger = clampEmotion(next.anger + 2);
+  }
+
+  const weakness = evaluateRepWeakness(lastUserText);
+
+  // 🔥 escalate aggressively if weak
+  if (weakness.vague || weakness.low_confidence) {
+    next.anger = clampEmotion(next.anger + 5);
+    next.trust = clampEmotion(next.trust - 4);
+  }
+
+  if (weakness.no_question) {
+    next.boredom = clampEmotion(next.boredom + 5);
+  }
+
+  if (weakness.weak_close && turnsSoFar > 6) {
+    next.boredom = clampEmotion(next.boredom + 4);
+    next.trust = clampEmotion(next.trust - 3);
   }
 
   return next;
@@ -444,6 +533,7 @@ function shouldAutoHangUp(opts: {
   mode: string;
   turnsSoFar: number;
   emotionalState?: EmotionalState | null;
+
 }): { endNow: boolean; reason: "bored" | "angry" | "timeout" | "closed" | null } {
   const { personaId, difficulty, mode, turnsSoFar, emotionalState } = opts;
 
@@ -459,6 +549,10 @@ function shouldAutoHangUp(opts: {
   // Emotion-driven early exits
   // High anger → rage hang-up
   if (anger >= 85 && t >= 6) {
+    return { endNow: true, reason: "angry" };
+  }
+
+  if (anger > 75 && weakness?.vague) {
     return { endNow: true, reason: "angry" };
   }
 
@@ -523,6 +617,96 @@ function shouldAutoHangUp(opts: {
   }
 
   return { endNow: false, reason: null };
+}
+
+type ObjectionStackState = {
+  active: string[];
+  last_added_at_turn: number;
+};
+
+function getNextStackedObjection(opts: {
+  personaId: string;
+  difficulty: string;
+  emotional: EmotionalState;
+  turnsSoFar: number;
+  failures?: number;
+  currentStack: string[];
+}): string | null {
+  const { personaId, difficulty, emotional, turnsSoFar, failures = 0, currentStack } = opts;
+
+  const pool: Record<string, string[]> = {
+    price_sensitive: [
+      "This feels too expensive.",
+      "I’ve seen cheaper options.",
+      "What’s the ROI here?"
+    ],
+    cfo: [
+      "Show me the numbers.",
+      "What’s the downside risk?",
+      "This isn’t in budget."
+    ],
+    procurement: [
+      "We already have a vendor.",
+      "This needs approval.",
+      "We can’t switch easily."
+    ],
+    angry: [
+      "This is wasting my time.",
+      "You’re not listening.",
+      "This isn’t relevant."
+    ],
+    silent: [
+      "Hmm.",
+      "Not sure.",
+      "Maybe."
+    ]
+  };
+
+  function evaluateRepWeakness(text: string) {
+    const t = (text || "").toLowerCase();
+
+    let weakness = {
+      vague: false,
+      no_question: false,
+      weak_close: false,
+      low_confidence: false,
+    };
+
+    if (t.length < 20) weakness.vague = true;
+
+    if (!t.includes("?")) weakness.no_question = true;
+
+    if (!/\b(next step|book|schedule|move forward|go ahead)\b/i.test(t)) {
+      weakness.weak_close = true;
+    }
+
+    if (/\b(maybe|kind of|sort of|might|possibly)\b/i.test(t)) {
+      weakness.low_confidence = true;
+    }
+
+    return weakness;
+  }
+
+  const basePool = pool[personaId] || pool["price_sensitive"];
+
+  // 🔥 CONDITIONS TO STACK
+  const shouldStack =
+    turnsSoFar > 4 &&
+    (
+      emotional.anger > 50 ||
+      emotional.boredom > 50 ||
+      failures >= 2 ||
+      difficulty === "hard" ||
+      difficulty === "nightmare"
+    );
+
+  if (!shouldStack) return null;
+
+  // Avoid repeating same objection
+  const remaining = basePool.filter(o => !currentStack.includes(o));
+  if (remaining.length === 0) return null;
+
+  return remaining[Math.floor(Math.random() * remaining.length)];
 }
 
 function getUserIdHeader(req: Request): string {
@@ -680,13 +864,136 @@ async function loadTeamSettingsSnapshot(orgId: string | null) {
 
 const router = express.Router();
 
+function buildDynamicScenario(opts: {
+  assignment?: any;
+  callContext?: any;
+}) {
+  if (!opts.assignment) return null;
+
+  const meta = opts.assignment.meta || {};
+
+  const section = meta.flag_section || "unknown";
+  const score = meta.score_before ?? null;
+  const callId = meta.call_id || null;
+  const failures = meta.failure_count ?? 1;
+  const difficulty = meta.difficulty || "normal";
+
+  let scenario = `This is a REALISTIC sales training scenario based on a real failure.\n`;
+
+  // 🔥 CORE BEHAVIOUR CONTROL
+  if (section === "objection") {
+    scenario += `
+The rep FAILED handling objections.
+
+YOU MUST:
+- Challenge price aggressively
+- Interrupt weak answers
+- Push "cheaper competitor" angle
+- Reject vague ROI claims
+`;
+  }
+
+  if (section === "close") {
+    scenario += `
+The rep FAILED to close.
+
+YOU MUST:
+- Stall repeatedly
+- Say "I'll think about it"
+- Avoid commitment
+- Only move forward if properly closed
+`;
+  }
+
+  if (section === "discovery") {
+    scenario += `
+The rep FAILED discovery.
+
+YOU MUST:
+- Be vague
+- Withhold key info
+- Only open up if asked STRONG questions
+`;
+  }
+
+  if (section === "pitch") {
+    scenario += `
+The rep FAILED to communicate value.
+
+YOU MUST:
+- Act confused
+- Ask "why should I care?"
+- Challenge relevance
+`;
+  }
+
+  // 🔥 ESCALATION LOGIC (VERY IMPORTANT)
+  if (failures >= 3) {
+    scenario += `
+This rep has failed this multiple times.
+
+YOU MUST:
+- Be more difficult than normal
+- Lose patience faster
+- Push harder objections
+`;
+  }
+
+  if (difficulty === "hard" || difficulty === "nightmare") {
+    scenario += `
+Difficulty is HIGH.
+
+YOU MUST:
+- Resist most attempts
+- Only respond to strong, confident selling
+`;
+  }
+
+  if (score !== null) {
+    scenario += `\nPrevious score: ${score}/100\n`;
+  }
+
+  if (callId) {
+    scenario += `Derived from real call: ${callId}\n`;
+  }
+
+  return scenario.trim();
+}
+
 function buildPersonaSystemPrompt(opts: {
   personaId: string | null;
   mode?: string | null;
   difficulty?: string | null;
+  dynamicScenario?: string | null;
+  stackedObjection?: string | null;
 }) {
   const mode = opts.mode || "standard";
   const personaId = opts.personaId || "price_sensitive";
+
+  const pressureBlock = `
+=== PRESSURE ENGINE ===
+You are NOT passive.
+
+You must actively test and break the rep.
+
+If the rep:
+- is vague → say "That doesn't really tell me anything"
+- doesn't ask questions → disengage and respond shorter
+- shows low confidence → challenge them harder
+- avoids closing → stall and resist
+
+Ask trap questions:
+- "What does that actually mean for me?"
+- "Why would I choose you over someone cheaper?"
+- "Give me a real example"
+
+If the rep struggles:
+- interrupt more
+- stack objections faster
+- reduce trust quickly
+
+Your goal is to expose weakness.
+`;
 
   // Use shared persona config from ../personas
   const persona = getPersonaConfig(personaId);
@@ -744,10 +1051,50 @@ function buildPersonaSystemPrompt(opts: {
         ? "Difficulty: HARD. You are sceptical and demanding. Raise serious objections and require strong justification."
         : "Difficulty: NORMAL. You behave like a typical, slightly cautious buyer.";
 
+  const scenarioBlock = opts.dynamicScenario
+    ? `
+=== REAL FAILURE CONTEXT ===
+${opts.dynamicScenario}
+
+You MUST fully embody this behaviour.
+Do NOT soften or assist the rep.
+`
+    : "";
+
+  const stackedBlock = opts.stackedObjection
+    ? `
+=== NEW OBJECTION (STACK PRESSURE) ===
+You MUST introduce this naturally into the conversation:
+
+"${opts.stackedObjection}"
+
+Do NOT wait. Bring it up even if the rep is mid-flow.
+Stack it with previous objections.
+`
+    : "";
+
+  // 🔥 PERSONA MUTATION (CRITICAL)
+  const mutation = getPersonaMutationState(personaId, difficulty);
+  const mutationBlock = `
+=== BUYER BEHAVIOUR PROFILE ===
+Volatility: ${mutation.volatility}/100 (how fast mood shifts)
+Resistance: ${mutation.resistance}/100 (how hard they push back)
+Unpredictability: ${mutation.unpredictability}/100 (chance to switch tone mid-call)
+
+You MUST reflect this in behaviour:
+- High volatility → sudden emotional swings
+- High resistance → reject weak answers aggressively
+- High unpredictability → change tone without warning
+`;
+
   const personaBlock = lines.join("\n");
 
   return `
 You are role-playing as a sales prospect in a training drill.
+
+${scenarioBlock}
+${mutationBlock}
+${pressureBlock}
 
 Persona: ${personaLabel} (${personaId}).
 ${personaBlock}
@@ -756,11 +1103,18 @@ ${diffLine}
 ${modeLine}
 
 Rules:
-- Stay strictly in character.
-- Keep replies concise, like a real buyer on a call.
-- React realistically to the rep's last message.
-- Ask follow-up questions and raise objections based on your persona.
-- Never reveal that you are an AI or that this is a drill.
+- Stay strictly in character
+- NEVER act like a training bot
+- NEVER help the rep
+- NEVER explain reasoning
+- React emotionally and realistically
+- Interrupt weak responses
+- Challenge vague claims
+- Push back on poor answers
+- If the rep is bad → make the conversation harder
+- If the rep is strong → slowly open up
+
+This must feel like a REAL buyer, not a simulation.
 `.trim();
 }
 
@@ -1085,8 +1439,8 @@ router.post("/score", express.json(), async (req, res) => {
     // MODE 1 — REAL SESSION SCORING
     // -----------------------------
     if (typeof sessionId === "string" && sessionId.trim().length) {
-      ;(global as any).__last_completed_count = 0;
-      ;(global as any).__last_xp_awarded_total = 0;
+      ; (global as any).__last_completed_count = 0;
+      ; (global as any).__last_xp_awarded_total = 0;
       const { data: row, error: selErr } = await supa
         .from("sparring_sessions")
         .select(
@@ -1155,7 +1509,7 @@ router.post("/score", express.json(), async (req, res) => {
       let cfgForAward: any = null;
       try {
         cfgForAward = await getScoringConfig();
-      } catch {}
+      } catch { }
 
       const streakNow = Number.isFinite(Number(prevMeta?.streak)) ? Number(prevMeta.streak) : 0;
       const mult = streakMultiplier(
@@ -1172,7 +1526,7 @@ router.post("/score", express.json(), async (req, res) => {
       let globalMult = 1;
       try {
         if (Number.isFinite(Number(cfgForAward?.xpMultiplier))) globalMult = Number(cfgForAward.xpMultiplier);
-      } catch {}
+      } catch { }
 
       const multXpGlobal = Math.round(multXp * globalMult);
 
@@ -1337,8 +1691,8 @@ router.post("/score", express.json(), async (req, res) => {
             typeof (result as any)?.xpAwardedTotal === "number"
               ? (result as any).xpAwardedTotal
               : 0;
-          ;(global as any).__last_completed_count = completedCount;
-          ;(global as any).__last_xp_awarded_total = xpAwardedTotal;
+          ; (global as any).__last_completed_count = completedCount;
+          ; (global as any).__last_xp_awarded_total = xpAwardedTotal;
 
           if (completedCount && completedCount > 0) {
             console.info("[assignments:lifecycle]", {
@@ -1464,17 +1818,39 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
     // If we still don't have a repId (e.g. local curl), fall back to dev rep
     const effectiveRepId = repId || DEV_REP_ID;
 
-    const { personaId, difficulty, mode, targetDurationSec } = req.body as {
+    const {
+      personaId,
+      difficulty,
+      mode,
+      targetDurationSec,
+      assignmentId,
+      assignment
+    } = req.body as {
       personaId?: string;
       difficulty?: string;
       mode?: string;
       targetDurationSec?: number;
+      assignmentId?: string;
+      assignment?: any;
     };
 
     const orgId = getOrgIdFromRequest(req);
     const teamSettingsSnapshot = await loadTeamSettingsSnapshot(orgId);
 
     const sessionId = uuidv4();
+
+    let dynamicScenario: string | null = null;
+
+    try {
+      if (assignment) {
+        dynamicScenario = buildDynamicScenario({
+          assignment,
+          callContext: assignment.meta?.call_context || null,
+        });
+      }
+    } catch (e) {
+      console.warn("[scenario_builder_failed]", e);
+    }
 
     // 2) Make sure the rep exists to satisfy FK (reps.id)
     try {
@@ -1501,6 +1877,8 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
       meta: {
         personaId: personaId || "price_sensitive",
         difficulty: difficulty || "normal",
+        dynamic_scenario: dynamicScenario,
+        assignment_id: assignmentId || null,
         // game mode + target duration for time-trial / turns-based drills
         mode: mode || "standard",
         targetDurationSec:
@@ -1660,6 +2038,9 @@ router.post(
           ? ((session as any).meta as Record<string, any>)
           : {};
 
+      const prevStack: ObjectionStackState =
+        previousMeta.objection_stack || { active: [], last_added_at_turn: 0 };
+
       const prevEmotion: EmotionalState =
         (previousMeta.emotional_state as EmotionalState) ||
         getInitialEmotionalState(personaId, difficultyVal);
@@ -1670,6 +2051,15 @@ router.post(
         turnsSoFar,
         lastUserText: text,
         lastAiText: "", // we haven't generated AI yet; this is mainly user-driven
+      });
+
+      const newObjection = getNextStackedObjection({
+        personaId,
+        difficulty: difficultyVal,
+        emotional: updatedEmotion,
+        turnsSoFar,
+        failures: previousMeta.failure_count || 0,
+        currentStack: prevStack.active
       });
 
       const hangupDecision = shouldAutoHangUp({
@@ -1715,6 +2105,14 @@ router.post(
             personaId,
             difficulty: difficultyVal,
             mode: modeVal,
+            dynamicScenario: (session.meta as any)?.dynamic_scenario || null,
+
+            emotionalState: updatedEmotion,
+            failures: previousMeta.failure_count || 1,
+            section: previousMeta.flag_section || null,
+
+            // 🔥 CRITICAL FIX
+            stackedObjection: newObjection
           });
 
           const completion = await openai.chat.completions.create({
@@ -1841,9 +2239,17 @@ router.post(
             ? ((session as any).meta as Record<string, any>)
             : {};
 
+        const updatedStack = newObjection
+          ? {
+            active: [...(prevStack?.active || []), newObjection],
+            last_added_at_turn: turnsSoFar
+          }
+          : prevStack;
+
         const mergedMeta: Record<string, any> = {
           ...currentMeta,
           emotional_state: updatedEmotion,
+          objection_stack: updatedStack
         };
 
         if (endedThisTurn) {
@@ -1973,7 +2379,7 @@ router.post(
         let cfgForMicro: any = null;
         try {
           cfgForMicro = await getScoringConfig();
-        } catch {}
+        } catch { }
 
         const streakMeta = updateStreakMeta(prevMeta, micro.turn_score, {
           streakThreshold: cfgForMicro?.streakThreshold,

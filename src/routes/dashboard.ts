@@ -62,6 +62,102 @@ function safeDay(value: string | null | undefined): string | null {
   return d.toISOString().slice(0, 10);
 }
 
+function asObject(value: any): Record<string, any> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+}
+
+function readAnalysisJson(row: any): Record<string, any> | null {
+  return asObject((row as any)?.analysis_json);
+}
+
+function readReviewFlags(row: any): any[] {
+  const analysis = readAnalysisJson(row);
+  return Array.isArray((analysis as any)?.review_flags) ? ((analysis as any).review_flags as any[]) : [];
+}
+
+function readThresholdBand(row: any): string | null {
+  const analysis = readAnalysisJson(row);
+  const band = String((analysis as any)?.threshold_band ?? '').trim();
+  return band || null;
+}
+
+function readNeedsManagerReview(row: any): boolean {
+  const analysis = readAnalysisJson(row);
+  return Boolean((analysis as any)?.needs_manager_review);
+}
+
+function normalizeSkillLabel(value: string): string {
+  const key = String(value || '').trim().toLowerCase();
+  if (!key) return 'Unknown';
+  if (key === 'intro') return 'Intro';
+  if (key === 'discovery') return 'Discovery';
+  if (key === 'objection' || key === 'objection handling') return 'Objection handling';
+  if (key === 'close' || key === 'closing') return 'Closing';
+  if (key === 'price_handling' || key === 'price handling') return 'Price handling';
+  if (key === 'follow_up' || key === 'follow-up discipline' || key === 'follow up discipline') return 'Follow-up discipline';
+  if (key === 'execution') return 'Execution';
+  return value;
+}
+
+function inferWeakestSkillFromCall(row: any): string | null {
+  const analysis = readAnalysisJson(row);
+  const direct = String((analysis as any)?.weakest_skill ?? '').trim();
+  if (direct && direct.toLowerCase() !== 'unknown') return normalizeSkillLabel(direct);
+
+  const breakdown = asObject((analysis as any)?.skill_breakdown);
+  if (breakdown) {
+    const labelMap: Record<string, string> = {
+      intro: 'Intro',
+      discovery: 'Discovery',
+      objection: 'Objection handling',
+      close: 'Closing',
+      closing: 'Closing',
+      price_handling: 'Price handling',
+      follow_up: 'Follow-up discipline',
+      execution: 'Execution',
+    };
+
+    const scored = Object.entries(breakdown)
+      .map(([key, value]) => ({ key, value: Number(value) }))
+      .filter((x) => Number.isFinite(x.value) && labelMap[x.key]);
+
+    if (scored.length) {
+      scored.sort((a, b) => a.value - b.value);
+      return labelMap[scored[0].key];
+    }
+  }
+
+  const flags = readReviewFlags(row);
+  const weakness = flags.find((f) => String((f as any)?.type || '').endsWith('_weakness')) as any;
+  if (weakness) {
+    return normalizeSkillLabel(String(weakness?.section || '').trim());
+  }
+
+  return null;
+}
+
+function titleCaseLabel(value: string): string {
+  return String(value || '')
+    .replace(/_/g, ' ')
+    .split(' ')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function incrementMap(map: Map<string, number>, key: string | null | undefined) {
+  const clean = String(key || '').trim();
+  if (!clean) return;
+  map.set(clean, (map.get(clean) ?? 0) + 1);
+}
+
+function mapToRankedList(map: Map<string, number>, limit = 10) {
+  return Array.from(map.entries())
+    .map(([key, count]) => ({ key, label: titleCaseLabel(key), count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit);
+}
+
 // ---- GET /v1/dashboard/kpis ----
 // Returns compact KPI payload for CRM Overview cards + sparklines
 router.get('/kpis', async (req, res) => {
@@ -218,6 +314,316 @@ router.get('/kpis', async (req, res) => {
       // expose since for debugging even on error
       since: typeof since !== 'undefined' ? since : undefined,
     });
+  }
+});
+
+// --- FLAG ANALYTICS (Day 65 — upgraded) ---
+router.get("/flags/summary", async (req, res) => {
+  try {
+    const svc = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
+    );
+
+    const days = Number(req.query.days || 7);
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+
+    const { data, error } = await svc
+      .from("crm_activities")
+      .select("flag_key, flag_section, flag_severity, rep_id, created_at")
+      .eq("type", "review_flag")
+      .gte("created_at", since);
+
+    if (error) throw error;
+
+    const rows = data || [];
+
+    // --- AGG MAPS ---
+    const sectionMap = new Map<string, number>();
+    const severityMap = new Map<string, number>();
+    const repMap = new Map<string, number>();
+
+    for (const r of rows) {
+      const section = normalizeSkillLabel(String(r.flag_section || "unknown"));
+      const severity = String(r.flag_severity || "unknown").toLowerCase();
+      const rep = String(r.rep_id || "unknown");
+
+      incrementMap(sectionMap, section);
+      incrementMap(severityMap, severity);
+      incrementMap(repMap, rep);
+    }
+
+    // --- RANKED OUTPUT (for charts) ---
+    const bySection = mapToRankedList(sectionMap, 8);
+    const bySeverity = mapToRankedList(severityMap, 5);
+
+    // --- TOP PROBLEM AREA ---
+    const topSection = bySection.length
+      ? { section: bySection[0].label, count: bySection[0].count }
+      : null;
+
+    // --- REPS AT RISK ---
+    const repsAtRisk = Array.from(repMap.entries())
+      .filter(([_, count]) => count >= 3)
+      .map(([rep_id, count]) => ({ rep_id, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 10);
+
+    return res.json({
+      ok: true,
+      window_days: days,
+
+      totals: {
+        flags: rows.length,
+      },
+
+      breakdown: {
+        by_section: bySection,
+        by_severity: bySeverity,
+      },
+
+      insights: {
+        top_problem_area: topSection,
+        reps_at_risk: repsAtRisk,
+      },
+    });
+
+  } catch (e: any) {
+    console.error("[flags/summary] error", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ---- GET /v1/dashboard/reporting-summary ----
+// Main manager reporting read layer
+// Query params: days=7&orgId=<uuid>
+router.get('/reporting-summary', async (req, res) => {
+  try {
+    if (!supabase) throw new Error('Supabase not configured');
+
+    const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? '7'), 10) || 7));
+    const since = isoDaysAgo(days);
+    const orgId = (req.query.orgId ? String(req.query.orgId) : '').trim();
+    const db = sbAdmin ?? supabase;
+    if (!db) throw new Error('No Supabase client available');
+
+    let callsQuery = db
+      .from('calls')
+      .select('id,user_id,org_id,created_at,score_overall,analysis_json')
+      .gte('created_at', since)
+      .order('created_at', { ascending: false })
+      .limit(50000);
+    if (orgId) callsQuery = callsQuery.eq('org_id', orgId);
+
+    const { data: calls, error: callsErr } = await callsQuery;
+    if (callsErr) throw callsErr;
+
+    let coachAssignmentsQuery = db
+      .from('coach_assignments')
+      .select('id,assignee_user_id,status,created_at,source,meta')
+      .gte('created_at', since)
+      .order('created_at', { ascending: false })
+      .limit(50000);
+    const { data: coachAssignments, error: coachErr } = await coachAssignmentsQuery;
+    if (coachErr && !(String((coachErr as any)?.message || '').toLowerCase().includes('does not exist'))) {
+      throw coachErr;
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const callRows = (calls || []) as any[];
+    const assignmentRows = (coachAssignments || []) as any[];
+
+    const totalCalls = callRows.length;
+    const scoredCalls = callRows.filter((row) => Number.isFinite(Number((row as any)?.score_overall))).length;
+
+    const criticalCallsToday = callRows.filter((row) => {
+      const day = safeDay((row as any)?.created_at);
+      return day === today && (readThresholdBand(row) === 'critical' || readNeedsManagerReview(row));
+    }).length;
+
+    const criticalCallsThisWeek = callRows.filter((row) => {
+      return readThresholdBand(row) === 'critical' || readNeedsManagerReview(row);
+    }).length;
+
+    const flaggedCallsThisWeek = callRows.filter((row) => {
+      return readReviewFlags(row).length > 0 || Boolean(readThresholdBand(row)) || readNeedsManagerReview(row);
+    }).length;
+
+    const flaggedCallRate = totalCalls ? Math.round((flaggedCallsThisWeek / totalCalls) * 100) : 0;
+
+    // --- AUTO / MANUAL ASSIGNMENTS ---
+    let autoAssignmentsCreated = 0;
+    let manualAssignmentsCreated = 0;
+
+    // NEW: track linkage to flags
+    let assignmentsFromCriticalFlags = 0;
+    let assignmentsFromLowFlags = 0;
+
+    for (const row of assignmentRows) {
+      const source = String((row as any)?.source ?? (row as any)?.meta?.source ?? '').trim().toLowerCase();
+      const meta = (row as any)?.meta || {};
+
+      if (source === 'flagged_call_auto') {
+        autoAssignmentsCreated++;
+
+        // 🔥 NEW — understand WHY assignment was created
+        const flagSeverity = String(meta?.flag_severity || '').toLowerCase();
+
+        if (flagSeverity === 'critical') {
+          assignmentsFromCriticalFlags++;
+        } else if (flagSeverity === 'low') {
+          assignmentsFromLowFlags++;
+        }
+
+      } else {
+        manualAssignmentsCreated++;
+      }
+    }
+
+
+    const assignmentAutoRate = assignmentRows.length
+      ? Math.round((autoAssignmentsCreated / assignmentRows.length) * 100)
+      : 0;
+
+    const completedAssignments = assignmentRows.filter((row) => String((row as any)?.status || '').toLowerCase() === 'completed').length;
+    const assignmentCompletionRate = assignmentRows.length
+      ? Math.round((completedAssignments / assignmentRows.length) * 100)
+      : 0;
+
+    const openAssignments = assignmentRows.filter((row) => String((row as any)?.status || '').toLowerCase() !== 'completed').length;
+
+    // --- NEW: FLAG SECTION BREAKDOWN (for charts + decisions) ---
+    const flagSectionCounts = new Map<string, number>();
+
+    for (const row of callRows) {
+      const flags = readReviewFlags(row);
+      for (const flag of flags) {
+        const section = normalizeSkillLabel(String((flag as any)?.section || 'unknown'));
+        incrementMap(flagSectionCounts, section);
+      }
+    }
+
+    const weakestSkillCounts = new Map<string, number>();
+    const reviewFlagTypeCounts = new Map<string, number>();
+    const reviewFlagSeverityCounts = new Map<string, number>();
+
+    for (const row of callRows) {
+      const skill = inferWeakestSkillFromCall(row);
+      if (skill) incrementMap(weakestSkillCounts, skill);
+
+      for (const flag of readReviewFlags(row)) {
+        incrementMap(reviewFlagTypeCounts, String((flag as any)?.type || 'unknown'));
+        incrementMap(reviewFlagSeverityCounts, String((flag as any)?.severity || 'unknown'));
+      }
+    }
+
+    const weakestSkills = mapToRankedList(weakestSkillCounts, 8);
+    const flagsBySection = mapToRankedList(flagSectionCounts, 8);
+    const weakestTeamSkill = weakestSkills.length
+      ? { skill: weakestSkills[0].label, count: weakestSkills[0].count }
+      : null;
+    const reviewFlagsByType = mapToRankedList(reviewFlagTypeCounts, 12);
+    const reviewFlagsBySeverity = mapToRankedList(reviewFlagSeverityCounts, 6);
+
+    const helpByRep = new Map<string, { rep_id: string; flagged_calls: number; critical_calls: number; avg_score_sum: number; avg_score_n: number; open_assignments: number; skill_counts: Map<string, number> }>();
+    for (const row of callRows) {
+      const repId = String((row as any)?.user_id || '').trim();
+      if (!repId) continue;
+      const item = helpByRep.get(repId) || {
+        rep_id: repId,
+        flagged_calls: 0,
+        critical_calls: 0,
+        avg_score_sum: 0,
+        avg_score_n: 0,
+        open_assignments: 0,
+        skill_counts: new Map<string, number>(),
+      };
+      const score = Number((row as any)?.score_overall);
+      if (Number.isFinite(score)) {
+        item.avg_score_sum += score;
+        item.avg_score_n += 1;
+      }
+      const flagged = readReviewFlags(row).length > 0 || Boolean(readThresholdBand(row)) || readNeedsManagerReview(row);
+      if (flagged) item.flagged_calls += 1;
+      if (readThresholdBand(row) === 'critical' || readNeedsManagerReview(row)) item.critical_calls += 1;
+      const skill = inferWeakestSkillFromCall(row);
+      if (skill) incrementMap(item.skill_counts, skill);
+      helpByRep.set(repId, item);
+    }
+
+    for (const row of assignmentRows) {
+      const repId = String((row as any)?.assignee_user_id || '').trim();
+      if (!repId) continue;
+      const item = helpByRep.get(repId) || {
+        rep_id: repId,
+        flagged_calls: 0,
+        critical_calls: 0,
+        avg_score_sum: 0,
+        avg_score_n: 0,
+        open_assignments: 0,
+        skill_counts: new Map<string, number>(),
+      };
+      const status = String((row as any)?.status || '').toLowerCase();
+      if (status !== 'completed') item.open_assignments += 1;
+      helpByRep.set(repId, item);
+    }
+
+    const repsNeedingHelp = Array.from(helpByRep.values())
+      .map((item) => {
+        const topSkill = mapToRankedList(item.skill_counts, 1)[0] || null;
+        return {
+          rep_id: item.rep_id,
+          flagged_calls: item.flagged_calls,
+          critical_calls: item.critical_calls,
+          open_assignments: item.open_assignments,
+          avg_score: item.avg_score_n ? Math.round(item.avg_score_sum / item.avg_score_n) : null,
+          weakest_skill: topSkill ? topSkill.label : null,
+        };
+      })
+      .filter((item) => item.critical_calls > 0 || item.flagged_calls > 0 || item.open_assignments >= 2 || (typeof item.avg_score === 'number' && item.avg_score < 65))
+      .sort((a, b) => {
+        if (b.critical_calls !== a.critical_calls) return b.critical_calls - a.critical_calls;
+        if (b.flagged_calls !== a.flagged_calls) return b.flagged_calls - a.flagged_calls;
+        if (b.open_assignments !== a.open_assignments) return b.open_assignments - a.open_assignments;
+        return (a.avg_score ?? 999) - (b.avg_score ?? 999);
+      })
+      .slice(0, 10);
+
+    return res.json({
+      ok: true,
+      days,
+      since,
+      totals: {
+        calls: totalCalls,
+        scored_calls: scoredCalls,
+        assignments: assignmentRows.length,
+        open_assignments: openAssignments,
+        completed_assignments: completedAssignments,
+      },
+      critical_calls_today: criticalCallsToday,
+      critical_calls_this_week: criticalCallsThisWeek,
+      flagged_calls_this_week: flaggedCallsThisWeek,
+      flagged_call_rate: flaggedCallRate,
+      auto_assignments_created: autoAssignmentsCreated,
+      manual_assignments_created: manualAssignmentsCreated,
+
+      // 🔥 NEW — THIS IS HUGE FOR MANAGERS
+      assignments_from_critical_flags: assignmentsFromCriticalFlags,
+      assignments_from_low_flags: assignmentsFromLowFlags,
+
+      assignment_auto_rate: assignmentAutoRate,
+      assignment_completion_rate: assignmentCompletionRate,
+      weakest_team_skill: weakestTeamSkill,
+      weakest_skills: weakestSkills,
+      // 🔥 NEW — powers charts + manager decisions
+      flags_by_section: flagsBySection,
+      review_flags_by_type: reviewFlagsByType,
+      review_flags_by_severity: reviewFlagsBySeverity,
+      reps_needing_help: repsNeedingHelp,
+    });
+  } catch (err: any) {
+    console.error('GET /v1/dashboard/reporting-summary error:', err);
+    return res.status(500).json({ ok: false, error: err?.message || 'reporting_summary_failed' });
   }
 });
 

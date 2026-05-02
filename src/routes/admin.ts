@@ -122,28 +122,30 @@ adminRouter.get("/status", async (_req, res) => {
 adminRouter.post('/test-slack', async (req, res) => {
   try {
     const url = (process.env.SLACK_WEBHOOK_URL || '').trim();
-    if (!url) return res.status(400).json({ ok:false, error:'SLACK_WEBHOOK_URL not set' });
+    if (!url) return res.status(400).json({ ok: false, error: 'SLACK_WEBHOOK_URL not set' });
 
     const text = (req.body?.text as string | undefined) || 'Gravix test: webhook is live ✅';
     const payload = {
       text,
       blocks: [
         { type: 'section', text: { type: 'mrkdwn', text } },
-        { type: 'context', elements: [
-          { type:'mrkdwn', text:`*Env:* ${process.env.NODE_ENV || 'dev'}  •  *API:* ${process.env.PUBLIC_API_BASE || 'local'}` }
-        ]}
+        {
+          type: 'context', elements: [
+            { type: 'mrkdwn', text: `*Env:* ${process.env.NODE_ENV || 'dev'}  •  *API:* ${process.env.PUBLIC_API_BASE || 'local'}` }
+          ]
+        }
       ]
     };
 
     const r = await fetch(url, {
-      method:'POST',
-      headers:{ 'content-type':'application/json' },
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload)
     });
 
     return res.json({ ok: true, status: r.status });
-  } catch (e:any) {
-    return res.status(500).json({ ok:false, error: e?.message || 'slack_failed' });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || 'slack_failed' });
   }
 });
 
@@ -266,7 +268,15 @@ adminRouter.get('/whoami-org', (req, res) => {
 adminRouter.get("/config", requireManager, async (_req, res) => {
   try {
     const config = await getAdminConfig();
-    return res.json({ ok: true, config });
+
+    return res.json({
+      ok: true,
+      config,
+      scoring: {
+        low: config?.low_score_threshold ?? null,
+        critical: config?.critical_score_threshold ?? null,
+      },
+    });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message ?? "failed_to_load_config" });
   }
@@ -274,11 +284,23 @@ adminRouter.get("/config", requireManager, async (_req, res) => {
 
 /* ----------------------------------------------------------------
    PATCH /v1/admin/config
-   Body: { streak_threshold?: number, xp_multiplier?: number, comeback_bonus?: number }
+   Body: {
+     streak_threshold?: number,
+     xp_multiplier?: number,
+     comeback_bonus?: number,
+     low_score_threshold?: number,
+     critical_score_threshold?: number,
+   }
 ----------------------------------------------------------------- */
 adminRouter.patch("/config", requireManager, async (req, res) => {
   try {
-    const { streak_threshold, xp_multiplier, comeback_bonus } = req.body ?? {};
+    const {
+      streak_threshold,
+      xp_multiplier,
+      comeback_bonus,
+      low_score_threshold,
+      critical_score_threshold,
+    } = req.body ?? {};
 
     // light validation (MVP)
     if (streak_threshold !== undefined) {
@@ -299,13 +321,55 @@ adminRouter.patch("/config", requireManager, async (req, res) => {
       }
     }
 
+    if (low_score_threshold !== undefined) {
+      if (!Number.isInteger(low_score_threshold) || low_score_threshold < 0 || low_score_threshold > 100) {
+        return res.status(400).json({ ok: false, error: "low_score_threshold must be an integer 0–100" });
+      }
+    }
+
+    if (critical_score_threshold !== undefined) {
+      if (!Number.isInteger(critical_score_threshold) || critical_score_threshold < 0 || critical_score_threshold > 100) {
+        return res.status(400).json({ ok: false, error: "critical_score_threshold must be an integer 0–100" });
+      }
+    }
+
+    if (
+      low_score_threshold !== undefined &&
+      critical_score_threshold !== undefined &&
+      critical_score_threshold > low_score_threshold
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "critical_score_threshold must be less than or equal to low_score_threshold",
+      });
+    }
+
     // no-op patch protection (optional but nice)
-    if (streak_threshold === undefined && xp_multiplier === undefined && comeback_bonus === undefined) {
+    if (
+      streak_threshold === undefined &&
+      xp_multiplier === undefined &&
+      comeback_bonus === undefined &&
+      low_score_threshold === undefined &&
+      critical_score_threshold === undefined
+    ) {
       return res.status(400).json({ ok: false, error: "no_fields_to_update" });
     }
 
-    const updated = await patchAdminConfig({ streak_threshold, xp_multiplier, comeback_bonus } as any);
-    return res.json({ ok: true, config: updated });
+    const updated = await patchAdminConfig({
+      streak_threshold,
+      xp_multiplier,
+      comeback_bonus,
+      low_score_threshold,
+      critical_score_threshold,
+    } as any);
+    return res.json({
+      ok: true,
+      config: updated,
+      scoring: {
+        low: updated?.low_score_threshold ?? null,
+        critical: updated?.critical_score_threshold ?? null,
+      },
+    });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message ?? "failed_to_update_config" });
   }
