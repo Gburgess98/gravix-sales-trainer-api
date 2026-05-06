@@ -69,12 +69,63 @@ async function getRequesterOrgId(requester: string): Promise<string | null> {
   return data?.org_id ?? null;
 }
 
-async function canAccessCall(requester: string, callUserId: string, callOrgId: string | null) {
+async function getManagerForRep(supa: any, repId: string) {
+  const { data: user } = await supa
+    .from("users")
+    .select("manager_id, office_id")
+    .eq("id", repId)
+    .maybeSingle();
+
+  if (!user?.manager_id) {
+    return {
+      manager: null,
+      office_id: user?.office_id || null,
+    };
+  }
+
+  const { data: manager } = await supa
+    .from("users")
+    .select("id, email, role, office_id")
+    .eq("id", user.manager_id)
+    .maybeSingle();
+
+  return {
+    manager: manager || null,
+    office_id: user?.office_id || null,
+  };
+}
+
+import { getOrgCallVisibility } from "../lib/adminConfig";
+
+async function canAccessCall(
+  requester: string,
+  callUserId: string,
+  callOrgId: string | null
+) {
   if (callUserId === requester) return true;
   if (!callOrgId) return false;
 
   const requesterOrgId = await getRequesterOrgId(requester);
-  return !!requesterOrgId && requesterOrgId === callOrgId;
+  if (!requesterOrgId || requesterOrgId !== callOrgId) return false;
+
+  const visibility = await getOrgCallVisibility(callOrgId);
+
+  if (visibility === "disabled") return false;
+
+  if (visibility === "everyone") return true;
+
+  if (visibility === "managers") {
+    // TEMP: treat users with assignments as "managers"
+    const { data } = await supa
+      .from("assignments")
+      .select("id")
+      .eq("manager_id", requester)
+      .limit(1);
+
+    return (data?.length ?? 0) > 0;
+  }
+
+  return false;
 }
 
 async function getOpenAssignmentCallIds(callIds: string[]): Promise<Set<string>> {
@@ -170,6 +221,72 @@ function detectWeakClose(args: { closeScore: number | null; text: string }) {
   return false;
 }
 
+// 🔥 OBJECTION + TIMESTAMP DETECTION (Day 66)
+function detectObjectionMoments(text: string) {
+  const lower = String(text || "").toLowerCase();
+
+  const objectionPhrases = [
+    "too expensive",
+    "not interested",
+    "need to think",
+    "send me info",
+    "call me back",
+    "already using",
+    "happy with",
+    "no budget",
+    "not right now",
+  ];
+
+  const events: Array<{ type: string; timestamp: number; phrase: string }> = [];
+
+  const sentences = lower.split(/[.!?]/);
+
+  let wordIndex = 0;
+
+  for (const sentence of sentences) {
+    const words = sentence.trim().split(/\s+/);
+    if (!words.length) continue;
+
+    for (const phrase of objectionPhrases) {
+      if (sentence.includes(phrase)) {
+        events.push({
+          type: "objection",
+          timestamp: wordIndex, // simple proxy (can upgrade later)
+          phrase,
+        });
+      }
+    }
+
+    wordIndex += words.length;
+  }
+
+  return events;
+}
+
+// 🔥 STAGE CLASSIFICATION (Day 66)
+function classifyCallStages(text: string) {
+  const lower = String(text || "").toLowerCase();
+
+  const words = lower.split(/\s+/);
+  const total = words.length;
+
+  const stages: Array<{ stage: string; start: number; end: number }> = [];
+
+  if (total === 0) return stages;
+
+  // Simple heuristic split (can upgrade later with AI)
+  const introEnd = Math.floor(total * 0.15);
+  const discoveryEnd = Math.floor(total * 0.5);
+  const objectionEnd = Math.floor(total * 0.8);
+
+  stages.push({ stage: "intro", start: 0, end: introEnd });
+  stages.push({ stage: "discovery", start: introEnd, end: discoveryEnd });
+  stages.push({ stage: "objection", start: discoveryEnd, end: objectionEnd });
+  stages.push({ stage: "close", start: objectionEnd, end: total });
+
+  return stages;
+}
+
 
 function buildVoiceScore(args: {
   transcriptText: string;
@@ -178,6 +295,18 @@ function buildVoiceScore(args: {
   const transcriptText = String(args.transcriptText || "");
   const filler = analyseFillers(transcriptText);
   const weakClose = detectWeakClose({ closeScore: args.closeScore, text: transcriptText });
+  const objectionEvents = detectObjectionMoments(transcriptText);
+
+  const stages = classifyCallStages(transcriptText);
+
+  // attach stage to each event
+  const enrichedEvents = objectionEvents.map((e) => {
+    const stage = stages.find(s => e.timestamp >= s.start && e.timestamp < s.end);
+    return {
+      ...e,
+      stage: stage?.stage || "unknown"
+    };
+  });
 
   const fillerPenalty = filler.filler_density * 220;
   const fillerScore = clampScore(100 - fillerPenalty);
@@ -198,11 +327,23 @@ function buildVoiceScore(args: {
     tone * 0.2 + clarity * 0.25 + confidence * 0.2 + fillerScore * 0.15 + close * 0.2
   );
 
+  const stageSummary: Record<string, number> = {};
+  for (const e of enrichedEvents) {
+    stageSummary[e.stage] = (stageSummary[e.stage] || 0) + 1;
+  }
+
   const review_tags = {
     filler_words: filler.filler_words,
     filler_count: filler.filler_count,
     filler_density: Number(filler.filler_density.toFixed(4)),
     weak_close: weakClose,
+    objection_count: enrichedEvents.length,
+    objection_phrases: enrichedEvents.map(e => e.phrase),
+    stage_breakdown: stageSummary,
+    events: [
+      ...enrichedEvents,
+      ...(weakClose ? [{ type: "weak_close", timestamp: transcriptText.length, stage: "close" }] : []),
+    ],
   };
 
   return { voice_score, voice_rubric, review_tags };
@@ -238,6 +379,12 @@ async function resolveReviewFeedbackContext(args: {
   }
 
   if (!managerId) {
+    const managerContext = await getManagerForRep(supa, repId);
+
+    if (managerContext?.manager?.id) {
+      managerId = String(managerContext.manager.id);
+    }
+
     const fallback = await supa
       .from("assignments")
       .select("id,rep_id,manager_id,target_id,type,status,created_at")
@@ -249,8 +396,13 @@ async function resolveReviewFeedbackContext(args: {
       .maybeSingle();
 
     if (!fallback.error && fallback.data) {
-      managerId = fallback.data.manager_id ? String(fallback.data.manager_id) : null;
-      resolvedAssignmentId = fallback.data.id ? String(fallback.data.id) : resolvedAssignmentId;
+      managerId = fallback.data.manager_id
+        ? String(fallback.data.manager_id)
+        : managerId;
+
+      resolvedAssignmentId = fallback.data.id
+        ? String(fallback.data.id)
+        : resolvedAssignmentId;
     }
   }
 
@@ -663,6 +815,25 @@ router.get("/", async (req, res) => {
       if (!requesterOrgId) {
         return res.status(403).json({ ok: false, error: "missing_org_scope" });
       }
+
+      const visibility = await getOrgCallVisibility(requesterOrgId);
+
+      if (visibility === "disabled") {
+        return res.status(403).json({ ok: false, error: "company_calls_disabled" });
+      }
+
+      if (visibility === "managers") {
+        const { data } = await supa
+          .from("assignments")
+          .select("id")
+          .eq("manager_id", requester)
+          .limit(1);
+
+        if (!data?.length) {
+          return res.status(403).json({ ok: false, error: "manager_only_access" });
+        }
+      }
+
       q = q.eq("org_id", requesterOrgId);
     } else {
       q = q.eq("user_id", requester);
@@ -764,6 +935,25 @@ router.get("/paged", async (req, res) => {
       if (!requesterOrgId) {
         return res.status(403).json({ ok: false, error: "missing_org_scope" });
       }
+
+      const visibility = await getOrgCallVisibility(requesterOrgId);
+
+      if (visibility === "disabled") {
+        return res.status(403).json({ ok: false, error: "company_calls_disabled" });
+      }
+
+      if (visibility === "managers") {
+        const { data } = await supa
+          .from("assignments")
+          .select("id")
+          .eq("manager_id", requester)
+          .limit(1);
+
+        if (!data?.length) {
+          return res.status(403).json({ ok: false, error: "manager_only_access" });
+        }
+      }
+
       q = q.eq("org_id", requesterOrgId);
     } else {
       q = q.eq("user_id", requester);
@@ -911,11 +1101,49 @@ router.post("/:id/score", async (req, res) => {
     if (call.user_id !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
 
     const reviewText = String(body.transcript_text ?? (call as any)?.summary ?? "");
+    // 🔥 CONTEXT INJECTION FOR REVIEW BOT (Day 66)
+    let contextNote = "";
+    try {
+      const { data: recentFlags } = await supa
+        .from("crm_activities")
+        .select("meta")
+        .eq("type", "review_flag")
+        .eq("rep_id", requester)
+        .limit(20);
+
+      const sectionCounts: Record<string, number> = {};
+      for (const row of recentFlags || []) {
+        const section = row?.meta?.flag_section || "general";
+        sectionCounts[section] = (sectionCounts[section] || 0) + 1;
+      }
+
+      const topWeakness = Object.entries(sectionCounts)
+        .sort((a, b) => b[1] - a[1])[0]?.[0];
+
+      if (topWeakness) {
+        contextNote = `Rep historically struggles with ${topWeakness}. Prioritise this in analysis.`;
+      }
+    } catch (e) {
+      console.warn("[review_context_injection_failed]", e);
+    }
+
+    const enrichedReviewText = contextNote
+      ? `${reviewText}\n\n[CONTEXT]\n${contextNote}`
+      : reviewText;
+
     const closeScore = typeof (body.rubric as any)?.close === "number" ? Number((body.rubric as any).close) : null;
     const { voice_score, voice_rubric, review_tags } = buildVoiceScore({
-      transcriptText: reviewText,
+      transcriptText: enrichedReviewText,
       closeScore,
     });
+
+    // 🔥 ROUTE FEEDBACK TO MANAGER (Day 67)
+    const managerContext = await getManagerForRep(supa, call.user_id);
+    const manager = managerContext?.manager;
+
+    if (manager?.email) {
+      console.log("📣 Send feedback to manager:", manager.email);
+    }
 
     const transcriptText = String(body.transcript_text ?? "").trim();
 

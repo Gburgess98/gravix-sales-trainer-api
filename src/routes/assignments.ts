@@ -31,6 +31,61 @@ function getUserId(req: Request) {
   );
 }
 
+// 🔥 FAILURE ESCALATION FUNCTION (Day 66)
+function getFailureMultiplier(failureCount: number) {
+  if (!failureCount || failureCount <= 1) return 1;
+
+  if (failureCount === 2) return 1.3;   // repeated
+  if (failureCount === 3) return 1.7;   // concerning
+  if (failureCount >= 4) return 2.2;    // 🔥 major issue
+
+  return 1;
+}
+
+function calculateWeaknessPriority(args: {
+  section: string;
+  severity: "low" | "critical";
+  failureCount: number;
+  lastFailedAt?: string | null;
+}) {
+  const SECTION_WEIGHTS: Record<string, number> = {
+    close: 10,        // 🔥 revenue critical
+    objection: 7,     // high impact
+    discovery: 5,     // mid impact
+    intro: 2,         // low impact
+  };
+
+  const SEVERITY_WEIGHTS = {
+    critical: 5,
+    low: 2,
+  };
+
+  const sectionScore = SECTION_WEIGHTS[args.section] || 1;
+  const severityScore = SEVERITY_WEIGHTS[args.severity] || 1;
+
+  const frequencyScore = args.failureCount || 0;
+
+  let recencyScore = 0;
+  if (args.lastFailedAt) {
+    const diff = Date.now() - new Date(args.lastFailedAt).getTime();
+    if (diff < 24 * 60 * 60 * 1000) recencyScore = 3;
+    else if (diff < 72 * 60 * 60 * 1000) recencyScore = 1;
+  }
+
+  const businessImpactMultiplier =
+    args.section === "close" ? 1.5 :
+      args.section === "objection" ? 1.2 :
+        1;
+
+  const failureMultiplier = getFailureMultiplier(args.failureCount || 1);
+
+  return (
+    ((sectionScore * severityScore * businessImpactMultiplier) * failureMultiplier) +
+    (frequencyScore * 2) +
+    recencyScore
+  );
+}
+
 function formatDayMon(d: Date) {
   try {
     return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short" }).format(d);
@@ -81,6 +136,97 @@ async function getRepSectionMemory(supa: any, repId: string) {
   }
 
   return memory;
+}
+
+// 🔥 REP WEAKNESS RANKING (Day 66)
+async function getRepWeaknessRanking(supa: any, repId: string) {
+  const { data, error } = await supa
+    .from("crm_activities")
+    .select("meta, created_at")
+    .eq("type", "review_flag")
+    .eq("rep_id", repId)
+    .limit(2000);
+
+  if (error) throw error;
+
+  const bySection: Record<string, any> = {};
+
+  for (const row of data || []) {
+    const m = row.meta || {};
+    const section = m.flag_section || "general";
+    const severity = m.flag_severity || "low";
+
+    if (!bySection[section]) {
+      bySection[section] = {
+        section,
+        failures: 0,
+        critical: 0,
+        last_failed_at: row.created_at,
+      };
+    }
+
+    bySection[section].failures++;
+
+    if (severity === "critical") {
+      bySection[section].critical++;
+    }
+
+    if (new Date(row.created_at) > new Date(bySection[section].last_failed_at)) {
+      bySection[section].last_failed_at = row.created_at;
+    }
+  }
+
+  const ranked = Object.values(bySection)
+    .map((s: any) => ({
+      ...s,
+      priority: calculateWeaknessPriority({
+        section: s.section,
+        severity: s.critical > 0 ? "critical" : "low",
+        failureCount: s.failures,
+        lastFailedAt: s.last_failed_at,
+      }),
+    }))
+    .sort((a: any, b: any) => b.priority - a.priority);
+
+  return ranked.slice(0, 3);
+}
+
+async function getManagerForRep(supa: any, repId: string) {
+  const { data: user } = await supa
+    .from("users")
+    .select("manager_id")
+    .eq("id", repId)
+    .maybeSingle();
+
+  if (!user?.manager_id) return null;
+
+  const { data: manager } = await supa
+    .from("users")
+    .select("id, email")
+    .eq("id", user.manager_id)
+    .maybeSingle();
+
+  return manager;
+}
+
+async function getManagerVisibility(supa: any, userId: string) {
+  const { data } = await supa
+    .from("users")
+    .select("visibility_scope")
+    .eq("id", userId)
+    .maybeSingle();
+
+  return String(data?.visibility_scope || "team"); // default safe
+}
+
+async function getUserOffice(supa: any, userId: string) {
+  const { data } = await supa
+    .from("users")
+    .select("office_id")
+    .eq("id", userId)
+    .maybeSingle();
+
+  return data?.office_id || null;
 }
 
 // 🔥 IMPROVEMENT SCORE
@@ -344,6 +490,11 @@ export function assignmentsRoutes() {
       const type = String((req.query.type as string) || "call_review").trim().toLowerCase() || "call_review";
       const manager = await isManagerUser(userId);
 
+      let visibility = "team";
+      if (manager) {
+        visibility = await getManagerVisibility(supa, userId);
+      }
+
       let q = supa
         .from("assignments")
         .select("id,target_id,status,rep_id,manager_id,type,created_at,completed_at,due_at")
@@ -351,7 +502,9 @@ export function assignmentsRoutes() {
         .eq("type", type)
         .order("created_at", { ascending: false });
 
-      if (manager) q = q.eq("manager_id", userId);
+      if (manager && visibility !== "company") {
+        q = q.eq("manager_id", userId);
+      }
       else q = q.eq("rep_id", userId);
 
       const { data, error } = await q;
@@ -436,8 +589,15 @@ export function assignmentsRoutes() {
 
     if (repId !== userId) {
       const managerId = String((req as any).authUserId || "").trim();
-      if (managerId) {
+      const visibility = await getManagerVisibility(supa, managerId);
+      const officeId = await getUserOffice(supa, managerId);
+
+      if (managerId && visibility !== "company") {
         q = q.eq("manager_id", managerId);
+
+        if (officeId) {
+          q = q.eq("office_id", officeId);
+        }
       }
     }
 
@@ -489,8 +649,15 @@ export function assignmentsRoutes() {
 
     if (repId !== userId) {
       const managerId = String((req as any).authUserId || "").trim();
-      if (managerId) {
+      const visibility = await getManagerVisibility(supa, managerId);
+      const officeId = await getUserOffice(supa, managerId);
+
+      if (managerId && visibility !== "company") {
         q = q.eq("manager_id", managerId);
+
+        if (officeId) {
+          q = q.eq("office_id", officeId);
+        }
       }
     }
 
@@ -580,13 +747,39 @@ export function assignmentsRoutes() {
       console.log("[memory.fetch.failed]", e);
     }
 
+    // 🔥 STEP 2 — RANK WEAKNESSES (Day 66)
+    let rankedWeaknesses: any[] = [];
+
+    try {
+      rankedWeaknesses = await getRepWeaknessRanking(supa, rep_id);
+    } catch (e) {
+      console.log("[weakness.ranking.failed]", e);
+    }
+
+    if (!rankedWeaknesses.length) {
+      rankedWeaknesses = [
+        {
+          section: safeMeta?.flag_section || "general",
+          severity:
+            safeMeta?.threshold_band === "critical" ? "critical" : "low",
+          failureCount: safeMeta?.failure_count || 1,
+          lastFailedAt: new Date().toISOString(),
+          priority: 1,
+        },
+      ];
+    }
+
+    const primaryWeakness = rankedWeaknesses[0];
+
     // 🔥 STEP 1 — Derive drill type from section
+    const sectionForDrill = primaryWeakness?.section || safeMeta?.flag_section;
+
     const drillType =
-      safeMeta?.flag_section === "objection"
+      sectionForDrill === "objection"
         ? "objection_handling"
-        : safeMeta?.flag_section === "close"
+        : sectionForDrill === "close"
           ? "closing"
-          : safeMeta?.flag_section === "discovery"
+          : sectionForDrill === "discovery"
             ? "discovery"
             : "general";
 
@@ -622,9 +815,13 @@ export function assignmentsRoutes() {
     }
 
     // 🔥 STEP 4 — Final payload
+    const manager = await getManagerForRep(supa, rep_id);
+    const repOfficeId = await getUserOffice(supa, rep_id);
+
     const payload: any = {
       rep_id,
-      manager_id: managerId,
+      manager_id: manager?.id || managerId,
+      office_id: repOfficeId,
       type,
       title: cleanTitle,
       status: "assigned",
@@ -1087,12 +1284,22 @@ export function assignmentsRoutes() {
     const cursor = String((req.query.cursor as any) || "").trim();
     const [cursorCreatedAt, cursorId] = cursor ? cursor.split("|") : ["", ""];
 
+    const visibility = await getManagerVisibility(supa, managerId);
+    const officeId = await getUserOffice(supa, managerId);
+
     let q = supa
       .from("assignments")
       .select(SELECT_FIELDS)
-      .eq("manager_id", managerId)
       .order("created_at", { ascending: false })
       .order("id", { ascending: false });
+
+    if (visibility !== "company") {
+      q = q.eq("manager_id", managerId);
+
+      if (officeId) {
+        q = q.eq("office_id", officeId);
+      }
+    }
 
     if (repId) q = q.eq("rep_id", repId);
     if (status) q = q.eq("status", status);
@@ -1436,6 +1643,12 @@ export function assignmentsRoutes() {
 
       if (!isManager) {
         q = q.eq("rep_id", userId);
+      } else {
+        const visibility = await getManagerVisibility(supa, userId);
+
+        if (visibility !== "company") {
+          q = q.eq("manager_id", userId);
+        }
       }
 
       const { data, error } = await q;

@@ -394,6 +394,150 @@ router.get("/flags/summary", async (req, res) => {
   }
 });
 
+// 🔥 COMPANY WEAKNESS AGGREGATION (Day 66)
+async function getCompanyWeaknessAggregation(supa: any) {
+  const { data, error } = await supa
+    .from("crm_activities")
+    .select("meta, rep_id, created_at")
+    .eq("type", "review_flag")
+    .limit(5000);
+
+  if (error) throw error;
+
+  const bySection: Record<string, any> = {};
+
+  for (const row of data || []) {
+    const m = row.meta || {};
+    const section = m.flag_section || "general";
+    const severity = m.flag_severity || "low";
+
+    if (!bySection[section]) {
+      bySection[section] = {
+        section,
+        total_failures: 0,
+        critical_count: 0,
+        reps_affected: new Set<string>(),
+        last_seen: row.created_at,
+      };
+    }
+
+    const item = bySection[section];
+
+    item.total_failures++;
+    item.reps_affected.add(row.rep_id);
+
+    if (severity === "critical") {
+      item.critical_count++;
+    }
+
+    if (new Date(row.created_at) > new Date(item.last_seen)) {
+      item.last_seen = row.created_at;
+    }
+  }
+
+  const ranked = Object.values(bySection)
+    .map((s: any) => ({
+      ...s,
+      reps_affected_count: s.reps_affected.size,
+      priority:
+        (s.total_failures * 2) +
+        (s.critical_count * 5) +
+        (s.reps_affected.size * 3),
+    }))
+    .sort((a: any, b: any) => b.priority - a.priority);
+
+  return ranked;
+}
+
+// 🔥 API: Company Weakness
+router.get("/company-weakness", async (req, res) => {
+  try {
+    const supa = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
+    );
+
+    const data = await getCompanyWeaknessAggregation(supa);
+
+    return res.json({
+      ok: true,
+      weaknesses: data,
+      top_problem: data[0] || null,
+    });
+  } catch (e: any) {
+    console.error("[company.weakness] error", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// 🔥 REP IMPROVEMENT TRACKING (Day 66)
+router.get("/rep-improvement", async (req, res) => {
+  try {
+    const supa = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
+    );
+
+    const repId = String(req.query.rep_id || "").trim();
+    if (!repId) {
+      return res.status(400).json({ ok: false, error: "rep_id required" });
+    }
+
+    const days = Number(req.query.days || 30);
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+
+    const { data, error } = await supa
+      .from("calls")
+      .select("created_at, score_overall")
+      .eq("user_id", repId)
+      .gte("created_at", since)
+      .order("created_at", { ascending: true });
+
+    if (error) throw error;
+
+    const dayAgg: Record<string, { total: number; count: number }> = {};
+
+    for (const row of data || []) {
+      const score = Number(row.score_overall);
+      if (!Number.isFinite(score)) continue;
+
+      const day = new Date(row.created_at).toISOString().slice(0, 10);
+
+      if (!dayAgg[day]) {
+        dayAgg[day] = { total: 0, count: 0 };
+      }
+
+      dayAgg[day].total += score;
+      dayAgg[day].count += 1;
+    }
+
+    const trend = Object.keys(dayAgg)
+      .sort()
+      .map((date) => ({
+        date,
+        avg_score: Math.round(dayAgg[date].total / dayAgg[date].count),
+      }));
+
+    const first = trend[0]?.avg_score ?? null;
+    const last = trend[trend.length - 1]?.avg_score ?? null;
+
+    const improvement =
+      first !== null && last !== null ? last - first : null;
+
+    return res.json({
+      ok: true,
+      rep_id: repId,
+      trend,
+      improvement,
+      start_score: first,
+      current_score: last,
+    });
+  } catch (e: any) {
+    console.error("[rep.improvement] error", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ---- GET /v1/dashboard/reporting-summary ----
 // Main manager reporting read layer
 // Query params: days=7&orgId=<uuid>

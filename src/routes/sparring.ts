@@ -1932,6 +1932,7 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
 // POST /v1/sparring/sessions/:id/turns
 // -----------------------------------------
 // Append a user turn and generate an AI reply
+import { buildAIContext } from "../lib/contextBuilder";
 router.post(
   '/sessions/:id/turns',
   express.json(),
@@ -2101,26 +2102,50 @@ router.post(
         }
       } else {
         try {
+          // 🔥 CONTEXT INJECTION (Day 66)
+          let aiContext: any = null;
+          try {
+            aiContext = await buildAIContext({
+              supa,
+              repId: repId || session.rep_id,
+            });
+          } catch (e) {
+            console.warn("[context_builder_failed]", e);
+          }
+
           const systemPrompt = buildPersonaSystemPrompt({
             personaId,
             difficulty: difficultyVal,
             mode: modeVal,
             dynamicScenario: (session.meta as any)?.dynamic_scenario || null,
-
             emotionalState: updatedEmotion,
             failures: previousMeta.failure_count || 1,
             section: previousMeta.flag_section || null,
-
-            // 🔥 CRITICAL FIX
             stackedObjection: newObjection
           });
+
+          // 🔥 AUGMENT PROMPT WITH CONTEXT (CRITICAL)
+          const enrichedSystemPrompt = `
+${systemPrompt}
+
+=== REP CONTEXT ===
+${aiContext?.rep?.topWeaknesses?.map((w: any) => `- ${w.section} (${w.count})`).join("\n") || "None"}
+
+=== COMPANY CONTEXT ===
+Top weakness: ${aiContext?.company?.topWeakness || "unknown"}
+
+INSTRUCTIONS:
+- Focus on the rep’s weaknesses
+- Apply pressure where they fail most
+- Be harder in those areas
+`;
 
           const completion = await openai.chat.completions.create({
             model: process.env.OPENAI_SPARRING_MODEL || "gpt-4o-mini",
             messages: [
               {
                 role: "system",
-                content: systemPrompt,
+                content: enrichedSystemPrompt,
               },
               ...history,
             ],

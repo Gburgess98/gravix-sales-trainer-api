@@ -27,6 +27,7 @@ import adminRouter from "./routes/admin";
 import { assignmentsRoutes } from "./routes/assignments";
 import debugRouter from "./routes/debug";
 
+
 const REQUIRED_ENV = [
   "SUPABASE_URL",
   "SUPABASE_SERVICE_ROLE_KEY",

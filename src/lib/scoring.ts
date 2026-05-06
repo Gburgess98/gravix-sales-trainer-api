@@ -1010,6 +1010,32 @@ function shouldCreateAssignment(args: {
   return meaningful;
 }
 
+// 🔥 STEP 1 — NOISE FILTER FUNCTION (Day 66)
+function isHighQualityFlag(args: {
+  section: string;
+  severity: "low" | "critical";
+  score?: number;
+  failureCount?: number;
+}) {
+  // ❌ Ignore low severity unless repeated
+  if (args.severity === "low" && (args.failureCount || 0) < 2) {
+    return false;
+  }
+
+  // ❌ Ignore weak sections unless critical
+  const weakSections = ["intro"];
+  if (weakSections.includes(args.section) && args.severity !== "critical") {
+    return false;
+  }
+
+  // ❌ Ignore decent performance (not actually failing)
+  if (typeof args.score === "number" && args.score > 65) {
+    return false;
+  }
+
+  return true;
+}
+
 async function ensureCriticalCallAssignment(args: {
   supabase: SupabaseClient;
   callId: string;
@@ -1022,12 +1048,41 @@ async function ensureCriticalCallAssignment(args: {
 }) {
   const hasCriticalFlag = args.reviewFlags.some(f => f.severity === "critical");
 
-  // 🔥 NEW FILTERING LAYER
-  if (!shouldCreateAssignment({
-    reviewFlags: args.reviewFlags,
-    overall: args.overall,
-    thresholdBand: args.thresholdBand,
-  })) return null;
+  if (
+
+    !shouldCreateAssignment({
+
+      reviewFlags: args.reviewFlags,
+
+      overall: args.overall,
+
+      thresholdBand: args.thresholdBand,
+
+    })
+
+  ) return null;
+
+  // 🔥 NEW FILTER LAYER
+
+  const validFlags = args.reviewFlags.filter(f =>
+
+    isHighQualityFlag({
+
+      section: f.section,
+
+      severity: f.severity,
+
+      score: args.overall,
+
+      failureCount: f.failureCount || 1,
+
+    })
+
+  );
+
+  // ❌ No strong signal → no assignment
+
+  if (validFlags.length === 0) return null;
 
   if (!hasCriticalFlag) return null;
   if (!args.assigneeUserId) return null;
@@ -1040,7 +1095,7 @@ async function ensureCriticalCallAssignment(args: {
     ): string => {
 
       // 1. PRIORITISE CRITICAL FLAGS
-      const criticalFlags = flags.filter(f => f.severity === "critical");
+      const criticalFlags = validFlags.filter(f => f.severity === "critical");
 
       // 2. PRIORITISE BY SECTION IMPORTANCE (closing > objection > discovery > intro)
       const priorityOrder = ["close", "objection", "discovery", "intro"];

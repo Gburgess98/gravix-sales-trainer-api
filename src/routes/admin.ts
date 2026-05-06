@@ -62,6 +62,264 @@ adminRouter.post("/force-score/:id", async (req, res) => {
   }
 });
 
+/* ----------------------------------------------------------------
+   GET /v1/admin/org-settings
+----------------------------------------------------------------- */
+adminRouter.get("/org-settings", requireManager, async (req: any, res: any) => {
+  try {
+    const requester = String(req.header("x-user-id") || "").trim();
+
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+    if (!url || !key) return res.status(500).json({ ok: false, error: "server_missing_supabase_env" });
+
+    const supa = createClient(url, key);
+
+    const { data: callRow } = await supa
+      .from("calls")
+      .select("org_id")
+      .eq("user_id", requester)
+      .not("org_id", "is", null)
+      .limit(1)
+      .maybeSingle();
+
+    const orgId = callRow?.org_id;
+    if (!orgId) return res.status(403).json({ ok: false, error: "no_org" });
+
+    const { data, error } = await supa
+      .from("org_settings")
+      .select("call_visibility")
+      .eq("org_id", orgId)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      settings: {
+        call_visibility: data?.call_visibility || "everyone",
+      },
+    });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || "org_settings_failed" });
+  }
+});
+
+/* ----------------------------------------------------------------
+   PATCH /v1/admin/org-settings
+----------------------------------------------------------------- */
+
+adminRouter.patch("/org-settings", requireManager, async (req: any, res: any) => {
+  try {
+    const requester = String(req.header("x-user-id") || "").trim();
+    const call_visibility = req.body?.call_visibility;
+
+    if (!["everyone", "managers", "disabled"].includes(call_visibility)) {
+      return res.status(400).json({ ok: false, error: "invalid_call_visibility" });
+    }
+
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+    if (!url || !key) return res.status(500).json({ ok: false, error: "server_missing_supabase_env" });
+
+    const supa = createClient(url, key);
+
+    const { data: callRow } = await supa
+      .from("calls")
+      .select("org_id")
+      .eq("user_id", requester)
+      .not("org_id", "is", null)
+      .limit(1)
+      .maybeSingle();
+
+    const orgId = callRow?.org_id;
+    if (!orgId) return res.status(403).json({ ok: false, error: "no_org" });
+
+    const { data, error } = await supa
+      .from("org_settings")
+      .upsert(
+        {
+          org_id: orgId,
+          call_visibility,
+        },
+        { onConflict: "org_id" }
+      )
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({
+      ok: true,
+      settings: data,
+    });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || "org_settings_update_failed" });
+  }
+});
+
+/* ----------------------------------------------------------------
+   POST /v1/admin/users
+   Create a new user (rep/manager/admin)
+----------------------------------------------------------------- */
+adminRouter.post("/users", requireManager, async (req: any, res: any) => {
+  try {
+    const {
+      email,
+      role,
+      manager_id,
+      office_id,
+    } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ ok: false, error: "email_required" });
+    }
+    if (!office_id) {
+      return res.status(400).json({ ok: false, error: "office_required" });
+    }
+
+    if (!["rep", "manager", "admin"].includes(role)) {
+      return res.status(400).json({ ok: false, error: "invalid_role" });
+    }
+    if (role === "rep" && !manager_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "manager_required_for_rep",
+      });
+    }
+
+    const supa = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
+    );
+
+    const requester = req.header("x-user-id");
+
+    const { data: orgRow } = await supa
+      .from("calls")
+      .select("org_id")
+      .eq("user_id", requester)
+      .limit(1)
+      .maybeSingle();
+
+    const orgId = orgRow?.org_id;
+    if (!orgId) {
+      return res.status(403).json({ ok: false, error: "no_org" });
+    }
+
+    // 🔥 USER LIMIT ENFORCEMENT (seat-based)
+    const { count: userCount } = await supa
+      .from("users")
+      .select("*", { count: "exact", head: true })
+      .eq("org_id", orgId);
+
+    const { data: limitRow } = await supa
+      .from("org_limits")
+      .select("max_users")
+      .eq("org_id", orgId)
+      .maybeSingle();
+
+    const maxUsers = limitRow?.max_users ?? 5; // default plan
+
+    if ((userCount ?? 0) >= maxUsers) {
+      return res.status(403).json({
+        ok: false,
+        error: "user_limit_reached",
+        message: `User limit reached (${userCount}/${maxUsers}). Upgrade required.`,
+      });
+    }
+
+    if (manager_id) {
+      const { data: manager } = await supa
+        .from("users")
+        .select("id, role, office_id")
+        .eq("id", manager_id)
+        .maybeSingle();
+
+      if (!manager) {
+        return res.status(400).json({ ok: false, error: "invalid_manager_id" });
+      }
+
+      // reps cannot manage users
+      if (manager.role === "rep") {
+        return res.status(400).json({
+          ok: false,
+          error: "rep_cannot_be_manager",
+        });
+      }
+
+      // office safety check
+      if (
+        role === "rep" &&
+        manager.office_id &&
+        office_id &&
+        manager.office_id !== office_id
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: "manager_office_mismatch",
+        });
+      }
+    }
+
+    const { data, error } = await supa
+      .from("users")
+      .insert({
+        email,
+        role,
+        manager_id: role === "rep" ? manager_id : null,
+        office_id,
+        org_id: orgId,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return res.json({ ok: true, user: data });
+  } catch (e: any) {
+    console.error("[POST /users]", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+/* ----------------------------------------------------------------
+   GET /v1/admin/users
+   Get all users for org (for dropdowns etc.)
+----------------------------------------------------------------- */
+adminRouter.get("/users", requireManager, async (req: any, res: any) => {
+  try {
+    const supa = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
+    );
+
+    const requester = req.header("x-user-id");
+
+    const { data: orgRow } = await supa
+      .from("calls")
+      .select("org_id")
+      .eq("user_id", requester)
+      .limit(1)
+      .maybeSingle();
+
+    const orgId = orgRow?.org_id;
+
+    const { data, error } = await supa
+      .from("users")
+      .select("*")
+      .eq("org_id", orgId)
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    return res.json({ ok: true, users: data });
+  } catch (e: any) {
+    console.error("[GET /users]", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 adminRouter.get("/status", async (_req, res) => {
   const out: any = { ok: true, checks: [] as any[] };
 
@@ -69,6 +327,60 @@ adminRouter.get("/status", async (_req, res) => {
     out.checks.push({ name, ok, detail });
     if (!ok) out.ok = false;
   }
+
+  /* ----------------------------------------------------------------
+     PATCH /v1/admin/org-settings
+     Body: { call_visibility: 'everyone' | 'managers' | 'disabled' }
+  ----------------------------------------------------------------- */
+  adminRouter.patch("/org-settings", requireManager, async (req: any, res: any) => {
+    try {
+      const requester = String(req.header("x-user-id") || "").trim();
+      const call_visibility = req.body?.call_visibility;
+
+      if (!["everyone", "managers", "disabled"].includes(call_visibility)) {
+        return res.status(400).json({ ok: false, error: "invalid_call_visibility" });
+      }
+
+      const url = process.env.SUPABASE_URL;
+      const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
+      if (!url || !key) return res.status(500).json({ ok: false, error: "server_missing_supabase_env" });
+
+      const supa = createClient(url, key);
+
+      // get org_id
+      const { data: callRow } = await supa
+        .from("calls")
+        .select("org_id")
+        .eq("user_id", requester)
+        .not("org_id", "is", null)
+        .limit(1)
+        .maybeSingle();
+
+      const orgId = callRow?.org_id;
+      if (!orgId) return res.status(403).json({ ok: false, error: "no_org" });
+
+      const { data, error } = await supa
+        .from("org_settings")
+        .upsert(
+          {
+            org_id: orgId,
+            call_visibility,
+          },
+          { onConflict: "org_id" }
+        )
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      return res.json({
+        ok: true,
+        settings: data,
+      });
+    } catch (e: any) {
+      return res.status(500).json({ ok: false, error: e?.message || "org_settings_update_failed" });
+    }
+  });
 
   // --- ENV presence checks ---
   try {
@@ -146,6 +458,56 @@ adminRouter.post('/test-slack', async (req, res) => {
     return res.json({ ok: true, status: r.status });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message || 'slack_failed' });
+  }
+});
+
+
+/* ----------------------------------------------------------------
+   GET /v1/admin/usage
+----------------------------------------------------------------- */
+adminRouter.get("/usage", requireManager, async (req: any, res: any) => {
+  try {
+    const supa = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!
+    );
+
+    const requester = req.header("x-user-id");
+
+    const { data: orgRow } = await supa
+      .from("calls")
+      .select("org_id")
+      .eq("user_id", requester)
+      .limit(1)
+      .maybeSingle();
+
+    const orgId = orgRow?.org_id;
+    if (!orgId) {
+      return res.status(403).json({ ok: false, error: "no_org" });
+    }
+
+    const { count } = await supa
+      .from("users")
+      .select("*", { count: "exact", head: true })
+      .eq("org_id", orgId);
+
+    const { data: limitRow } = await supa
+      .from("org_limits")
+      .select("max_users")
+      .eq("org_id", orgId)
+      .maybeSingle();
+
+    const maxUsers = limitRow?.max_users ?? 5;
+
+    return res.json({
+      ok: true,
+      usage: {
+        used: count ?? 0,
+        max: maxUsers,
+      },
+    });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
