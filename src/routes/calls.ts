@@ -69,6 +69,19 @@ async function getRequesterOrgId(requester: string): Promise<string | null> {
   return data?.org_id ?? null;
 }
 
+async function getUserHierarchy(supa: any, userId: string) {
+  const { data } = await supa
+    .from("users")
+    .select("office_id, company_id")
+    .eq("id", userId)
+    .maybeSingle();
+
+  return {
+    office_id: data?.office_id || null,
+    company_id: data?.company_id || null,
+  };
+}
+
 async function getManagerForRep(supa: any, repId: string) {
   const { data: user } = await supa
     .from("users")
@@ -691,9 +704,27 @@ router.post("/", async (req, res) => {
   try {
     const body = CreateCallSchema.parse(req.body);
 
+    const hierarchy = await getUserHierarchy(supa, body.userId);
+
+    if (!hierarchy.office_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "user_missing_office",
+      });
+    }
+
+    if (!hierarchy.company_id) {
+      return res.status(400).json({
+        ok: false,
+        error: "user_missing_company",
+      });
+    }
+
     const insert = {
       user_id: body.userId,
       org_id: process.env.DEFAULT_ORG_ID ?? null, // adapt if NOT NULL
+      office_id: hierarchy.office_id,
+      company_id: hierarchy.company_id,
       filename: body.fileName,
       storage_path: body.storagePath,
       size_bytes: body.sizeBytes ?? null,
@@ -992,6 +1023,22 @@ router.get("/paged", async (req, res) => {
     const openAssignmentCallIds = await getOpenAssignmentCallIds(
       items.map((c: any) => String(c.id ?? ""))
     );
+
+    const hierarchy = await getUserHierarchy(supa, userId);
+
+if (!hierarchy.office_id) {
+  return res.status(400).json({
+    ok: false,
+    error: "user_missing_office",
+  });
+}
+
+if (!hierarchy.company_id) {
+  return res.status(400).json({
+    ok: false,
+    error: "user_missing_company",
+  });
+}
 
     // Shape payload for web: keep existing fields, add new UX bits
     const mapped = items.map((c) => ({

@@ -3,6 +3,13 @@ import { Router } from "express";
 import type { Request, Response, NextFunction } from "express";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
+import {
+  isCompanyManager,
+  isOfficeManager,
+  canAccessOffice,
+  canAccessCompany,
+  type UserContext,
+} from "../lib/permissions.ts";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -194,39 +201,61 @@ async function getRepWeaknessRanking(supa: any, repId: string) {
 async function getManagerForRep(supa: any, repId: string) {
   const { data: user } = await supa
     .from("users")
-    .select("manager_id")
+    .select("manager_id, office_id, company_id")
     .eq("id", repId)
     .maybeSingle();
 
-  if (!user?.manager_id) return null;
+  if (!user?.manager_id) {
+    return {
+      manager: null,
+      office_id: user?.office_id || null,
+      company_id: user?.company_id || null,
+    };
+  }
 
   const { data: manager } = await supa
     .from("users")
-    .select("id, email")
+    .select("id, email, role, office_id, company_id")
     .eq("id", user.manager_id)
     .maybeSingle();
 
-  return manager;
+  return {
+    manager: manager || null,
+    office_id: user?.office_id || null,
+    company_id: user?.company_id || null,
+  };
 }
 
-async function getManagerVisibility(supa: any, userId: string) {
+
+async function getUserHierarchy(supa: any, userId: string) {
   const { data } = await supa
     .from("users")
-    .select("visibility_scope")
+    .select("office_id, company_id")
     .eq("id", userId)
     .maybeSingle();
 
-  return String(data?.visibility_scope || "team"); // default safe
+  return {
+    office_id: data?.office_id || null,
+    company_id: data?.company_id || null,
+  };
 }
 
-async function getUserOffice(supa: any, userId: string) {
+async function getUserContext(supa: any, userId: string): Promise<UserContext | null> {
   const { data } = await supa
     .from("users")
-    .select("office_id")
+    .select("id, role, office_id, company_id, is_admin")
     .eq("id", userId)
     .maybeSingle();
 
-  return data?.office_id || null;
+  if (!data) return null;
+
+  return {
+    id: String(data.id),
+    role: String(data.role || "rep"),
+    office_id: data.office_id || null,
+    company_id: data.company_id || null,
+    is_admin: Boolean(data.is_admin),
+  };
 }
 
 // 🔥 IMPROVEMENT SCORE
@@ -490,10 +519,9 @@ export function assignmentsRoutes() {
       const type = String((req.query.type as string) || "call_review").trim().toLowerCase() || "call_review";
       const manager = await isManagerUser(userId);
 
-      let visibility = "team";
-      if (manager) {
-        visibility = await getManagerVisibility(supa, userId);
-      }
+      const managerContext = manager
+        ? await getUserContext(supa, userId)
+        : null;
 
       let q = supa
         .from("assignments")
@@ -502,10 +530,17 @@ export function assignmentsRoutes() {
         .eq("type", type)
         .order("created_at", { ascending: false });
 
-      if (manager && visibility !== "company") {
-        q = q.eq("manager_id", userId);
+      if (manager && managerContext) {
+        if (isOfficeManager(managerContext)) {
+          q = q.eq("office_id", managerContext.office_id);
+        }
+
+        if (isCompanyManager(managerContext)) {
+          q = q.eq("company_id", managerContext.company_id);
+        }
+      } else {
+        q = q.eq("rep_id", userId);
       }
-      else q = q.eq("rep_id", userId);
 
       const { data, error } = await q;
       if (error) return res.status(500).json({ ok: false, error: error.message });
@@ -589,14 +624,15 @@ export function assignmentsRoutes() {
 
     if (repId !== userId) {
       const managerId = String((req as any).authUserId || "").trim();
-      const visibility = await getManagerVisibility(supa, managerId);
-      const officeId = await getUserOffice(supa, managerId);
+      const managerContext = await getUserContext(supa, managerId);
 
-      if (managerId && visibility !== "company") {
-        q = q.eq("manager_id", managerId);
+      if (managerContext) {
+        if (isOfficeManager(managerContext)) {
+          q = q.eq("office_id", managerContext.office_id);
+        }
 
-        if (officeId) {
-          q = q.eq("office_id", officeId);
+        if (isCompanyManager(managerContext)) {
+          q = q.eq("company_id", managerContext.company_id);
         }
       }
     }
@@ -649,14 +685,15 @@ export function assignmentsRoutes() {
 
     if (repId !== userId) {
       const managerId = String((req as any).authUserId || "").trim();
-      const visibility = await getManagerVisibility(supa, managerId);
-      const officeId = await getUserOffice(supa, managerId);
+      const managerContext = await getUserContext(supa, managerId);
 
-      if (managerId && visibility !== "company") {
-        q = q.eq("manager_id", managerId);
+      if (managerContext) {
+        if (isOfficeManager(managerContext)) {
+          q = q.eq("office_id", managerContext.office_id);
+        }
 
-        if (officeId) {
-          q = q.eq("office_id", officeId);
+        if (isCompanyManager(managerContext)) {
+          q = q.eq("company_id", managerContext.company_id);
         }
       }
     }
@@ -815,13 +852,33 @@ export function assignmentsRoutes() {
     }
 
     // 🔥 STEP 4 — Final payload
-    const manager = await getManagerForRep(supa, rep_id);
-    const repOfficeId = await getUserOffice(supa, rep_id);
+    const managerContext = await getManagerForRep(supa, rep_id);
+    const manager = managerContext?.manager;
+
+    const hierarchy = await getUserHierarchy(supa, rep_id);
+
+    const repOfficeId = hierarchy?.office_id || null;
+    const repCompanyId = hierarchy?.company_id || null;
+
+    if (!repOfficeId) {
+      return res.status(400).json({
+        ok: false,
+        error: "rep_missing_office",
+      });
+    }
+
+    if (!repCompanyId) {
+      return res.status(400).json({
+        ok: false,
+        error: "rep_missing_company",
+      });
+    }
 
     const payload: any = {
       rep_id,
       manager_id: manager?.id || managerId,
       office_id: repOfficeId,
+      company_id: repCompanyId,
       type,
       title: cleanTitle,
       status: "assigned",
@@ -1284,8 +1341,7 @@ export function assignmentsRoutes() {
     const cursor = String((req.query.cursor as any) || "").trim();
     const [cursorCreatedAt, cursorId] = cursor ? cursor.split("|") : ["", ""];
 
-    const visibility = await getManagerVisibility(supa, managerId);
-    const officeId = await getUserOffice(supa, managerId);
+    const managerContext = await getUserContext(supa, managerId);
 
     let q = supa
       .from("assignments")
@@ -1293,11 +1349,13 @@ export function assignmentsRoutes() {
       .order("created_at", { ascending: false })
       .order("id", { ascending: false });
 
-    if (visibility !== "company") {
-      q = q.eq("manager_id", managerId);
+    if (managerContext) {
+      if (isOfficeManager(managerContext)) {
+        q = q.eq("office_id", managerContext.office_id);
+      }
 
-      if (officeId) {
-        q = q.eq("office_id", officeId);
+      if (isCompanyManager(managerContext)) {
+        q = q.eq("company_id", managerContext.company_id);
       }
     }
 
@@ -1644,10 +1702,16 @@ export function assignmentsRoutes() {
       if (!isManager) {
         q = q.eq("rep_id", userId);
       } else {
-        const visibility = await getManagerVisibility(supa, userId);
+        const managerContext = await getUserContext(supa, userId);
 
-        if (visibility !== "company") {
-          q = q.eq("manager_id", userId);
+        if (managerContext) {
+          if (isOfficeManager(managerContext)) {
+            q = q.eq("office_id", managerContext.office_id);
+          }
+
+          if (isCompanyManager(managerContext)) {
+            q = q.eq("company_id", managerContext.company_id);
+          }
         }
       }
 

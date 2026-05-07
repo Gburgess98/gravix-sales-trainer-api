@@ -4,10 +4,18 @@ import { Router } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { buildScoreSummaryBlocks } from "../lib/slackBlocks";
 import { getAdminConfig, patchAdminConfig } from "../services/adminConfig";
+import {
+  auditUserCreated,
+  writeAuditEvent,
+} from "../lib/audit";
 export const adminRouter = Router();
 
 // --- Roles (lean RBAC v1) -------------------------------------
-const ROLE_VALUES = ["SalesRep", "TeamLead", "Manager", "Owner"] as const;
+const ROLE_VALUES = [
+  "rep",
+  "office_manager",
+  "company_manager",
+] as const;
 type Role = (typeof ROLE_VALUES)[number];
 
 function isRole(x: any): x is Role {
@@ -15,7 +23,10 @@ function isRole(x: any): x is Role {
 }
 
 function isManagerRole(role: string | null | undefined) {
-  return role === "Manager" || role === "Owner";
+  return (
+  role === "office_manager" ||
+  role === "company_manager"
+);
 }
 
 // --- Manager gate (MVP RBAC) ----------------------------------------------
@@ -178,8 +189,17 @@ adminRouter.post("/users", requireManager, async (req: any, res: any) => {
       return res.status(400).json({ ok: false, error: "office_required" });
     }
 
-    if (!["rep", "manager", "admin"].includes(role)) {
-      return res.status(400).json({ ok: false, error: "invalid_role" });
+    if (
+      ![
+        "rep",
+        "office_manager",
+        "company_manager",
+      ].includes(role)
+    ) {
+      return res.status(400).json({
+        ok: false,
+        error: "invalid_role",
+      });
     }
     if (role === "rep" && !manager_id) {
       return res.status(400).json({
@@ -275,6 +295,16 @@ adminRouter.post("/users", requireManager, async (req: any, res: any) => {
       .single();
 
     if (error) throw error;
+
+    await writeAuditEvent(
+      supa,
+      auditUserCreated(
+        String((req as any).authUserId || requester || ""),
+        data.id,
+        data.company_id || null,
+        data.office_id || null
+      )
+    );
 
     return res.json({ ok: true, user: data });
   } catch (e: any) {

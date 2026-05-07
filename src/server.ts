@@ -15,6 +15,7 @@ import callsRouter from "./routes/calls";
 import pinsRouter from "./routes/pins";
 import crmRouter from "./routes/crm";
 import dashboardRoutes from "./routes/dashboard";
+import internalRoutes from "./routes/internal";
 import sparringRouter from "./routes/sparring";
 
 import coachRoutes from "./routes/coach";
@@ -228,6 +229,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 app.use("/v1/dashboard", dashboardRoutes);
+app.use("/v1/internal", internalRoutes);
 
 // --- Dashboard: Leaderboard (top reps by avg score) ---
 app.get("/v1/dashboard/leaderboard", async (req, res) => {

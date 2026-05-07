@@ -1,5 +1,10 @@
 import { Router } from 'express';
 import { createClient } from '@supabase/supabase-js';
+import {
+  isCompanyManager,
+  isOfficeManager,
+  type UserContext,
+} from '../lib/permissions.ts';
 
 const router = Router();
 
@@ -20,6 +25,41 @@ const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
 const sbAdmin = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
   ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
   : null;
+
+// User context helper for hierarchy filtering
+async function getUserContext(db: any, userId: string): Promise<UserContext | null> {
+  if (!userId) return null;
+
+  const { data } = await db
+    .from('users')
+    .select('id, role, office_id, company_id, is_admin')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (!data) return null;
+
+  return {
+    id: String(data.id),
+    role: String(data.role || 'rep'),
+    office_id: data.office_id || null,
+    company_id: data.company_id || null,
+    is_admin: Boolean(data.is_admin),
+  };
+}
+
+function applyHierarchyFilters(query: any, user: UserContext | null) {
+  if (!user) return query;
+
+  if (isOfficeManager(user)) {
+    return query.eq('office_id', user.office_id);
+  }
+
+  if (isCompanyManager(user)) {
+    return query.eq('company_id', user.company_id);
+  }
+
+  return query;
+}
 
 function isoDaysAgo(days: number) {
   const d = new Date();
@@ -169,6 +209,7 @@ router.get('/kpis', async (req, res) => {
     const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? '90'), 10) || 90));
     const since = isoDaysAgo(days);
     const orgId = (req.query.orgId ? String(req.query.orgId) : '').trim();
+    const userId = String((req as any).authUserId || '').trim();
 
     // Defaults keep UI rendering even if queries fail
     let total_calls = 0;
@@ -188,10 +229,13 @@ router.get('/kpis', async (req, res) => {
 
     let callQuery = db
       .from('calls')
-      .select('id, created_at, status, score_overall, account_id, user_id, org_id', { count: 'exact' })
+      .select('id, created_at, status, score_overall, account_id, user_id, org_id, office_id, company_id', { count: 'exact' })
       .gte('created_at', since)
       .limit(50000);
     if (orgId) callQuery = callQuery.eq('org_id', orgId);
+
+    const userContext = await getUserContext(db, userId);
+    callQuery = applyHierarchyFilters(callQuery, userContext);
 
     const { data: calls, error: callsErr, count } = await callQuery;
     const supportsWon = Array.isArray(calls) && calls.some((c: any) => typeof (c as any).won !== 'undefined');
@@ -548,16 +592,20 @@ router.get('/reporting-summary', async (req, res) => {
     const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? '7'), 10) || 7));
     const since = isoDaysAgo(days);
     const orgId = (req.query.orgId ? String(req.query.orgId) : '').trim();
+    const userId = String((req as any).authUserId || '').trim();
     const db = sbAdmin ?? supabase;
     if (!db) throw new Error('No Supabase client available');
 
     let callsQuery = db
       .from('calls')
-      .select('id,user_id,org_id,created_at,score_overall,analysis_json')
+      .select('id,user_id,org_id,office_id,company_id,created_at,score_overall,analysis_json')
       .gte('created_at', since)
       .order('created_at', { ascending: false })
       .limit(50000);
     if (orgId) callsQuery = callsQuery.eq('org_id', orgId);
+
+    const userContext = await getUserContext(db, userId);
+    callsQuery = applyHierarchyFilters(callsQuery, userContext);
 
     const { data: calls, error: callsErr } = await callsQuery;
     if (callsErr) throw callsErr;
@@ -782,15 +830,19 @@ router.get('/leaderboard', async (req, res) => {
     const minCalls = Math.max(0, Math.min(1000, parseInt(String(req.query.minCalls ?? '3'), 10) || 3));
     const since = isoDaysAgo(days);
     const orgId = (req.query.orgId ? String(req.query.orgId) : '').trim();
+    const userId = String((req as any).authUserId || '').trim();
 
     // Pull all scored calls since cutoff; aggregate in Node for portability
     let callQuery = supabase
       .from('calls')
-      .select('user_id, score_overall, created_at, org_id')
+      .select('user_id, score_overall, created_at, org_id, office_id, company_id')
       .gte('created_at', since)
       .not('score_overall', 'is', null)
       .limit(50000);
     if (orgId) callQuery = callQuery.eq('org_id', orgId);
+
+    const userContext = await getUserContext(supabase, userId);
+    callQuery = applyHierarchyFilters(callQuery, userContext);
     const { data: calls, error: callsErr } = await callQuery;
 
     if (callsErr) throw callsErr;
@@ -903,7 +955,7 @@ router.get('/rep-summary', async (req, res) => {
     // Calls for this rep (last N days)
     let callsQ = supabase
       .from('calls')
-      .select('id, account_id, score_overall, created_at, org_id')
+      .select('id, account_id, score_overall, created_at, org_id, office_id, company_id')
       .eq('user_id', userId)
       .gte('created_at', since)
       .order('created_at', { ascending: false })
@@ -998,7 +1050,7 @@ router.get('/voice-score-summary', async (req, res) => {
 
     let q = supabase
       .from('call_scores')
-      .select('call_id, user_id, created_at, rubric')
+      .select('call_id, user_id, created_at, rubric, office_id, company_id')
       .gte('created_at', since)
       .order('created_at', { ascending: false })
       .limit(10000);
@@ -1090,7 +1142,7 @@ router.get('/voice-score-trend', async (req, res) => {
     // dedicated columns do not exist on calls yet.
     let q = supabase
       .from('call_scores')
-      .select('call_id, user_id, created_at, rubric')
+      .select('call_id, user_id, created_at, rubric, office_id, company_id')
       .gte('created_at', since)
       .order('created_at', { ascending: true })
       .limit(10000);
