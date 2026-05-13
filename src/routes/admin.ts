@@ -16,10 +16,36 @@ const ROLE_VALUES = [
   "office_manager",
   "company_manager",
 ] as const;
+
 type Role = (typeof ROLE_VALUES)[number];
+
+type PersonaConfigPayload = {
+  buyer_style?: string | null;
+  industry_preset?: string | null;
+  objection_patterns?: string[];
+  competitor_names?: string[];
+  common_pushbacks?: string[];
+  persona_memory?: string[];
+  emotional_tuning?: {
+    pressure_level?: number;
+    trust_decay?: number;
+    objection_aggression?: number;
+  };
+};
 
 function isRole(x: any): x is Role {
   return typeof x === "string" && (ROLE_VALUES as readonly string[]).includes(x);
+}
+
+function normaliseStringArray(input: any): string[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  return input
+    .map((x) => String(x || "").trim())
+    .filter(Boolean)
+    .slice(0, 100);
 }
 
 function isManagerRole(role: string | null | undefined) {
@@ -846,3 +872,230 @@ adminRouter.patch("/reps/:id", requireManager, async (req: any, res: any) => {
 });
 
 export default adminRouter;
+
+/* ----------------------------------------------------------------
+   GET /v1/admin/persona-config
+----------------------------------------------------------------- */
+adminRouter.get(
+  "/persona-config",
+  requireManager,
+  async (req: any, res: any) => {
+    try {
+      const requester = String(req.header("x-user-id") || "").trim();
+
+      const supa = createClient(
+        process.env.SUPABASE_URL!,
+        process.env.SUPABASE_SERVICE_ROLE_KEY!
+      );
+
+      const { data: requesterUser } = await supa
+        .from("users")
+        .select("company_id")
+        .eq("id", requester)
+        .maybeSingle();
+
+      const companyId = requesterUser?.company_id;
+
+      if (!companyId) {
+        return res.status(403).json({
+          ok: false,
+          error: "missing_company_context",
+        });
+      }
+
+      const { data: company, error } = await supa
+        .from("companies")
+        .select("id, name, settings")
+        .eq("id", companyId)
+        .single();
+
+      if (error || !company) {
+        return res.status(404).json({
+          ok: false,
+          error: "company_not_found",
+        });
+      }
+
+      const settings =
+        company.settings && typeof company.settings === "object"
+          ? company.settings
+          : {};
+
+      return res.json({
+        ok: true,
+        company_id: company.id,
+        company_name: company.name,
+        config: {
+          buyer_style: settings.buyer_style || null,
+          industry_preset: settings.industry_preset || null,
+          objection_patterns: Array.isArray(settings.objection_patterns)
+            ? settings.objection_patterns
+            : [],
+          competitor_names: Array.isArray(settings.competitor_names)
+            ? settings.competitor_names
+            : [],
+          common_pushbacks: Array.isArray(settings.common_pushbacks)
+            ? settings.common_pushbacks
+            : [],
+          persona_memory: Array.isArray(settings.persona_memory)
+            ? settings.persona_memory
+            : [],
+          emotional_tuning:
+            settings.emotional_tuning &&
+            typeof settings.emotional_tuning === "object"
+              ? settings.emotional_tuning
+              : {
+                  pressure_level: 50,
+                  trust_decay: 50,
+                  objection_aggression: 50,
+                },
+        },
+      });
+    } catch (e: any) {
+      console.error("[persona-config:get]", e);
+
+      return res.status(500).json({
+        ok: false,
+        error: e?.message || "persona_config_load_failed",
+      });
+    }
+  }
+);
+
+/* ----------------------------------------------------------------
+   PATCH /v1/admin/persona-config
+----------------------------------------------------------------- */
+adminRouter.patch(
+  "/persona-config",
+  requireManager,
+  async (req: any, res: any) => {
+    try {
+      const requester = String(req.header("x-user-id") || "").trim();
+
+      const body = (req.body || {}) as PersonaConfigPayload;
+
+      const supa = createClient(
+        process.env.SUPABASE_URL!,
+        process.env.SUPABASE_SERVICE_ROLE_KEY!
+      );
+
+      const { data: requesterUser } = await supa
+        .from("users")
+        .select("company_id")
+        .eq("id", requester)
+        .maybeSingle();
+
+      const companyId = requesterUser?.company_id;
+
+      if (!companyId) {
+        return res.status(403).json({
+          ok: false,
+          error: "missing_company_context",
+        });
+      }
+
+      const { data: existingCompany } = await supa
+        .from("companies")
+        .select("settings")
+        .eq("id", companyId)
+        .maybeSingle();
+
+      const existingSettings =
+        existingCompany?.settings &&
+        typeof existingCompany.settings === "object"
+          ? existingCompany.settings
+          : {};
+
+      const mergedSettings = {
+        ...existingSettings,
+
+        buyer_style:
+          typeof body.buyer_style === "string"
+            ? body.buyer_style.trim()
+            : existingSettings.buyer_style || null,
+
+        industry_preset:
+          typeof body.industry_preset === "string"
+            ? body.industry_preset.trim()
+            : existingSettings.industry_preset || null,
+
+        objection_patterns: normaliseStringArray(
+          body.objection_patterns
+        ),
+
+        competitor_names: normaliseStringArray(
+          body.competitor_names
+        ),
+
+        common_pushbacks: normaliseStringArray(
+          body.common_pushbacks
+        ),
+
+        persona_memory: normaliseStringArray(
+          body.persona_memory
+        ),
+
+        emotional_tuning: {
+          pressure_level: Number(
+            body.emotional_tuning?.pressure_level ?? 50
+          ),
+          trust_decay: Number(
+            body.emotional_tuning?.trust_decay ?? 50
+          ),
+          objection_aggression: Number(
+            body.emotional_tuning?.objection_aggression ?? 50
+          ),
+        },
+      };
+
+      const { data: updatedCompany, error } = await supa
+        .from("companies")
+        .update({
+          settings: mergedSettings,
+        })
+        .eq("id", companyId)
+        .select("id, name, settings")
+        .single();
+
+      if (error || !updatedCompany) {
+        return res.status(500).json({
+          ok: false,
+          error: error?.message || "persona_config_update_failed",
+        });
+      }
+
+      await writeAuditEvent(
+        supa,
+        {
+          actor_user_id: requester,
+          event_type: "persona_config_updated",
+          entity_type: "company",
+          entity_id: companyId,
+          company_id: companyId,
+          office_id: null,
+          metadata: {
+            buyer_style: mergedSettings.buyer_style,
+            industry_preset: mergedSettings.industry_preset,
+            objection_count:
+              mergedSettings.objection_patterns.length,
+            memory_count:
+              mergedSettings.persona_memory.length,
+          },
+        } as any
+      );
+
+      return res.json({
+        ok: true,
+        company: updatedCompany,
+        config: updatedCompany.settings,
+      });
+    } catch (e: any) {
+      console.error("[persona-config:patch]", e);
+
+      return res.status(500).json({
+        ok: false,
+        error: e?.message || "persona_config_patch_failed",
+      });
+    }
+  }
+);

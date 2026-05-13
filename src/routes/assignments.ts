@@ -730,16 +730,28 @@ export function assignmentsRoutes() {
       rep_id,
       type,
       target_id,
+      target,
       title,
       due_at,
       source,
-      meta
+      notes,
+      meta,
     } = req.body ?? {};
 
     if (!rep_id || typeof rep_id !== "string") {
       return res.status(400).json({ ok: false, error: "rep_id_required" });
     }
-    if (!type || typeof type !== "string" || !["call_review", "sparring", "custom"].includes(type)) {
+    if (
+      !type ||
+      typeof type !== "string" ||
+      ![
+        "call_review",
+        "sparring",
+        "custom",
+        "drill",
+        "replay",
+      ].includes(type)
+    ) {
       return res.status(400).json({ ok: false, error: "invalid_type" });
     }
 
@@ -757,6 +769,14 @@ export function assignmentsRoutes() {
       return res.status(400).json({ ok: false, error: "target_id_must_be_string" });
     }
 
+    if (target !== undefined && target !== null && typeof target !== "string") {
+      return res.status(400).json({ ok: false, error: "target_must_be_string" });
+    }
+
+    if (notes !== undefined && notes !== null && typeof notes !== "string") {
+      return res.status(400).json({ ok: false, error: "notes_must_be_string" });
+    }
+
     let cleanDueAt: string | null = null;
     if (due_at !== undefined && due_at !== null) {
       if (typeof due_at !== "string") {
@@ -770,6 +790,16 @@ export function assignmentsRoutes() {
     }
 
     const safeMeta = typeof meta === "object" && meta ? meta : {};
+
+    const cleanNotes =
+      typeof notes === "string"
+        ? notes.trim().slice(0, 4000)
+        : null;
+
+    const cleanTarget =
+      typeof target === "string"
+        ? target.trim().slice(0, 1000)
+        : null;
 
     // 🧠 ADVANCED MEMORY-BASED DIFFICULTY
     let difficulty = "easy";
@@ -881,6 +911,7 @@ export function assignmentsRoutes() {
       company_id: repCompanyId,
       type,
       title: cleanTitle,
+      due_at: cleanDueAt,
       status: "assigned",
       source: source || safeMeta?.assignment_origin || "manual",
       meta: {
@@ -910,10 +941,38 @@ export function assignmentsRoutes() {
           difficulty,
           scenario_seed: `${safeMeta?.flag_section || "general"}_${Date.now()}`
         },
+
+        // 🚀 COACHING ASSIGNMENT INTELLIGENCE
+        coaching_notes: cleanNotes,
+        coaching_target: cleanTarget,
+        coaching_assignment_type: type,
+
+        replay_context:
+          type === "replay"
+            ? {
+              replay_call_id: cleanTarget,
+              replay_reason:
+                safeMeta?.replay_reason ||
+                "Replay failed sales moment",
+            }
+            : null,
+
+        drill_context:
+          type === "drill"
+            ? {
+              drill_name: cleanTarget,
+              drill_focus:
+                safeMeta?.flag_section || "general",
+              adaptive_difficulty: difficulty,
+            }
+            : null,
       },
     };
 
     if (target_id !== undefined) payload.target_id = target_id;
+    if (cleanTarget && !payload.target_id) {
+      payload.target_id = cleanTarget;
+    }
     if (cleanDueAt) payload.due_at = cleanDueAt;
 
     const { data, error } = await supa

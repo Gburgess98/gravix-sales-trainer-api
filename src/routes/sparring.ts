@@ -169,6 +169,23 @@ function containsAny(text: string, needles: string[]) {
   return needles.some((n) => t.includes(n));
 }
 
+type FailedMoment = {
+  turn: number;
+  reason: string;
+  buyer_message: string;
+  rep_response: string;
+  score: number;
+  created_at: string;
+};
+
+type ReplayState = {
+  source_session_id: string;
+  source_turn: number;
+  source_reason: string;
+  replay_started_at: string;
+  replay_attempt: number;
+};
+
 type MicroScore = {
   turn_score: number;
   micro_breakdown: {
@@ -257,6 +274,54 @@ function scoreRepTurnHeuristic(repText: string, buyerText: string): MicroScore {
     },
     coach_note,
     flags,
+  };
+}
+
+function buildFailedMoment(opts: {
+  turnNumber: number;
+  repText: string;
+  buyerText: string;
+  micro: MicroScore;
+}): FailedMoment | null {
+  const { turnNumber, repText, buyerText, micro } = opts;
+
+  if (micro.turn_score >= 55) {
+    return null;
+  }
+
+  let reason = "weak_response";
+
+  if (micro.flags.includes("missed_price_objection")) {
+    reason = "missed_price_objection";
+  } else if (micro.flags.includes("stall_not_addressed")) {
+    reason = "stall_not_addressed";
+  } else if (micro.flags.includes("price_without_value")) {
+    reason = "price_without_value";
+  } else if (micro.flags.includes("too_short")) {
+    reason = "weak_confidence";
+  }
+
+  return {
+    turn: turnNumber,
+    reason,
+    buyer_message: buyerText,
+    rep_response: repText,
+    score: micro.turn_score,
+    created_at: new Date().toISOString(),
+  };
+}
+
+function buildReplayState(opts: {
+  sourceSessionId: string;
+  failedMoment: FailedMoment;
+  existingAttempts?: number;
+}): ReplayState {
+  return {
+    source_session_id: opts.sourceSessionId,
+    source_turn: opts.failedMoment.turn,
+    source_reason: opts.failedMoment.reason,
+    replay_started_at: new Date().toISOString(),
+    replay_attempt: (opts.existingAttempts || 0) + 1,
   };
 }
 
@@ -545,6 +610,9 @@ function shouldAutoHangUp(opts: {
   const anger = emotionalState?.anger ?? 0;
   const boredom = emotionalState?.boredom ?? 0;
   const trust = emotionalState?.trust ?? 0;
+  const weakness = {
+    vague: false,
+  };
 
   // Emotion-driven early exits
   // High anger → rage hang-up
@@ -862,6 +930,360 @@ async function loadTeamSettingsSnapshot(orgId: string | null) {
   };
 }
 
+
+// ==== COMPANY PERSONA PROFILE HELPERS ====
+type CompanyPersonaProfile = {
+  company_name?: string | null;
+  industry?: string | null;
+  buyer_style?: string | null;
+  industry_preset?: string | null;
+  objection_patterns?: string[];
+  competitor_names?: string[];
+  common_pushbacks?: string[];
+  persona_memory?: string[];
+  emotional_tuning?: {
+    pressure_level?: number;
+    trust_decay?: number;
+    objection_aggression?: number;
+  } | null;
+};
+
+async function loadCompanyPersonaProfile(opts: {
+  companyId?: string | null;
+  officeId?: string | null;
+}) {
+  const emptyProfile: CompanyPersonaProfile = {
+    company_name: null,
+    industry: null,
+    buyer_style: null,
+    industry_preset: null,
+    objection_patterns: [],
+    competitor_names: [],
+    common_pushbacks: [],
+    persona_memory: [],
+    emotional_tuning: null,
+  };
+
+  try {
+    if (!opts.companyId) {
+      return emptyProfile;
+    }
+
+    const { data, error } = await supa
+      .from("companies")
+      .select(`
+        id,
+        name,
+        industry,
+        settings
+      `)
+      .eq("id", opts.companyId)
+      .single();
+
+    if (error || !data) {
+      return emptyProfile;
+    }
+
+    const settings =
+      data.settings && typeof data.settings === "object"
+        ? data.settings
+        : {};
+
+    return {
+      company_name: data.name || null,
+      industry: data.industry || null,
+      buyer_style:
+        typeof settings.buyer_style === "string"
+          ? settings.buyer_style
+          : null,
+      industry_preset:
+        typeof settings.industry_preset === "string"
+          ? settings.industry_preset
+          : null,
+      emotional_tuning:
+        settings.emotional_tuning &&
+          typeof settings.emotional_tuning === "object"
+          ? settings.emotional_tuning
+          : {
+            pressure_level: 50,
+            trust_decay: 50,
+            objection_aggression: 50,
+          },
+      objection_patterns: Array.isArray(settings.objection_patterns)
+        ? settings.objection_patterns
+        : [],
+      competitor_names: Array.isArray(settings.competitor_names)
+        ? settings.competitor_names
+        : [],
+      common_pushbacks: Array.isArray(settings.common_pushbacks)
+        ? settings.common_pushbacks
+        : [],
+      persona_memory: Array.isArray(settings.persona_memory)
+        ? settings.persona_memory
+        : [],
+    };
+  } catch (e) {
+    console.warn("[persona_profile_load_failed]", e);
+    return emptyProfile;
+  }
+}
+
+
+function computeAdaptiveDifficulty(opts: {
+  requestedDifficulty?: string | null;
+  emotionalTuning?: {
+    pressure_level?: number;
+    trust_decay?: number;
+    objection_aggression?: number;
+  } | null;
+}) {
+  const requested = String(opts.requestedDifficulty || "normal").toLowerCase();
+
+  const pressure = Number(opts.emotionalTuning?.pressure_level ?? 50);
+  const aggression = Number(
+    opts.emotionalTuning?.objection_aggression ?? 50
+  );
+
+  let baseline = requested;
+
+  if (
+    requested === "normal" &&
+    (pressure >= 75 || aggression >= 75)
+  ) {
+    baseline = "hard";
+  }
+
+  if (
+    requested === "hard" &&
+    pressure >= 90 &&
+    aggression >= 90
+  ) {
+    baseline = "nightmare";
+  }
+
+  return {
+    requested,
+    effective: baseline,
+    pressure,
+    aggression,
+  };
+}
+
+
+// ==== BEHAVIOURAL ANALYTICS TYPES + HELPERS ====
+type ReplayComparison = {
+  original_session_id: string | null;
+  replay_attempt: number;
+  original_score: number | null;
+  replay_score: number | null;
+  score_delta: number | null;
+  trust_recovery_delta: number | null;
+  anger_reduction_delta: number | null;
+  objection_improvement_delta: number | null;
+  replay_improvement_score: number | null;
+  confidence_recovery_detected: boolean;
+};
+
+type BehaviourDiagnostics = {
+  trustCollapseDetected: boolean;
+  angerSpikeDetected: boolean;
+  disengagedDetected: boolean;
+  escalationScore: number;
+  strongestEmotion: "anger" | "boredom" | "trust" | "balanced";
+  recoveryDetected: boolean;
+};
+
+function buildBehaviourDiagnostics(opts: {
+  emotionalTimeline?: any[];
+  objectionHistory?: any[];
+}) : BehaviourDiagnostics {
+  const timeline = Array.isArray(opts.emotionalTimeline)
+    ? opts.emotionalTimeline
+    : [];
+
+  const objections = Array.isArray(opts.objectionHistory)
+    ? opts.objectionHistory
+    : [];
+
+  const latest = timeline[timeline.length - 1] || {};
+
+  const anger = Number(latest.anger || 0);
+  const boredom = Number(latest.boredom || 0);
+  const trust = Number(latest.trust || 0);
+
+  let strongestEmotion: BehaviourDiagnostics["strongestEmotion"] = "balanced";
+
+  if (anger > boredom && anger > trust) {
+    strongestEmotion = "anger";
+  } else if (boredom > anger && boredom > trust) {
+    strongestEmotion = "boredom";
+  } else if (trust > anger && trust > boredom) {
+    strongestEmotion = "trust";
+  }
+
+  const escalationScore = Math.min(
+    100,
+    Math.round(
+      objections.length * 12 +
+      anger * 0.35 +
+      boredom * 0.2
+    )
+  );
+
+  const recoveryDetected = timeline.some((x: any) => {
+    const t = Number(x?.trust || 0);
+    return t >= 60;
+  });
+
+  return {
+    trustCollapseDetected: trust <= 25,
+    angerSpikeDetected: anger >= 75,
+    disengagedDetected: boredom >= 75,
+    escalationScore,
+    strongestEmotion,
+    recoveryDetected,
+  };
+}
+
+function buildCoachingInsights(opts: {
+  diagnostics: BehaviourDiagnostics;
+  objectionHistory?: any[];
+  failedMoments?: any[];
+}) {
+  const insights: string[] = [];
+
+  const diagnostics = opts.diagnostics;
+
+  if (diagnostics.trustCollapseDetected) {
+    insights.push(
+      "Buyer trust collapsed during the conversation. Rep likely failed to anchor value or build confidence."
+    );
+  }
+
+  if (diagnostics.angerSpikeDetected) {
+    insights.push(
+      "Buyer frustration escalated aggressively. Rep may have pushed too hard or failed to handle objections calmly."
+    );
+  }
+
+  if (diagnostics.disengagedDetected) {
+    insights.push(
+      "Buyer disengagement detected. Rep likely lost conversational control or failed discovery."
+    );
+  }
+
+  if (diagnostics.recoveryDetected) {
+    insights.push(
+      "Rep successfully recovered buyer trust at certain points in the conversation."
+    );
+  }
+
+  const objections = Array.isArray(opts.objectionHistory)
+    ? opts.objectionHistory
+    : [];
+
+  if (objections.length >= 3) {
+    insights.push(
+      "Multiple objections stacked during the call. Rep struggled under sustained pressure."
+    );
+  }
+
+  const failed = Array.isArray(opts.failedMoments)
+    ? opts.failedMoments
+    : [];
+
+  if (failed.length >= 2) {
+    insights.push(
+      "Repeated weak moments detected. Recommend replay drills focused on objection handling and confidence control."
+    );
+  }
+
+  return insights;
+}
+
+function buildReplayComparison(opts: {
+  currentSession: any;
+  replayState?: any;
+  emotionalTimeline?: any[];
+  objectionHistory?: any[];
+  failedMoments?: any[];
+}) : ReplayComparison {
+  const replay = opts.replayState || null;
+
+  const latestEmotion = Array.isArray(opts.emotionalTimeline)
+    ? opts.emotionalTimeline[opts.emotionalTimeline.length - 1] || {}
+    : {};
+
+  const trust = Number(latestEmotion?.trust || 0);
+  const anger = Number(latestEmotion?.anger || 0);
+
+  const replayScore = Number(opts.currentSession?.total_score || 0);
+
+  const originalScore = Number(
+    replay?.original_score ||
+    replay?.source_score ||
+    0
+  );
+
+  const scoreDelta =
+    replayScore && originalScore
+      ? replayScore - originalScore
+      : null;
+
+  const trustRecoveryDelta = trust - 25;
+  const angerReductionDelta = 75 - anger;
+
+  const objectionImprovementDelta = Math.max(
+    0,
+    100 - ((opts.objectionHistory || []).length * 12)
+  );
+
+  const replayImprovementScore = Math.max(
+    0,
+    Math.min(
+      100,
+      Math.round(
+        (scoreDelta || 0) * 1.4 +
+        trustRecoveryDelta * 0.45 +
+        angerReductionDelta * 0.25 +
+        objectionImprovementDelta * 0.2
+      )
+    )
+  );
+
+  return {
+    original_session_id:
+      replay?.source_session_id || null,
+
+    replay_attempt:
+      Number(replay?.replay_attempt || 0),
+
+    original_score:
+      originalScore || null,
+
+    replay_score:
+      replayScore || null,
+
+    score_delta:
+      scoreDelta,
+
+    trust_recovery_delta:
+      trustRecoveryDelta,
+
+    anger_reduction_delta:
+      angerReductionDelta,
+
+    objection_improvement_delta:
+      objectionImprovementDelta,
+
+    replay_improvement_score:
+      replayImprovementScore,
+
+    confidence_recovery_detected:
+      trust >= 60 && anger <= 40,
+  };
+}
+
 const router = express.Router();
 
 function buildDynamicScenario(opts: {
@@ -966,6 +1388,12 @@ function buildPersonaSystemPrompt(opts: {
   difficulty?: string | null;
   dynamicScenario?: string | null;
   stackedObjection?: string | null;
+  replayContext?: any;
+  companyProfile?: CompanyPersonaProfile | null;
+  buyerStyle?: string | null;
+  emotionalState?: EmotionalState | null;
+  failures?: number;
+  section?: string | null;
 }) {
   const mode = opts.mode || "standard";
   const personaId = opts.personaId || "price_sensitive";
@@ -1051,6 +1479,91 @@ Your goal is to expose weakness.
         ? "Difficulty: HARD. You are sceptical and demanding. Raise serious objections and require strong justification."
         : "Difficulty: NORMAL. You behave like a typical, slightly cautious buyer.";
 
+  const companyProfile = opts.companyProfile || null;
+
+  const buyerStyleBlock = opts.buyerStyle
+    ? `
+=== BUYER STYLE ===
+Buyer style: ${opts.buyerStyle}
+
+You MUST embody this buyer style consistently.
+`
+    : "";
+
+  const companyBlock = companyProfile
+    ? `
+=== COMPANY CONTEXT ===
+Company: ${companyProfile.company_name || "Unknown"}
+Industry: ${companyProfile.industry || "General"}
+
+Common objections:
+${(companyProfile.objection_patterns || []).map((x) => `- ${x}`).join("\n")}
+
+Competitors:
+${(companyProfile.competitor_names || []).map((x) => `- ${x}`).join("\n")}
+
+Typical pushbacks:
+${(companyProfile.common_pushbacks || []).map((x) => `- ${x}`).join("\n")}
+
+Persona memory:
+${(companyProfile.persona_memory || []).map((x) => `- ${x}`).join("\n")}
+`
+    : "";
+
+  const emotionalPressureBlock = opts.emotionalState
+    ? `
+=== LIVE EMOTIONAL STATE ===
+Anger: ${opts.emotionalState.anger}/100
+Boredom: ${opts.emotionalState.boredom}/100
+Trust: ${opts.emotionalState.trust}/100
+
+If anger is high:
+- interrupt more
+- challenge harder
+- lose patience faster
+
+If boredom is high:
+- shorten responses
+- disengage
+- become dismissive
+
+If trust is high:
+- slowly open up
+- provide more information
+- soften resistance slightly
+`
+    : "";
+
+  const replayBlock = opts.replayContext
+    ? `
+=== FAILURE REPLAY MODE ===
+This is a replay coaching scenario.
+
+The rep PREVIOUSLY FAILED this exact moment.
+
+Original buyer objection:
+"${opts.replayContext.buyer_message}"
+
+Previous failed rep response:
+"${opts.replayContext.previous_rep_response}"
+
+Failure reason:
+${opts.replayContext.failure_reason}
+
+Original score:
+${opts.replayContext.original_score}/100
+
+YOU MUST:
+- challenge weak answers harder than before
+- punish repeated weak behaviour
+- compare current answers against the failed attempt
+- only reward genuine improvement
+- pressure the rep more aggressively if they repeat mistakes
+- test confidence harder than normal
+- escalate objections faster if the rep stays vague
+`
+    : "";
+
   const scenarioBlock = opts.dynamicScenario
     ? `
 === REAL FAILURE CONTEXT ===
@@ -1073,6 +1586,20 @@ Stack it with previous objections.
 `
     : "";
 
+  const adaptivePressureBlock = opts.failures && opts.failures >= 2
+    ? `
+=== ADAPTIVE PRESSURE ===
+The rep has repeatedly struggled.
+
+You MUST:
+- escalate objections faster
+- stack multiple objections together
+- reduce trust aggressively
+- punish generic sales language
+- become more emotionally difficult
+`
+    : "";
+
   // 🔥 PERSONA MUTATION (CRITICAL)
   const mutation = getPersonaMutationState(personaId, difficulty);
   const mutationBlock = `
@@ -1092,7 +1619,13 @@ You MUST reflect this in behaviour:
   return `
 You are role-playing as a sales prospect in a training drill.
 
+${companyBlock}
+${buyerStyleBlock}
+${emotionalPressureBlock}
+${replayBlock}
 ${scenarioBlock}
+${stackedBlock}
+${adaptivePressureBlock}
 ${mutationBlock}
 ${pressureBlock}
 
@@ -1117,6 +1650,137 @@ Rules:
 This must feel like a REAL buyer, not a simulation.
 `.trim();
 }
+
+// === Behavioural Analytics Endpoint ===
+router.get('/sessions/:id/analytics', async (req: Request, res: Response) => {
+  try {
+    const sessionId = String(req.params.id || '').trim();
+
+    if (!sessionId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_session_id',
+      });
+    }
+
+    const { data: session, error } = await supa
+      .from('sparring_sessions')
+      .select(`
+        id,
+        rep_id,
+        persona_id,
+        difficulty,
+        total_score,
+        created_at,
+        meta
+      `)
+      .eq('id', sessionId)
+      .single();
+
+    if (error || !session) {
+      return res.status(404).json({
+        ok: false,
+        error: 'session_not_found',
+      });
+    }
+
+    const meta =
+      session.meta && typeof session.meta === 'object'
+        ? session.meta
+        : {};
+
+    const emotionalTimeline = Array.isArray(meta.emotional_timeline)
+      ? meta.emotional_timeline
+      : [];
+
+    const objectionHistory = Array.isArray(meta.objection_history)
+      ? meta.objection_history
+      : [];
+
+    const failedMoments = Array.isArray(meta.failed_moments)
+      ? meta.failed_moments
+      : [];
+
+    const diagnostics = buildBehaviourDiagnostics({
+      emotionalTimeline,
+      objectionHistory,
+    });
+
+    const coachingInsights = buildCoachingInsights({
+      diagnostics,
+      objectionHistory,
+      failedMoments,
+    });
+
+    const replayComparison = buildReplayComparison({
+      currentSession: session,
+      replayState: meta.replay_state || null,
+      emotionalTimeline,
+      objectionHistory,
+      failedMoments,
+    });
+
+    return res.json({
+      ok: true,
+
+      analytics: {
+        session: {
+          id: session.id,
+          rep_id: session.rep_id,
+          persona_id: session.persona_id,
+          difficulty: session.difficulty,
+          total_score: session.total_score,
+          created_at: session.created_at,
+        },
+
+        diagnostics,
+
+        emotional_timeline: emotionalTimeline,
+
+        objection_history: objectionHistory,
+
+        failed_moments: failedMoments,
+
+        coaching_insights: coachingInsights,
+
+        replay_comparison: replayComparison,
+
+        coaching_progression: {
+          replay_attempt:
+            replayComparison.replay_attempt,
+
+          confidence_recovery_detected:
+            replayComparison.confidence_recovery_detected,
+
+          improvement_detected:
+            (replayComparison.score_delta || 0) > 0,
+
+          trust_recovery_delta:
+            replayComparison.trust_recovery_delta,
+
+          replay_improvement_score:
+            replayComparison.replay_improvement_score,
+        },
+
+        analytics_state:
+          meta.analytics_state || {},
+
+        replay_state:
+          meta.replay_state || null,
+
+        company_profile:
+          meta.company_persona_profile || null,
+      },
+    });
+  } catch (e: any) {
+    console.error('[sparring.analytics] failed', e);
+
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || 'analytics_failed',
+    });
+  }
+});
 
 // List available sparring personas (global presets for now)
 router.get("/personas", async (_req, res) => {
@@ -1837,6 +2501,30 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
     const orgId = getOrgIdFromRequest(req);
     const teamSettingsSnapshot = await loadTeamSettingsSnapshot(orgId);
 
+    let requesterUser: any = null;
+
+    try {
+      const { data } = await supa
+        .from("users")
+        .select("company_id, office_id")
+        .eq("id", effectiveRepId)
+        .maybeSingle();
+
+      requesterUser = data || null;
+    } catch (e) {
+      console.warn("[sparring] failed loading requester user", e);
+    }
+
+    const companyProfile = await loadCompanyPersonaProfile({
+      companyId: requesterUser?.company_id || null,
+      officeId: requesterUser?.office_id || null,
+    });
+
+    const adaptiveDifficulty = computeAdaptiveDifficulty({
+      requestedDifficulty: difficulty || "normal",
+      emotionalTuning: companyProfile.emotional_tuning || null,
+    });
+
     const sessionId = uuidv4();
 
     let dynamicScenario: string | null = null;
@@ -1873,10 +2561,50 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
       id: sessionId,
       rep_id: effectiveRepId,
       persona_id: personaId || 'price_sensitive',
-      difficulty: difficulty || 'normal',
+      difficulty: adaptiveDifficulty.effective || difficulty || 'normal',
       meta: {
         personaId: personaId || "price_sensitive",
-        difficulty: difficulty || "normal",
+        difficulty: adaptiveDifficulty.effective || difficulty || "normal",
+
+        requested_difficulty: difficulty || "normal",
+        adaptive_difficulty: adaptiveDifficulty,
+
+        company_id: requesterUser?.company_id || null,
+        office_id: requesterUser?.office_id || null,
+
+        buyer_style:
+          companyProfile.buyer_style ||
+          companyProfile.industry_preset ||
+          "default",
+
+        company_persona_profile: {
+          company_name: companyProfile.company_name || null,
+          industry: companyProfile.industry || null,
+          industry_preset: companyProfile.industry_preset || null,
+          buyer_style: companyProfile.buyer_style || null,
+        },
+
+        emotional_tuning:
+          companyProfile.emotional_tuning || {
+            pressure_level: 50,
+            trust_decay: 50,
+            objection_aggression: 50,
+          },
+
+        objection_library: {
+          objection_patterns:
+            companyProfile.objection_patterns || [],
+          competitor_names:
+            companyProfile.competitor_names || [],
+          common_pushbacks:
+            companyProfile.common_pushbacks || [],
+        },
+
+        persona_memory:
+          companyProfile.persona_memory || [],
+
+        persona_pack_version: "v1",
+
         dynamic_scenario: dynamicScenario,
         assignment_id: assignmentId || null,
         // game mode + target duration for time-trial / turns-based drills
@@ -1898,11 +2626,15 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
         // Initial emotional state for this drill
         emotional_state: getInitialEmotionalState(
           personaId || "price_sensitive",
-          difficulty || "normal"
+          adaptiveDifficulty.effective || difficulty || "normal"
         ),
 
         // Day 56 — snapshot manager/team scoring config at session start
         team_settings_snapshot: teamSettingsSnapshot,
+
+        // Failure Replay Engine
+        failed_moments: [],
+        replay_enabled: true,
       },
     };
 
@@ -2054,6 +2786,20 @@ router.post(
         lastAiText: "", // we haven't generated AI yet; this is mainly user-driven
       });
 
+      const emotionalTimeline = Array.isArray(
+        previousMeta.emotional_timeline
+      )
+        ? [...previousMeta.emotional_timeline]
+        : [];
+
+      emotionalTimeline.push({
+        at_turn: turnsSoFar,
+        anger: updatedEmotion.anger,
+        boredom: updatedEmotion.boredom,
+        trust: updatedEmotion.trust,
+        created_at: new Date().toISOString(),
+      });
+
       const newObjection = getNextStackedObjection({
         personaId,
         difficulty: difficultyVal,
@@ -2062,6 +2808,23 @@ router.post(
         failures: previousMeta.failure_count || 0,
         currentStack: prevStack.active
       });
+
+      const objectionHistory = Array.isArray(
+        previousMeta.objection_history
+      )
+        ? [...previousMeta.objection_history]
+        : [];
+
+      if (newObjection) {
+        objectionHistory.push({
+          objection: newObjection,
+          at_turn: turnsSoFar,
+          anger: updatedEmotion.anger,
+          boredom: updatedEmotion.boredom,
+          trust: updatedEmotion.trust,
+          created_at: new Date().toISOString(),
+        });
+      }
 
       const hangupDecision = shouldAutoHangUp({
         personaId,
@@ -2118,10 +2881,25 @@ router.post(
             difficulty: difficultyVal,
             mode: modeVal,
             dynamicScenario: (session.meta as any)?.dynamic_scenario || null,
+            replayContext: previousMeta.replay_context || null,
+            companyProfile: {
+              ...(previousMeta.company_persona_profile || {}),
+              objection_patterns:
+                previousMeta.objection_library?.objection_patterns || [],
+              competitor_names:
+                previousMeta.objection_library?.competitor_names || [],
+              common_pushbacks:
+                previousMeta.objection_library?.common_pushbacks || [],
+              persona_memory:
+                previousMeta.persona_memory || [],
+            },
+
+            buyerStyle:
+              previousMeta.buyer_style || null,
             emotionalState: updatedEmotion,
             failures: previousMeta.failure_count || 1,
             section: previousMeta.flag_section || null,
-            stackedObjection: newObjection
+            stackedObjection: newObjection,
           });
 
           // 🔥 AUGMENT PROMPT WITH CONTEXT (CRITICAL)
@@ -2239,9 +3017,26 @@ INSTRUCTIONS:
               flags: micro.flags,
             };
 
+            const failedMoment = buildFailedMoment({
+              turnNumber: turnsSoFar,
+              repText: text,
+              buyerText: buyerTurn?.text || aiText,
+              micro,
+            });
+
+            const existingFailedMoments = Array.isArray(
+              (currentMeta as any).failed_moments
+            )
+              ? (currentMeta as any).failed_moments
+              : [];
+
             const mergedMeta: Record<string, any> = {
               ...currentMeta,
               micro_scores: [...existing, entry].slice(-200),
+
+              failed_moments: failedMoment
+                ? [...existingFailedMoments, failedMoment].slice(-50)
+                : existingFailedMoments,
             };
 
             // Preserve emotional_state / end flags which are also being written later
@@ -2274,7 +3069,28 @@ INSTRUCTIONS:
         const mergedMeta: Record<string, any> = {
           ...currentMeta,
           emotional_state: updatedEmotion,
+          emotional_timeline: emotionalTimeline,
+
+          objection_history: objectionHistory,
+
+          analytics_state: {
+            latest_anger: updatedEmotion.anger,
+            latest_boredom: updatedEmotion.boredom,
+            latest_trust: updatedEmotion.trust,
+
+            objection_count: objectionHistory.length,
+
+            trust_drop_detected:
+              updatedEmotion.trust < 25,
+
+            anger_spike_detected:
+              updatedEmotion.anger > 75,
+
+            disengaged:
+              updatedEmotion.boredom > 75,
+          },
           objection_stack: updatedStack
+
         };
 
         if (endedThisTurn) {
@@ -2445,6 +3261,181 @@ router.post(
     } catch (err: any) {
       console.error("[micro-score] unexpected error", err);
       return res.status(500).json({ ok: false, error: err?.message || "micro_score_failed" });
+    }
+  }
+);
+
+// -----------------------------------------
+// POST /v1/sparring/sessions/:id/replay
+// -----------------------------------------
+router.post(
+  "/sessions/:id/replay",
+  express.json(),
+  async (req: Request, res: Response) => {
+    try {
+      const sessionId = String(req.params.id || "").trim();
+      const failedTurn = Number(req.body?.failed_turn || 0);
+
+      if (!sessionId) {
+        return res.status(400).json({
+          ok: false,
+          error: "session_id_required",
+        });
+      }
+
+      if (!Number.isFinite(failedTurn) || failedTurn <= 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "invalid_failed_turn",
+        });
+      }
+
+      const { data: sourceSession, error: sourceError } = await supa
+        .from("sparring_sessions")
+        .select("*")
+        .eq("id", sessionId)
+        .single();
+
+      if (sourceError || !sourceSession) {
+        return res.status(404).json({
+          ok: false,
+          error: "source_session_not_found",
+        });
+      }
+
+      const failedMoments = Array.isArray(
+        (sourceSession.meta as any)?.failed_moments
+      )
+        ? (sourceSession.meta as any).failed_moments
+        : [];
+
+      const targetMoment = failedMoments.find(
+        (m: any) => Number(m?.turn || 0) === failedTurn
+      );
+
+      if (!targetMoment) {
+        return res.status(404).json({
+          ok: false,
+          error: "failed_moment_not_found",
+        });
+      }
+
+      const replayAttempts = Number(
+        (sourceSession.meta as any)?.replay_attempts || 0
+      );
+
+      const replayState = buildReplayState({
+        sourceSessionId: sourceSession.id,
+        failedMoment: targetMoment,
+        existingAttempts: replayAttempts,
+      });
+
+      const newSessionId = uuidv4();
+
+      const newMeta = {
+        ...(sourceSession.meta || {}),
+
+        replay_mode: true,
+        replay_state: replayState,
+        replay_attempts: replayState.replay_attempt,
+
+        replay_context: {
+          buyer_message: targetMoment.buyer_message,
+          previous_rep_response: targetMoment.rep_response,
+          failure_reason: targetMoment.reason,
+          original_score: targetMoment.score,
+        },
+
+        failed_moments: [],
+        micro_scores: [],
+        ended: false,
+        end_reason: null,
+      };
+
+      const { data: replaySession, error: replayError } = await supa
+        .from("sparring_sessions")
+        .insert({
+          id: newSessionId,
+          rep_id: sourceSession.rep_id,
+          persona_id: sourceSession.persona_id,
+          difficulty: sourceSession.difficulty,
+          meta: newMeta,
+        })
+        .select("*")
+        .single();
+
+      if (replayError || !replaySession) {
+        return res.status(500).json({
+          ok: false,
+          error: "replay_session_create_failed",
+        });
+      }
+
+      return res.json({
+        ok: true,
+        replay_session: replaySession,
+        replay_state: replayState,
+      });
+    } catch (e: any) {
+      console.error("[sparring/replay-create] failed", e);
+
+      return res.status(500).json({
+        ok: false,
+        error: e?.message || "replay_create_failed",
+      });
+    }
+  }
+);
+
+// -----------------------------------------
+// GET /v1/sparring/sessions/:id/replay
+// -----------------------------------------
+router.get(
+  "/sessions/:id/replay",
+  async (req: Request, res: Response) => {
+    try {
+      const sessionId = String(req.params.id || "").trim();
+
+      if (!sessionId) {
+        return res.status(400).json({
+          ok: false,
+          error: "session_id_required",
+        });
+      }
+
+      const { data, error } = await supa
+        .from("sparring_sessions")
+        .select("id, meta")
+        .eq("id", sessionId)
+        .single();
+
+      if (error || !data) {
+        return res.status(404).json({
+          ok: false,
+          error: "session_not_found",
+        });
+      }
+
+      const failedMoments = Array.isArray(
+        (data.meta as any)?.failed_moments
+      )
+        ? (data.meta as any).failed_moments
+        : [];
+
+      return res.json({
+        ok: true,
+        session_id: sessionId,
+        replay_enabled:
+          (data.meta as any)?.replay_enabled === true,
+        failed_moments: failedMoments,
+      });
+    } catch (e: any) {
+      console.error("[sparring/replay] failed", e);
+
+      return res.status(500).json({
+        ok: false,
+        error: e?.message || "replay_failed",
+      });
     }
   }
 );
