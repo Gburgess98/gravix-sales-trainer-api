@@ -26,6 +26,7 @@ import { PERSONAS } from "./personas";
 import whispererRouter from "./routes/whisperer";
 import adminRouter from "./routes/admin";
 import { assignmentsRoutes } from "./routes/assignments";
+import accountsRouter from "./routes/accounts";
 import debugRouter from "./routes/debug";
 
 
@@ -1665,6 +1666,7 @@ app.use("/v1/calls", callsRouter);
 app.use("/v1/pins", pinsRouter);
 // Includes protected cron endpoints (e.g. POST /v1/cron/crm/auto-assign)
 app.use("/v1/crm", crmRouter);
+app.use("/v1/accounts", accountsRouter);
 app.use("/v1/coach", coachRoutes);
 app.use("/v1/team", teamRoutes);
 app.use("/v1/reps", repsRouter);
