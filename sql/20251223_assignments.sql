@@ -15,7 +15,10 @@ create table if not exists public.assignments (
 
   due_at timestamptz null,
   created_at timestamptz not null default now(),
-  completed_at timestamptz null
+  completed_at timestamptz null,
+  completed_by text null,
+  source text null,
+  meta jsonb null
 );
 
 create index if not exists idx_assignments_rep_id on public.assignments(rep_id);
