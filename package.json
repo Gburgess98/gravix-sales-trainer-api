@@ -34,6 +34,7 @@
     "test": "echo \"(no tests yet)\"",
     "smoke": "bash scripts/smoke.sh",
     "check": "npm run lint && npm run typecheck && npm run smoke",
-    "check:ci": "npm run lint && npm run typecheck"
+    "check:ci": "npm run lint && npm run typecheck",
+    "regression": "tsx scripts/api-regression.ts"
   }
 }

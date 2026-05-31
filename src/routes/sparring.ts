@@ -3580,6 +3580,10 @@ router.get('/sessions/:id', async (req: Request, res: Response) => {
       .single();
 
     if (error) {
+      // PGRST116: ".single() returned 0 rows" — session doesn't exist, not a server fault.
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ ok: false, error: 'session_not_found' });
+      }
       console.error('[sparring/sessions/:id] Supabase error', error);
       return res
         .status(500)
@@ -3589,7 +3593,7 @@ router.get('/sessions/:id', async (req: Request, res: Response) => {
     if (!data) {
       return res
         .status(404)
-        .json({ ok: false, error: 'Sparring session not found' });
+        .json({ ok: false, error: 'session_not_found' });
     }
 
     const personaId =

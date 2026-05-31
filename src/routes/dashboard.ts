@@ -374,7 +374,10 @@ router.get("/flags/summary", async (req, res) => {
 
     const { data, error } = await svc
       .from("crm_activities")
-      .select("flag_key, flag_section, flag_severity, rep_id, created_at")
+      // Read from meta JSONB — flag_key/section/severity columns may not exist yet (see
+      // sql/20260528_crm_activities_flag_columns.sql). After that migration runs the values
+      // will also appear as top-level columns, but meta is always populated.
+      .select("meta, rep_id, created_at")
       .eq("type", "review_flag")
       .gte("created_at", since);
 
@@ -388,8 +391,12 @@ router.get("/flags/summary", async (req, res) => {
     const repMap = new Map<string, number>();
 
     for (const r of rows) {
-      const section = normalizeSkillLabel(String(r.flag_section || "unknown"));
-      const severity = String(r.flag_severity || "unknown").toLowerCase();
+      const section = normalizeSkillLabel(String(
+        (r as any).meta?.flag_section || "unknown"
+      ));
+      const severity = String(
+        (r as any).meta?.flag_severity || "unknown"
+      ).toLowerCase();
       const rep = String(r.rep_id || "unknown");
 
       incrementMap(sectionMap, section);
@@ -1050,7 +1057,8 @@ router.get('/voice-score-summary', async (req, res) => {
 
     let q = supabase
       .from('call_scores')
-      .select('call_id, user_id, created_at, rubric, office_id, company_id')
+      // office_id / company_id do not exist on call_scores (schema drift); unused here.
+      .select('call_id, user_id, created_at, rubric')
       .gte('created_at', since)
       .order('created_at', { ascending: false })
       .limit(10000);
@@ -1140,9 +1148,10 @@ router.get('/voice-score-trend', async (req, res) => {
 
     // Prefer snapshots from call_scores because Day 55 writes voice data there even if
     // dedicated columns do not exist on calls yet.
+    // office_id / company_id do not exist on call_scores (schema drift); unused here.
     let q = supabase
       .from('call_scores')
-      .select('call_id, user_id, created_at, rubric, office_id, company_id')
+      .select('call_id, user_id, created_at, rubric')
       .gte('created_at', since)
       .order('created_at', { ascending: true })
       .limit(10000);

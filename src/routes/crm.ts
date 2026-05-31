@@ -5939,6 +5939,10 @@ router.get("/actions/today", async (req, res) => {
         select_cols: r.selectCols,
       });
     } catch (err: any) {
+      // getUserIdHeader throws when x-user-id is absent or malformed — surface as 401 not 500.
+      if (err?.message === "Missing or invalid x-user-id") {
+        return res.status(401).json({ ok: false, error: "missing_user" });
+      }
       console.error("[crm/actions/today]", err);
       return res.status(500).json({ ok: false, error: err.message || "actions_today_failed" });
     }
