@@ -2051,6 +2051,161 @@ router.post("/manager/settings", async (req, res) => {
 });
 
 /* ---------------------------------------------
+   GET /v1/crm/manager/contacts
+
+   Manager view of all contacts across every rep in the org.
+   - Scoped by org_id (via requireManagerOrg)
+   - Enriched with rep ownership + account linkage (best-effort)
+   - Supports: ?repId= ?q= ?limit= ?sort=
+---------------------------------------------- */
+router.get("/manager/contacts", async (req, res) => {
+  try {
+    const { requester, orgId, bypassed } = await requireManagerOrg(req);
+
+    const okManager = await isManagerUser(requester);
+    if (!okManager) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+    }
+
+    const limit = Math.min(Math.max(Number(req.query.limit ?? 100), 1), 500);
+    const repIdFilter = String(req.query.repId ?? "").trim();
+    const searchRaw = String(req.query.q ?? req.query.query ?? "").trim();
+    const sortBy = String(req.query.sort ?? "created_at").trim();
+
+    // 1) Resolve which rep IDs are visible to this manager
+    const allReps = await listRepDirectoryBestEffort(2000);
+    const visibleReps = allReps.filter((rep: any) => {
+      if (!String(rep?.id ?? "").trim()) return false;
+      if (bypassed) return true;
+      return String(rep?.org_id ?? "") === orgId;
+    });
+
+    // Optional: narrow to single rep
+    const targetReps = repIdFilter
+      ? visibleReps.filter((r: any) => String(r.id) === repIdFilter)
+      : visibleReps;
+
+    const repIds = targetReps.map((r: any) => String(r.id)).filter(Boolean);
+
+    if (!repIds.length) {
+      return res.json({ ok: true, contacts: [], total: 0, reps_included: 0 });
+    }
+
+    // Build fast lookup: repId → rep info
+    const repById = new Map<string, any>();
+    for (const rep of targetReps) {
+      repById.set(String(rep.id), rep);
+    }
+
+    // 2) Fetch contacts for all visible reps — schema-tolerant fallback chain
+    const contactSelectCandidates = [
+      "id, user_id, first_name, last_name, email, company, last_contacted_at, created_at",
+      "id, user_id, first_name, last_name, email, company, created_at",
+      "id, user_id, first_name, last_name, email, created_at",
+      "id, user_id, first_name, last_name, created_at",
+      "id, user_id, created_at",
+    ];
+
+    let contactRows: any[] = [];
+    for (const sel of contactSelectCandidates) {
+      let q = supa
+        .from("crm_contacts")
+        .select(sel)
+        .in("user_id", repIds)
+        .order("created_at", { ascending: false })
+        .limit(limit);
+
+      const { data, error } = await q;
+
+      if (!error) { contactRows = (data as any[]) ?? []; break; }
+
+      const msg = String((error as any)?.message ?? "").toLowerCase();
+      if (msg.includes("relation") && msg.includes("does not exist")) break;
+      if (msg.includes("column") && msg.includes("does not exist")) continue;
+
+      return res.status(500).json({ ok: false, error: (error as any)?.message ?? "contacts_fetch_failed" });
+    }
+
+    // 3) Optional search filter (applied in-memory after fetch)
+    if (searchRaw) {
+      const q = searchRaw.toLowerCase();
+      contactRows = contactRows.filter((c: any) => {
+        const hay = [c.first_name, c.last_name, c.email, c.company]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        return hay.includes(q);
+      });
+    }
+
+    // 4) Fetch accounts for enrichment (best-effort — null if table missing)
+    const accountRows = await listCrmAccountsBestEffort({ userIds: repIds, limit: 2000 });
+    const accountByUserId = new Map<string, any>();
+    for (const acc of accountRows) {
+      const uid = String((acc as any).user_id ?? "").trim();
+      if (uid && !accountByUserId.has(uid)) accountByUserId.set(uid, acc);
+    }
+
+    // 5) Sort
+    const sortDir = sortBy === "name" || sortBy === "company" ? 1 : -1;
+    contactRows.sort((a: any, b: any) => {
+      if (sortBy === "last_contacted_at") {
+        const ta = a.last_contacted_at ? new Date(a.last_contacted_at).getTime() : 0;
+        const tb = b.last_contacted_at ? new Date(b.last_contacted_at).getTime() : 0;
+        return (tb - ta);
+      }
+      if (sortBy === "name") {
+        const na = [a.first_name, a.last_name].filter(Boolean).join(" ").toLowerCase();
+        const nb = [b.first_name, b.last_name].filter(Boolean).join(" ").toLowerCase();
+        return na < nb ? -sortDir : na > nb ? sortDir : 0;
+      }
+      if (sortBy === "company") {
+        const ca = String(a.company ?? "").toLowerCase();
+        const cb = String(b.company ?? "").toLowerCase();
+        return ca < cb ? -sortDir : ca > cb ? sortDir : 0;
+      }
+      // default: created_at desc
+      const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return tb - ta;
+    });
+
+    // 6) Shape output
+    const contacts = contactRows.map((c: any) => {
+      const ownerId = String(c.user_id ?? "").trim();
+      const rep = repById.get(ownerId) ?? null;
+      const account = accountByUserId.get(ownerId) ?? null;
+
+      return {
+        id: c.id,
+        first_name: c.first_name ?? null,
+        last_name: c.last_name ?? null,
+        email: c.email ?? null,
+        company: c.company ?? null,
+        last_contacted_at: c.last_contacted_at ?? null,
+        created_at: c.created_at ?? null,
+        rep_id: ownerId || null,
+        rep_name: rep ? (String(rep.name ?? "").trim() || null) : null,
+        account: account ? { id: account.id, name: account.name ?? null } : null,
+      };
+    });
+
+    return res.json({
+      ok: true,
+      contacts,
+      total: contacts.length,
+      reps_included: targetReps.length,
+    });
+  } catch (e: any) {
+    const msg = String(e?.message ?? "bad_request");
+    if (msg === "forbidden_org_scope") return res.status(403).json({ ok: false, error: msg });
+    if (msg === "org_scope_not_supported") return res.status(500).json({ ok: false, error: msg });
+    if (msg === "Missing or invalid x-user-id") return res.status(401).json({ ok: false, error: "missing_user" });
+    return res.status(400).json({ ok: false, error: msg });
+  }
+});
+
+/* ---------------------------------------------
    OPPORTUNITIES PIPELINE (Kanban v1)
 
    GET /v1/crm/opportunities/pipeline

@@ -173,6 +173,7 @@ async function crmSuite() {
     "/v1/crm/actions/today",
     "/v1/crm/opportunities/pipeline",
     "/v1/crm/manager/overview",
+    "/v1/crm/manager/contacts",
   ];
   for (const path of crmSmokePaths) {
     await test(S, `SMOKE ${path}`, async () => {
@@ -196,6 +197,11 @@ async function crmSuite() {
   await test(S, "GET /v1/crm/opportunities/pipeline — 2xx with valid org_id", async () => {
     const r = await apiReq(API_BASE, "/v1/crm/opportunities/pipeline", { userId: USER_ID, orgId: ORG_ID });
     return [statusOk(r.status)];
+  });
+
+  await test(S, "GET /v1/crm/manager/contacts — 2xx + contacts array", async () => {
+    const r = await apiReq(API_BASE, "/v1/crm/manager/contacts", { userId: USER_ID, orgId: ORG_ID });
+    return [statusOk(r.status), isOk(r.body), fieldIsArray(r.body, "contacts")];
   });
 
   // Org isolation: wrong org must not return same data as correct org
