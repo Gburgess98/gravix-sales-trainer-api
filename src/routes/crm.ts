@@ -498,38 +498,28 @@ const ManagerAutoAssignRunBodySchema = z.object({
   max_total_contacts: z.number().int().min(1).max(1000).optional(),
 });
 
-async function listCrmAccountsBestEffort(args: { userIds: string[]; limit?: number }) {
-  const { userIds, limit = 5000 } = args;
-  if (!userIds.length) return [];
+async function listCrmAccountsBestEffort(args: { orgId: string; limit?: number }) {
+  const { orgId, limit = 5000 } = args;
+  if (!orgId) return [];
 
-  const selectCandidates = [
-    "id, user_id, name, created_at, updated_at",
-    "id, user_id, name, created_at",
-    "id, user_id, name",
-    "id, user_id",
-    "id",
-  ];
+  const r = await supa
+    .from("crm_accounts")
+    .select("id, org_id, name, domain, created_at")
+    .eq("org_id", orgId)
+    .order("created_at", { ascending: false })
+    .limit(limit);
 
-  for (const sel of selectCandidates) {
-    const r = await supa
-      .from("crm_accounts")
-      .select(sel)
-      .in("user_id", userIds)
-      .order("created_at", { ascending: false })
-      .limit(limit);
+  if (!r.error) return (r.data as any[]) ?? [];
 
-    if (!r.error) return (r.data as any[]) ?? [];
-
-    const msg = String((r.error as any)?.message ?? "").toLowerCase();
-    if ((msg.includes("relation") && msg.includes("does not exist")) || msg.includes("could not find the table")) {
-      return [];
-    }
-    if (msg.includes("column") && msg.includes("does not exist")) continue;
-
-    throw new Error((r.error as any)?.message ?? "crm_accounts_fetch_failed");
+  const msg = String((r.error as any)?.message ?? "").toLowerCase();
+  if (
+    (msg.includes("relation") && msg.includes("does not exist")) ||
+    msg.includes("could not find the table")
+  ) {
+    return [];
   }
 
-  return [];
+  throw new Error((r.error as any)?.message ?? "crm_accounts_fetch_failed");
 }
 
 async function listCrmOpportunitiesBestEffort(args: { userIds: string[]; limit?: number }) {
@@ -1239,7 +1229,7 @@ router.get("/reporting-summary", async (req, res) => {
 
     const [contacts, accounts, opportunities] = await Promise.all([
       Promise.all(userIds.map((userId) => listCrmContactsForUserBestEffort({ userId, limit: 500 }))).then((chunks) => chunks.flat()),
-      listCrmAccountsBestEffort({ userIds, limit: 5000 }),
+      listCrmAccountsBestEffort({ orgId, limit: 5000 }),
       listCrmOpportunitiesBestEffort({ userIds, limit: 5000 }),
     ]);
 
@@ -2139,7 +2129,7 @@ router.get("/manager/contacts", async (req, res) => {
     }
 
     // 4) Fetch accounts for enrichment (best-effort — null if table missing)
-    const accountRows = await listCrmAccountsBestEffort({ userIds: repIds, limit: 2000 });
+    const accountRows = await listCrmAccountsBestEffort({ orgId, limit: 2000 });
     const accountByUserId = new Map<string, any>();
     for (const acc of accountRows) {
       const uid = String((acc as any).user_id ?? "").trim();
@@ -4096,6 +4086,7 @@ router.get("/reps/:id/coaching-history", async (req, res) => {
 router.get("/analytics/summary", async (req, res) => {
   try {
     const requester = getUserIdHeader(req);
+    const orgId = getOrgIdHeader(req);
 
     const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
     const repIdRaw = String(req.query.repId ?? "").trim();
@@ -4106,16 +4097,19 @@ router.get("/analytics/summary", async (req, res) => {
     let oppsQ = supa
       .from("crm_opportunities")
       .select("id,stage,amount,created_at,user_id")
+      .eq("org_id", orgId)
       .gte("created_at", sinceIso);
 
     let activitiesQ = supa
       .from("crm_activities")
       .select("id,status,created_at,user_id")
+      .eq("org_id", orgId)
       .gte("created_at", sinceIso);
 
     let callsQ = supa
       .from("calls")
       .select("score_overall,created_at,user_id")
+      .eq("org_id", orgId)
       .gte("created_at", sinceIso);
 
     if (repId) {
@@ -4164,6 +4158,7 @@ router.get("/analytics/summary", async (req, res) => {
 router.get("/analytics/stage-conversion", async (req, res) => {
   try {
     const requester = getUserIdHeader(req);
+    const orgId = getOrgIdHeader(req);
     const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
     const repIdRaw = String(req.query.repId ?? "").trim();
     const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
@@ -4173,6 +4168,7 @@ router.get("/analytics/stage-conversion", async (req, res) => {
     let q = supa
       .from("crm_opportunities")
       .select("stage,amount,created_at,user_id")
+      .eq("org_id", orgId)
       .gte("created_at", sinceIso);
 
     if (repId) q = q.eq("user_id", repId);
@@ -4204,6 +4200,7 @@ router.get("/analytics/stage-conversion", async (req, res) => {
 router.get("/analytics/score-trend", async (req, res) => {
   try {
     const requester = getUserIdHeader(req);
+    const orgId = getOrgIdHeader(req);
     const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
     const repIdRaw = String(req.query.repId ?? "").trim();
     const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
@@ -4213,6 +4210,7 @@ router.get("/analytics/score-trend", async (req, res) => {
     let q = supa
       .from("calls")
       .select("score_overall,created_at,user_id")
+      .eq("org_id", orgId)
       .gte("created_at", sinceIso)
       .order("created_at", { ascending: true });
 
@@ -4252,6 +4250,7 @@ router.get("/analytics/score-trend", async (req, res) => {
 router.get("/analytics/activity-by-rep", async (req, res) => {
   try {
     const requester = getUserIdHeader(req);
+    const orgId = getOrgIdHeader(req);
     const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
     const repIdRaw = String(req.query.repId ?? "").trim();
     const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
@@ -4261,6 +4260,7 @@ router.get("/analytics/activity-by-rep", async (req, res) => {
     let q = supa
       .from("crm_activities")
       .select("user_id,status,created_at")
+      .eq("org_id", orgId)
       .gte("created_at", sinceIso);
 
     if (repId) q = q.eq("user_id", repId);

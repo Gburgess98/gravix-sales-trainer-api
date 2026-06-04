@@ -1024,32 +1024,6 @@ router.get("/paged", async (req, res) => {
       items.map((c: any) => String(c.id ?? ""))
     );
 
-    const hierarchy = await getUserHierarchy(supa, requester);
-
-    console.log("CALLS PAGED HIERARCHY", {
-      requester,
-      hierarchy,
-      headers: {
-        xUserId: req.header("x-user-id"),
-        xGravixUserId: req.header("x-gravix-user-id"),
-        xForwardedUserId: req.header("x-forwarded-user-id"),
-      },
-    });
-
-    if (!hierarchy.office_id) {
-      return res.status(400).json({
-        ok: false,
-        error: "user_missing_office",
-      });
-    }
-
-    if (!hierarchy.company_id) {
-      return res.status(400).json({
-        ok: false,
-        error: "user_missing_company",
-      });
-    }
-
     // Shape payload for web: keep existing fields, add new UX bits
     const mapped = items.map((c) => ({
       id: c.id,
