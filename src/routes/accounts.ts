@@ -129,6 +129,90 @@ router.get('/', async (req: Request, res: Response) => {
 });
 
 /* ----------------------------------------------------------------
+   resolveCompanyId
+   Tries users.company_id first (legacy hierarchy), then falls back
+   to reps.company_id (Phase 1 identity bridge) so auth-first users
+   (demo reps with no users row) can still create accounts.
+----------------------------------------------------------------- */
+async function resolveCompanyId(userId: string): Promise<string | null> {
+  if (!userId) return null;
+
+  const { data: userRow } = await supa
+    .from('users')
+    .select('company_id')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if (userRow?.company_id) return String(userRow.company_id);
+
+  // Phase 1 bridge: check reps table for users with no users row
+  const { data: repRow } = await supa
+    .from('reps')
+    .select('company_id')
+    .eq('id', userId)
+    .maybeSingle();
+
+  return (repRow as any)?.company_id ? String((repRow as any).company_id) : null;
+}
+
+/* ----------------------------------------------------------------
+   POST /v1/accounts
+   Body: { name: string, domain?: string, owner_id?: string }
+   - company_id is resolved server-side from the authenticated user
+   - duplicate names within the same company are rejected (409)
+----------------------------------------------------------------- */
+router.post('/', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    if (!userId) {
+      return res.status(401).json({ ok: false, error: 'missing_user' });
+    }
+
+    const companyId = await resolveCompanyId(userId);
+    if (!companyId) {
+      return res.status(403).json({ ok: false, error: 'missing_company_context' });
+    }
+
+    const name = String(req.body?.name ?? '').trim();
+    if (!name) {
+      return res.status(400).json({ ok: false, error: 'name_required' });
+    }
+
+    const domain  = req.body?.domain   ? String(req.body.domain).trim()   : null;
+    const ownerId = req.body?.owner_id ? String(req.body.owner_id).trim() : userId;
+
+    // Duplicate check: case-insensitive within the same company
+    const { data: existing } = await supa
+      .from('accounts')
+      .select('id')
+      .eq('org_id', companyId)
+      .ilike('name', name)
+      .maybeSingle();
+
+    if (existing) {
+      return res.status(409).json({
+        ok: false,
+        error: 'account_name_exists',
+        detail: `An account named "${name}" already exists in this company.`,
+      });
+    }
+
+    const { data: account, error } = await supa
+      .from('accounts')
+      .insert({ name, domain, org_id: companyId, owner_id: ownerId })
+      .select('id, org_id, owner_id, name, domain, created_at, updated_at')
+      .single();
+
+    if (error) throw error;
+
+    return res.status(201).json({ ok: true, account });
+  } catch (e: any) {
+    console.error('[accounts:create] failed', e);
+    return res.status(500).json({ ok: false, error: e?.message || 'account_create_failed' });
+  }
+});
+
+/* ----------------------------------------------------------------
    GET /v1/accounts/:id
 ----------------------------------------------------------------- */
 router.get('/:id', async (req: Request, res: Response) => {

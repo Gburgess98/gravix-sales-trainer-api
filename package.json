@@ -36,6 +36,8 @@
     "check": "npm run lint && npm run typecheck && npm run smoke",
     "check:ci": "npm run lint && npm run typecheck",
     "regression": "tsx scripts/api-regression.ts",
-    "seed:demo": "tsx scripts/seed-demo-org.ts"
+    "seed:demo": "tsx scripts/seed-demo-org.ts",
+    "db:backfill": "tsx scripts/backfill-reps-company.ts",
+    "validate:isolation": "tsx scripts/validate-isolation.ts"
   }
 }

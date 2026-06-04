@@ -392,6 +392,12 @@ async function listRepActivityBestEffort(limit = 2000) {
 // --- Inserted: listRepDirectoryBestEffort and listCrmActivityRowsBestEffort ---
 async function listRepDirectoryBestEffort(limit = 2000) {
   const selectCandidates = [
+    // Post-Phase-1: includes company_id + office_id for proper tenant scoping
+    "id, org_id, company_id, office_id, tier, name, last_active_at, created_at",
+    "id, org_id, company_id, office_id, tier, name, created_at",
+    "id, org_id, company_id, office_id, name, tier",
+    "id, org_id, company_id, office_id, tier",
+    // Pre-Phase-1 fallbacks (no company_id / office_id columns yet)
     "id, org_id, tier, name, last_active_at, created_at",
     "id, org_id, name, tier, last_active_at, created_at",
     "id, org_id, name, tier, created_at",
@@ -1218,13 +1224,7 @@ router.get("/reporting-summary", async (req, res) => {
       return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
     }
 
-    const repRows = await listRepDirectoryBestEffort(2000);
-    const visibleReps = repRows.filter((rep: any) => {
-      const repId = String(rep?.id ?? "").trim();
-      if (!repId) return false;
-      if (bypassed) return true;
-      return String(rep?.org_id ?? "") === orgId;
-    });
+    const visibleReps = await resolveVisibleReps({ requester, orgId, bypassed, limit: 2000 });
     const userIds = visibleReps.map((rep: any) => String(rep?.id ?? "").trim()).filter(Boolean);
 
     const [contacts, accounts, opportunities] = await Promise.all([
@@ -1334,15 +1334,10 @@ router.get("/manager/overview", async (req, res) => {
       return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
     }
 
-    const repRows = await listRepDirectoryBestEffort();
-    const activityRows = await listCrmActivityRowsBestEffort();
-
-    const visibleReps = repRows.filter((rep: any) => {
-      const repId = String(rep?.id ?? "").trim();
-      if (!repId) return false;
-      if (bypassed) return true;
-      return String(rep?.org_id ?? "") === orgId;
-    });
+    const [visibleReps, activityRows] = await Promise.all([
+      resolveVisibleReps({ requester, orgId, bypassed }),
+      listCrmActivityRowsBestEffort(),
+    ]);
 
     const nowMs = Date.now();
     const startOfToday = new Date();
@@ -1633,18 +1628,12 @@ router.get("/manager/control-centre", async (req, res) => {
       return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
     }
 
-    const repRows = await listRepDirectoryBestEffort();
-    const activityRows = await listCrmActivityRowsBestEffort();
-    const latestCallRows = await listLatestCallsForControlCentreBestEffort();
-    const latestScoreRows = await listLatestCallScoresBestEffort();
-
-    const visibleReps = repRows.filter((rep: any) => {
-      const repId = String(rep?.id ?? "").trim();
-      if (!repId) return false;
-      if (repId === requester) return false;
-      if (bypassed) return true;
-      return String(rep?.org_id ?? "") === orgId;
-    });
+    const [visibleReps, activityRows, latestCallRows, latestScoreRows] = await Promise.all([
+      resolveVisibleReps({ requester, orgId, bypassed, excludeSelf: true }),
+      listCrmActivityRowsBestEffort(),
+      listLatestCallsForControlCentreBestEffort(),
+      listLatestCallScoresBestEffort(),
+    ]);
 
     const nowMs = Date.now();
     const countsByUser = new Map<string, { open: number; overdue: number; completed_today: number }>();
@@ -1759,16 +1748,9 @@ router.post("/manager/auto-assign/run", async (req, res) => {
     const maxTotalContacts = body.max_total_contacts ?? 25;
     const source: "manual" | "cron" = String(req.header("x-cron-secret") || "").trim() ? "cron" : "manual";
 
-    const repRows = await listRepDirectoryBestEffort(limitReps * 5);
-    const visibleReps = repRows
-      .filter((rep: any) => {
-        const repId = String(rep?.id ?? "").trim();
-        if (!repId) return false;
-        if (repId === requester) return false;
-        if (bypassed) return true;
-        return String(rep?.org_id ?? "") === orgId;
-      })
-      .slice(0, limitReps);
+    const visibleReps = (
+      await resolveVisibleReps({ requester, orgId, bypassed, excludeSelf: true, limit: limitReps * 5 })
+    ).slice(0, limitReps);
 
     const preview: any[] = [];
     const assigned: any[] = [];
@@ -2063,12 +2045,7 @@ router.get("/manager/contacts", async (req, res) => {
     const sortBy = String(req.query.sort ?? "created_at").trim();
 
     // 1) Resolve which rep IDs are visible to this manager
-    const allReps = await listRepDirectoryBestEffort(2000);
-    const visibleReps = allReps.filter((rep: any) => {
-      if (!String(rep?.id ?? "").trim()) return false;
-      if (bypassed) return true;
-      return String(rep?.org_id ?? "") === orgId;
-    });
+    const visibleReps = await resolveVisibleReps({ requester, orgId, bypassed, limit: 2000 });
 
     // Optional: narrow to single rep
     const targetReps = repIdFilter
@@ -2235,6 +2212,94 @@ async function isManagerUser(userId: string) {
     return false;
   }
 }
+
+// ─── Phase 1 identity bridge ────────────────────────────────────────────────
+// After sql/20260604_reps_company_office_bridge.sql, reps has company_id and
+// office_id. This helper reads them so manager views scope by company, not by
+// the shared DEFAULT_ORG_ID that all reps currently share.
+
+type RepContext = {
+  id: string;
+  tier: string;
+  org_id: string | null;
+  company_id: string | null;
+  office_id: string | null;
+};
+
+async function getRepContext(userId: string): Promise<RepContext | null> {
+  try {
+    const { data, error } = await supa
+      .from("reps")
+      .select("id, tier, org_id, company_id, office_id")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (error || !data) return null;
+
+    return {
+      id:         String((data as any).id),
+      tier:       String((data as any).tier ?? ""),
+      org_id:     (data as any).org_id     ?? null,
+      company_id: (data as any).company_id ?? null,
+      office_id:  (data as any).office_id  ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns the subset of reps visible to requester.
+ *
+ * Scoping priority:
+ *   1. company_id match — used when both requester and rep have company_id set
+ *      (post-Phase-1-migration). Office managers are further scoped to their
+ *      office_id if both sides have it populated.
+ *   2. org_id match — legacy fallback used before the migration runs or for
+ *      reps that still have null company_id.
+ *   3. bypassed — dev/smoke-test mode (zero UUID or ALLOW_ORG_BYPASS=1).
+ */
+async function resolveVisibleReps(args: {
+  requester: string;
+  orgId: string;
+  bypassed: boolean;
+  excludeSelf?: boolean;
+  limit?: number;
+}): Promise<any[]> {
+  const { requester, orgId, bypassed, excludeSelf = false, limit = 2000 } = args;
+
+  const [allReps, requesterCtx] = await Promise.all([
+    listRepDirectoryBestEffort(limit),
+    getRepContext(requester),
+  ]);
+
+  const requesterCompanyId = requesterCtx?.company_id ?? null;
+  const requesterOfficeId  = requesterCtx?.office_id  ?? null;
+
+  return allReps.filter((rep: any) => {
+    const repId = String(rep?.id ?? "").trim();
+    if (!repId) return false;
+    if (excludeSelf && repId === requester) return false;
+    if (bypassed) return true;
+
+    const repCompanyId = (rep as any).company_id ?? null;
+    const repOfficeId  = (rep as any).office_id  ?? null;
+
+    // company_id scoping — used when the migration has been applied
+    if (requesterCompanyId && repCompanyId) {
+      if (String(repCompanyId) !== requesterCompanyId) return false;
+      // Office-level managers are further scoped to their office
+      if (requesterOfficeId && repOfficeId) {
+        return String(repOfficeId) === requesterOfficeId;
+      }
+      return true;
+    }
+
+    // Fallback: org_id scoping (pre-migration or incomplete data)
+    return String(rep?.org_id ?? "") === orgId;
+  });
+}
+// ─── end Phase 1 identity bridge ────────────────────────────────────────────
 
 async function listOrgRepIdsBestEffort(args: { orgId: string }) {
   const { orgId } = args;

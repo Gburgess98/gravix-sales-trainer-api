@@ -329,6 +329,80 @@ async function sparringSuite() {
   });
 }
 
+async function accountsSuite() {
+  const S = "Accounts";
+
+  // POST without auth → 401
+  await test(S, "POST /v1/accounts — 401 without x-user-id", async () => {
+    const r = await apiReq(API_BASE, "/v1/accounts", { method: "POST", body: { name: "Ghost" } });
+    return [statusIsAuth(r.status)];
+  });
+
+  // POST without name → 400
+  await test(S, "POST /v1/accounts — 400 when name missing", async () => {
+    const r = await apiReq(API_BASE, "/v1/accounts", { userId: FAKE_ID, method: "POST", body: {} });
+    return [statusNot5xx(r.status), c("not 201", r.status !== 201)];
+  });
+
+  // GET list — smoke
+  await test(S, "SMOKE GET /v1/accounts", async () => {
+    const r = await apiReq(API_BASE, "/v1/accounts", { userId: FAKE_ID });
+    return [statusNot5xx(r.status)];
+  });
+
+  if (!USER_ID) { skip(S, "Accounts authenticated tests", "TEST_USER_ID not set"); return; }
+
+  // Full create → read → duplicate → cleanup cycle
+  const uniqueName = `Regression Test Co ${Date.now()}`;
+
+  let createdId: string | null = null;
+
+  await test(S, "POST /v1/accounts — 201 + account shape", async () => {
+    const r = await apiReq(API_BASE, "/v1/accounts", {
+      userId: USER_ID,
+      method: "POST",
+      body: { name: uniqueName, domain: "regression-test.example.com" },
+    });
+    if (r.status === 201) createdId = (r.body as any)?.account?.id ?? null;
+    return [
+      statusIs(r.status, 201),
+      isOk(r.body),
+      hasField(r.body, "account"),
+      hasField((r.body as any)?.account, "id"),
+      hasField((r.body as any)?.account, "org_id"),
+      c("name matches", (r.body as any)?.account?.name === uniqueName),
+    ];
+  });
+
+  await test(S, "POST /v1/accounts — 409 on duplicate name", async () => {
+    const r = await apiReq(API_BASE, "/v1/accounts", {
+      userId: USER_ID,
+      method: "POST",
+      body: { name: uniqueName },
+    });
+    return [statusIs(r.status, 409), c('error is account_name_exists', (r.body as any)?.error === 'account_name_exists')];
+  });
+
+  await test(S, "POST /v1/accounts — 409 is case-insensitive", async () => {
+    const r = await apiReq(API_BASE, "/v1/accounts", {
+      userId: USER_ID,
+      method: "POST",
+      body: { name: uniqueName.toUpperCase() },
+    });
+    return [statusIs(r.status, 409)];
+  });
+
+  // Cleanup — best-effort, don't fail the suite if it errors
+  if (createdId) {
+    try {
+      await fetch(`${API_BASE}/v1/accounts/${createdId}`, {
+        method: "DELETE",
+        headers: { "x-user-id": USER_ID },
+      });
+    } catch { /* ignore */ }
+  }
+}
+
 // ---- reporter ----
 
 function report(): number {
@@ -397,6 +471,7 @@ async function main() {
   await callsSuite();
   await repsSuite();
   await sparringSuite();
+  await accountsSuite();
 
   const failed = report();
   process.exit(failed > 0 ? 1 : 0);
