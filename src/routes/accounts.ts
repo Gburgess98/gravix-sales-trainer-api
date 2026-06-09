@@ -1,5 +1,6 @@
 import express, { Request, Response } from 'express';
 import { createClient } from '@supabase/supabase-js';
+import { logAuditEvent, AUDIT_ACTIONS } from '../lib/audit.ts';
 
 const router = express.Router();
 
@@ -9,7 +10,12 @@ const supa = createClient(
 );
 
 function getUserId(req: Request) {
-  return String(req.header('x-user-id') || '').trim();
+  return String(
+    (req as any).userId ||
+    req.header("x-user-id") ||
+    req.header("x-gravix-user-id") ||
+    ""
+  ).trim();
 }
 
 async function getRequesterContext(userId: string) {
@@ -204,6 +210,15 @@ router.post('/', async (req: Request, res: Response) => {
       .single();
 
     if (error) throw error;
+
+    // Audit — fire-and-forget, never blocks the response
+    void logAuditEvent({
+      actorUserId: userId,
+      action:      AUDIT_ACTIONS.CREATE_ACCOUNT,
+      entityType:  "account",
+      entityId:    account.id ?? null,
+      metadata:    { name: account.name, company_id: companyId },
+    });
 
     return res.status(201).json({ ok: true, account });
   } catch (e: any) {

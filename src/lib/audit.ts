@@ -1,3 +1,71 @@
+import { createClient } from "@supabase/supabase-js";
+
+// ─── Action constants ────────────────────────────────────────────────────────
+
+export const AUDIT_ACTIONS = {
+  // Auth
+  LOGIN:             "login",
+  LOGOUT:            "logout",
+  // Account lifecycle
+  CREATE_ACCOUNT:    "create_account",
+  UPDATE_ACCOUNT:    "update_account",
+  DELETE_ACCOUNT:    "delete_account",
+  // User lifecycle
+  CREATE_USER:       "create_user",
+  UPDATE_USER:       "update_user",
+  DELETE_USER:       "delete_user",
+  // Impersonation
+  IMPERSONATE_USER:  "impersonate_user",
+  END_IMPERSONATION: "end_impersonation",
+  // Company lifecycle
+  UPDATE_COMPANY:    "update_company",
+  // Profile (self-service)
+  UPDATE_PROFILE:    "update_profile",
+} as const;
+
+export type AuditAction = (typeof AUDIT_ACTIONS)[keyof typeof AUDIT_ACTIONS];
+
+// ─── logAuditEvent — new audit_events table ──────────────────────────────────
+// Targets the audit_events table (see sql/20260605c_audit_events.sql).
+// Never throws — audit failures must not break business logic.
+
+let _auditSupa: ReturnType<typeof createClient> | null = null;
+function getAuditSupa() {
+  if (_auditSupa) return _auditSupa;
+  _auditSupa = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE_KEY!,
+    { auth: { persistSession: false, autoRefreshToken: false } }
+  );
+  return _auditSupa;
+}
+
+export type AuditEventPayload = {
+  actorUserId:   string;
+  targetUserId?: string | null;
+  action:        AuditAction | string;
+  entityType?:   string | null;
+  entityId?:     string | null;
+  metadata?:     Record<string, unknown>;
+};
+
+export async function logAuditEvent(payload: AuditEventPayload): Promise<void> {
+  try {
+    await (getAuditSupa().from("audit_events") as any).insert({
+      actor_user_id:  payload.actorUserId,
+      target_user_id: payload.targetUserId  ?? null,
+      action:         payload.action,
+      entity_type:    payload.entityType    ?? null,
+      entity_id:      payload.entityId      ?? null,
+      metadata:       payload.metadata      ?? {},
+    });
+  } catch {
+    // Intentionally swallowed — audit must never break calling code.
+  }
+}
+
+// ─── Legacy types (used by audit_logs / writeAuditEvent below) ───────────────
+
 export type AuditActorType =
   | "customer_user"
   | "internal_user";

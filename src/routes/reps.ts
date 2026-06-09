@@ -23,7 +23,12 @@ const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function getRequesterId(req: Request) {
-  const id = String(req.header("x-user-id") || "").trim();
+  const id = String(
+    (req as any).userId ||
+    req.header("x-user-id") ||
+    req.header("x-gravix-user-id") ||
+    ""
+  ).trim();
 
   if (!id || !UUID_RE.test(id)) {
     return null;
@@ -95,6 +100,50 @@ async function assertOrgScopeOr403(args: {
     throw new Error("forbidden_org_scope");
   }
 }
+
+// GET /v1/reps/me — identity endpoint for the authenticated user
+repsRouter.get("/me", async (req: Request, res: Response) => {
+  try {
+    const userId =
+      String((req as any)?.userId || req.header("x-user-id") || "").trim();
+    if (!userId || !UUID_RE.test(userId)) {
+      return res.status(401).json({ ok: false, error: "missing_user" });
+    }
+
+    const { data: rep, error: repErr } = await sb
+      .from("reps")
+      .select("id, name, tier, company_id, org_id")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (repErr) return res.status(500).json({ ok: false, error: repErr.message });
+    if (!rep) return res.status(404).json({ ok: false, error: "rep_not_found" });
+
+    const company_id: string | null = (rep as any).company_id ?? null;
+
+    let partner_id: string | null = null;
+    if (company_id) {
+      const { data: company } = await sb
+        .from("companies")
+        .select("partner_id")
+        .eq("id", company_id)
+        .maybeSingle();
+      partner_id = (company as any)?.partner_id ?? null;
+    }
+
+    return res.json({
+      ok: true,
+      id: (rep as any).id,
+      name: (rep as any).name ?? null,
+      tier: (rep as any).tier ?? null,
+      company_id,
+      office_id: null,
+      partner_id,
+    });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || "reps_me_failed" });
+  }
+});
 
 repsRouter.get("/:id/overview", async (req: Request, res: Response) => {
   try {

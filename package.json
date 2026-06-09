@@ -4,6 +4,8 @@
     "cors": "^2.8.5",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
+    "express-rate-limit": "^8.5.2",
+    "helmet": "^8.2.0",
     "multer": "^2.0.2",
     "music-metadata": "^11.12.3",
     "node-fetch": "^3.3.2",
@@ -38,6 +40,23 @@
     "regression": "tsx scripts/api-regression.ts",
     "seed:demo": "tsx scripts/seed-demo-org.ts",
     "db:backfill": "tsx scripts/backfill-reps-company.ts",
-    "validate:isolation": "tsx scripts/validate-isolation.ts"
+    "validate:isolation": "tsx scripts/validate-isolation.ts",
+    "validate:partner": "tsx scripts/validate-partner.ts",
+    "validate:permissions": "tsx scripts/validate-permissions.ts",
+    "validate:audit": "tsx scripts/validate-audit.ts",
+    "validate:impersonation": "tsx scripts/validate-impersonation.ts",
+    "validate:user-management": "tsx scripts/validate-user-management.ts",
+    "validate:company-management": "tsx scripts/validate-company-management.ts",
+    "validate:profile-management": "tsx scripts/validate-profile-management.ts",
+    "validate:platform-admin": "tsx scripts/validate-platform-admin.ts",
+    "validate:auth": "tsx scripts/validate-auth.ts",
+    "validate:lighthouse": "tsx scripts/validate-lighthouse.ts",
+    "validate:licences": "tsx scripts/validate-licences.ts",
+    "validate:context-switching": "tsx scripts/validate-context-switching.ts",
+    "validate:security": "tsx scripts/validate-security.ts",
+    "validate:security-audit": "tsx scripts/validate-security-audit.ts",
+    "validate:rls": "tsx scripts/validate-rls.ts",
+    "validate:final-security": "tsx scripts/validate-final-security.ts",
+    "validate:identity-architecture": "tsx scripts/validate-identity-architecture.ts"
   }
 }

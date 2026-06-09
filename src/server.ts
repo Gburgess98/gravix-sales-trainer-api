@@ -11,6 +11,9 @@ import { postSlack, postAssignNotification /* , postScoreSummary */ } from "./li
 import { scoreWithLLM } from "./lib/scoring";
 import { cleanTranscript, buildSegments } from "./lib/transcript";
 
+import { securityHeaders } from "./middleware/security";
+import { globalRateLimit, authRateLimit, uploadRateLimit } from "./middleware/rateLimits";
+
 import callsRouter from "./routes/calls";
 import pinsRouter from "./routes/pins";
 import crmRouter from "./routes/crm";
@@ -27,6 +30,8 @@ import whispererRouter from "./routes/whisperer";
 import adminRouter from "./routes/admin";
 import { assignmentsRoutes } from "./routes/assignments";
 import accountsRouter from "./routes/accounts";
+import { usersRouter } from "./routes/users";
+import { authRouter }  from "./routes/auth";
 import debugRouter from "./routes/debug";
 
 
@@ -72,6 +77,9 @@ type UploadedFile = {
 
 const app = express();
 
+// Security headers must be first — before any route can respond without them.
+app.use(securityHeaders);
+
 app.get("/__probe", (req, res) => {
   res.setHeader("x-probe-server", "gravix-api-live");
   return res.status(200).json({ ok: true, probe: "gravix-api-live" });
@@ -113,7 +121,7 @@ const corsOptions: cors.CorsOptions = {
     if (allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error(`CORS: origin not allowed: ${origin}`));
   },
-  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: [
     "Content-Type",
     "Authorization",
@@ -129,6 +137,18 @@ const corsOptions: cors.CorsOptions = {
 
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
+
+// Global rate limit — applied after CORS so preflight OPTIONS requests
+// (which don't carry auth) are not unfairly charged against the limit.
+app.use(globalRateLimit);
+
+// Auth-specific throttle — applied per path before the auth router mounts.
+// Must come before app.use("/v1/auth", authRouter) below.
+app.use("/v1/auth/login",          authRateLimit);
+app.use("/v1/auth/reset-password", authRateLimit);
+
+// Upload throttle — each upload triggers backend jobs; limit abuse.
+app.use("/v1/upload", uploadRateLimit);
 
 // --- Request ID + timing ---
 app.use((req, res, next) => {
@@ -204,6 +224,42 @@ app.use((req, res, next) => {
       jwtUid,
       hint: "x-user-id and Authorization Bearer token sub do not match",
     });
+  }
+
+  return next();
+});
+
+// Impersonation middleware — runs after auth, before routes.
+// When x-impersonated-user-id is present, validates the actor is SuperAdmin
+// and swaps req.userId to the target for the duration of this request.
+// Stores the original actor as req.actorUserId for audit purposes.
+app.use(async (req, res, next) => {
+  const targetId = String(req.header("x-impersonated-user-id") || "").trim();
+  if (!targetId || !isUuid(targetId)) return next();
+
+  const actorId = (req as any).userId;
+  if (!actorId) {
+    return sendJsonError(res, 401, "impersonation_requires_auth");
+  }
+
+  try {
+    const { data: actor } = await supabase
+      .from("reps")
+      .select("tier")
+      .eq("id", actorId)
+      .maybeSingle();
+
+    if ((actor as any)?.tier !== "SuperAdmin") {
+      return sendJsonError(res, 403, "impersonation_requires_super_admin");
+    }
+
+    (req as any).actorUserId = actorId;
+    (req as any).userId      = targetId;
+    (res.locals as any).userId      = targetId;
+    (res.locals as any).actorUserId = actorId;
+    (res.locals as any).isImpersonating = true;
+  } catch {
+    return sendJsonError(res, 500, "impersonation_check_failed");
   }
 
   return next();
@@ -493,7 +549,31 @@ if (!DEFAULT_ORG_ID) {
    Uploads (multipart)
 ------------------------- */
 const BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "calls";
-const upload = multer({ storage: multer.memoryStorage() });
+
+// Upload constraints
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
+
+// Accepted MIME types for audio uploads and JSON call data.
+// Clients (especially mobile/browser) vary in what they report for the same
+// audio format, so we accept all common aliases.
+const ALLOWED_UPLOAD_MIMES = new Set([
+  "audio/wav", "audio/x-wav",
+  "audio/mpeg", "audio/mp3",
+  "audio/mp4", "audio/x-m4a", "audio/m4a",
+  "audio/aac", "audio/x-aac",
+  "audio/ogg",
+  "audio/webm",
+  "audio/flac", "audio/x-flac",
+  "video/webm",  // Chrome/Firefox record audio as video/webm
+  "video/mp4",   // Some iOS clients report video/mp4 for audio
+  "application/json",
+  "application/octet-stream", // generic binary — allow for legacy clients
+]);
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: MAX_UPLOAD_BYTES },
+});
 
 /* --- Helpers --- */
 function getUserId(req: express.Request): string {
@@ -639,6 +719,10 @@ app.post("/v1/upload/signed", async (req, res) => {
     };
     if (!filename) return res.status(400).json({ ok: false, error: "missing_filename" });
 
+    if (mime && !ALLOWED_UPLOAD_MIMES.has(mime)) {
+      return res.status(415).json({ ok: false, error: "unsupported_file_type", mimetype: mime });
+    }
+
     const isJson = (mime || "").includes("json") || filename.toLowerCase().endsWith(".json");
     const kind = isJson ? "json" : "audio";
     const id = crypto.randomUUID();
@@ -770,6 +854,14 @@ app.post(
       const userId = getUserId(req);
       const f = req.file;
       if (!f) return res.status(400).json({ ok: false, error: "No file uploaded" });
+
+      if (!ALLOWED_UPLOAD_MIMES.has(f.mimetype)) {
+        return res.status(415).json({
+          ok: false, error: "unsupported_file_type",
+          mimetype: f.mimetype,
+          hint: "Accepted: audio/wav, audio/mpeg, audio/mp4, audio/aac, audio/ogg, audio/webm, application/json",
+        });
+      }
 
       const isJson = f.mimetype.includes("json");
       const kind = isJson ? "json" : "audio";
@@ -1675,6 +1767,8 @@ app.use("/v1/sparring", sparringRouter);
 app.use("/v1/whisperer", whispererRouter);
 app.use("/v1/admin", adminRouter);
 app.use("/v1/assignments", assignmentsRoutes());
+app.use("/v1/users", usersRouter);
+app.use("/v1/auth",  authRouter);
 app.use("/v1/debug", debugRouter);
 
 // NOTE: we’re no longer mounting personasRouter here –
@@ -1893,6 +1987,19 @@ app.use((req, res) => {
 // Global error handler (last middleware)
 app.use((err: any, req: any, res: express.Response, _next: express.NextFunction) => {
   const rid = (req as any)?.rid || req?.headers?.["x-request-id"] || "no-rid";
+
+  // Multer file size exceeded
+  if (err?.code === "LIMIT_FILE_SIZE") {
+    return sendJsonError(res, 413, "file_too_large", {
+      maxBytes: MAX_UPLOAD_BYTES,
+      hint: `Maximum upload size is ${MAX_UPLOAD_BYTES / 1024 / 1024} MB`,
+    });
+  }
+  // Other multer limit errors
+  if (err?.code?.startsWith?.("LIMIT_")) {
+    return sendJsonError(res, 400, "upload_limit_exceeded", { code: err.code });
+  }
+
   console.error(`[${rid}] Uncaught`, err);
   return sendJsonError(res, 500, "Internal error");
 });

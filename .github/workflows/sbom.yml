@@ -1,0 +1,108 @@
+name: SBOM + Supply Chain
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "package.json"
+      - "package-lock.json"
+  release:
+    types: [published]
+  schedule:
+    # Weekly on Monday at 09:00 UTC (after the security audit runs at 08:00)
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # needed to attach SBOM to releases
+      id-token: write  # needed for attestation
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # Generate CycloneDX SBOM (JSON format)
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+          artifact-name: sbom-cyclonedx
+
+      # Generate SPDX SBOM (for broader tooling compatibility)
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+          artifact-name: sbom-spdx
+
+      # Scan the generated SBOM for known vulnerabilities
+      - name: Scan SBOM for vulnerabilities (Grype)
+        uses: anchore/scan-action@v3
+        id: grype
+        with:
+          sbom: sbom.cyclonedx.json
+          fail-build: false  # report only; don't fail on CVEs in dev deps
+          severity-cutoff: high
+
+      # Upload SBOM as workflow artifact for traceability
+      - name: Archive SBOMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: |
+            sbom.cyclonedx.json
+            sbom.spdx.json
+          retention-days: 90
+
+      # On releases: attach SBOMs to the GitHub release assets
+      - name: Attach SBOM to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            sbom.cyclonedx.json
+            sbom.spdx.json
+
+  ossf-scorecard:
+    name: OSSF Scorecard
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    # Only run on the default branch push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run OSSF Scorecard analysis
+        uses: ossf/scorecard-action@v2.4.0
+        with:
+          results_file: scorecard-results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scorecard-results.sarif
+          category: ossf-scorecard

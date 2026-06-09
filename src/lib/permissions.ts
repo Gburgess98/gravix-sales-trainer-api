@@ -106,3 +106,23 @@ export function buildUserContext(
     is_admin: Boolean(dbUser.is_admin),
   };
 }
+
+// ─── Tier-based helpers (reps.tier system) ────────────────────────────────────
+// These work with reps.tier strings, not users.role.
+// Ordered narrowest → broadest: SalesRep < Manager < Owner < PartnerAdmin < SuperAdmin
+
+export function isPartnerAdmin(tier: string | null | undefined): boolean {
+  return tier === "PartnerAdmin";
+}
+
+export function isSuperAdmin(tier: string | null | undefined): boolean {
+  return tier === "SuperAdmin";
+}
+
+export function isPartnerAdminOrAbove(tier: string | null | undefined): boolean {
+  return tier === "PartnerAdmin" || tier === "SuperAdmin";
+}
+
+export function isManagerOrAbove(tier: string | null | undefined): boolean {
+  return ["Manager", "Owner", "PartnerAdmin", "SuperAdmin"].includes(tier ?? "");
+}

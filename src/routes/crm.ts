@@ -17,7 +17,12 @@ const UUID_RE =
 const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
 
 function getUserIdHeader(req: any): string {
-  const uid = req.header("x-user-id");
+  const uid = String(
+    req.userId ||
+    req.header("x-user-id") ||
+    req.header("x-gravix-user-id") ||
+    ""
+  ).trim();
   if (!uid || !UUID_RE.test(uid)) throw new Error("Missing or invalid x-user-id");
   return uid;
 }
@@ -2194,7 +2199,9 @@ const PIPELINE_STAGES_DEFAULT = [
   "lost",
 ];
 
-const MANAGER_ROLES = new Set(["Manager", "Owner"]);
+// PartnerAdmin and SuperAdmin have at least manager-level access to their scope.
+// Phase 2 will add partner-level enforcement on top of this.
+const MANAGER_ROLES = new Set(["Manager", "Owner", "PartnerAdmin", "SuperAdmin"]);
 
 async function isManagerUser(userId: string) {
   try {
@@ -2213,10 +2220,10 @@ async function isManagerUser(userId: string) {
   }
 }
 
-// ─── Phase 1 identity bridge ────────────────────────────────────────────────
+// ─── Phase 1 identity bridge ─────────────────────────────────────────────────
 // After sql/20260604_reps_company_office_bridge.sql, reps has company_id and
-// office_id. This helper reads them so manager views scope by company, not by
-// the shared DEFAULT_ORG_ID that all reps currently share.
+// office_id. These helpers scope by company/partner rather than the shared
+// DEFAULT_ORG_ID that all reps currently share.
 
 type RepContext = {
   id: string;
@@ -2224,6 +2231,10 @@ type RepContext = {
   org_id: string | null;
   company_id: string | null;
   office_id: string | null;
+};
+
+type PartnerContext = RepContext & {
+  partner_id: string | null;
 };
 
 async function getRepContext(userId: string): Promise<RepContext | null> {
@@ -2246,6 +2257,36 @@ async function getRepContext(userId: string): Promise<RepContext | null> {
   } catch {
     return null;
   }
+}
+
+/**
+ * Returns the full identity context for a user: tier, company, office, and
+ * the partner that owns their company (post-Phase-2-migration).
+ *
+ * Falls back gracefully when the partners table or partner_id column does not
+ * exist yet — returns partner_id: null so callers can proceed without it.
+ */
+async function getPartnerContext(userId: string): Promise<PartnerContext | null> {
+  const repCtx = await getRepContext(userId);
+  if (!repCtx) return null;
+
+  let partnerId: string | null = null;
+
+  if (repCtx.company_id) {
+    try {
+      const { data } = await supa
+        .from("companies")
+        .select("partner_id")
+        .eq("id", repCtx.company_id)
+        .maybeSingle();
+
+      partnerId = (data as any)?.partner_id ?? null;
+    } catch {
+      // partners table or partner_id column not yet migrated — fail-soft
+    }
+  }
+
+  return { ...repCtx, partner_id: partnerId };
 }
 
 /**

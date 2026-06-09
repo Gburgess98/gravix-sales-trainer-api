@@ -1,7 +1,15 @@
 import type { Request, Response, NextFunction } from "express";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-const MANAGER_TIERS = new Set(["Manager", "Owner"]);
+// All tiers recognised by the system. Ordered from narrowest to broadest scope.
+// PartnerAdmin and SuperAdmin are defined here for recognition only —
+// permission enforcement for these tiers is implemented in Phase 2.
+export const ALL_TIERS = ["SalesRep", "Manager", "Owner", "PartnerAdmin", "SuperAdmin"] as const;
+export type RepTier = (typeof ALL_TIERS)[number];
+
+// Tiers allowed through requireManager middleware (company-level and above).
+// PartnerAdmin and SuperAdmin pass through — they have at least manager-level access.
+const MANAGER_TIERS = new Set<string>(["Manager", "Owner", "PartnerAdmin", "SuperAdmin"]);
 
 let _supabaseAdmin: SupabaseClient | null = null;
 function getSupabaseAdmin(): SupabaseClient {

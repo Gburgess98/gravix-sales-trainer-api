@@ -86,6 +86,9 @@ async function upsert(
 
 // ─── personas ────────────────────────────────────────────────────────────────
 
+// Demo company that all UFC Elite reps belong to (the existing Gravix demo company).
+const DEMO_COMPANY_ID = process.env.DEMO_COMPANY_ID || "bfb9604e-bc2f-46fa-be97-6461e98e1a19";
+
 const MANAGERS = [
   { name: "Dana White",      email: "dana.white@ufcelite.demo"       },
   { name: "Hunter Campbell", email: "hunter.campbell@ufcelite.demo"  },
@@ -299,12 +302,12 @@ async function seedReps(authMap: Map<string, string>): Promise<void> {
   for (const m of MANAGERS) {
     const id = authMap.get(m.email);
     if (!id) continue;
-    rows.push({ id, org_id: ORG_ID, name: m.name, tier: "Manager",  xp: seededInt(m.name, 0, 800, 1500), created_at: daysAgo(seededInt(m.name, 1, 90, 180)) });
+    rows.push({ id, org_id: ORG_ID, company_id: DEMO_COMPANY_ID, name: m.name, display_name: m.name, email: m.email, tier: "Manager",  xp: seededInt(m.name, 0, 800, 1500), created_at: daysAgo(seededInt(m.name, 1, 90, 180)) });
   }
   for (const r of REPS) {
     const id = authMap.get(r.email);
     if (!id) continue;
-    rows.push({ id, org_id: ORG_ID, name: r.name, tier: "SalesRep", xp: seededInt(r.name, 0, 200, 1200), created_at: daysAgo(seededInt(r.name, 1, 60, 120)) });
+    rows.push({ id, org_id: ORG_ID, company_id: DEMO_COMPANY_ID, name: r.name, display_name: r.name, email: r.email, tier: "SalesRep", xp: seededInt(r.name, 0, 200, 1200), created_at: daysAgo(seededInt(r.name, 1, 60, 120)) });
   }
 
   const n = await upsert("reps", rows, "id");
