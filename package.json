@@ -40,6 +40,7 @@
     "regression": "tsx scripts/api-regression.ts",
     "seed:demo": "tsx scripts/seed-demo-org.ts",
     "db:backfill": "tsx scripts/backfill-reps-company.ts",
+    "db:backfill-calls": "tsx scripts/backfill-calls-hierarchy.ts",
     "validate:isolation": "tsx scripts/validate-isolation.ts",
     "validate:partner": "tsx scripts/validate-partner.ts",
     "validate:permissions": "tsx scripts/validate-permissions.ts",

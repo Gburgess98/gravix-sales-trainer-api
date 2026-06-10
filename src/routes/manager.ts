@@ -154,15 +154,72 @@ export function weakestSkillOf(stageScores: Partial<Record<SkillKey, number>>): 
   return weakest;
 }
 
-export function needsReview(call: ScoredCallRow): boolean {
+// Reasons a scored call needs manager review (empty array = does not need review).
+export function reviewReasons(call: ScoredCallRow): string[] {
+  const reasons: string[] = [];
+
   const overall = Number(call.score_overall);
-  if (Number.isFinite(overall) && overall < REVIEW_SCORE_THRESHOLD) return true;
+  if (Number.isFinite(overall) && overall < REVIEW_SCORE_THRESHOLD) {
+    reasons.push(`Score below ${REVIEW_SCORE_THRESHOLD}`);
+  }
 
   const stages = extractStageScores(call.analysis_json);
-  return SKILL_KEYS.some((key) => {
+  for (const key of SKILL_KEYS) {
     const score = stages[key];
-    return typeof score === "number" && score < CRITICAL_STAGE_THRESHOLD;
-  });
+    if (typeof score === "number" && score < CRITICAL_STAGE_THRESHOLD) {
+      reasons.push(`${SKILL_LABELS[key]} below ${CRITICAL_STAGE_THRESHOLD}`);
+    }
+  }
+
+  if (call.analysis_json?.needs_manager_review === true && reasons.length === 0) {
+    reasons.push("Flagged for manager review");
+  }
+
+  return reasons;
+}
+
+export function needsReview(call: ScoredCallRow): boolean {
+  return reviewReasons(call).length > 0;
+}
+
+// ── Manager review history (call_manager_reviews, Day 91) ───────────────────
+// Fail-soft: until sql/20260610_call_manager_reviews.sql has been run in the
+// Supabase SQL editor the table is missing — treat as "no reviews yet" so the
+// command centre keeps working, and report availability to the caller.
+
+function isMissingReviewTableError(error: any): boolean {
+  const msg = String(error?.message || "").toLowerCase();
+  return msg.includes("call_manager_reviews") && (
+    msg.includes("does not exist") ||
+    msg.includes("could not find") ||
+    msg.includes("schema cache")
+  );
+}
+
+async function fetchReviewedCallIds(
+  db: any,
+  since: string
+): Promise<{ ids: Set<string>; available: boolean }> {
+  // Reviews are always created after their call, so filtering reviews by the
+  // same `since` window covers every in-window call. Hierarchy scoping is
+  // applied by intersecting with the already-scoped call set in the caller.
+  const { data, error } = await db
+    .from("call_manager_reviews")
+    .select("call_id")
+    .gte("created_at", since)
+    .limit(5000);
+
+  if (error) {
+    if (isMissingReviewTableError(error)) return { ids: new Set(), available: false };
+    throw error;
+  }
+
+  const ids = new Set<string>();
+  for (const row of data ?? []) {
+    const callId = String((row as any)?.call_id ?? "").trim();
+    if (callId) ids.add(callId);
+  }
+  return { ids, available: true };
 }
 
 export function computeTeamHealthStatus(args: {
@@ -247,7 +304,11 @@ router.get("/command-centre", async (req: Request, res: Response) => {
       .limit(1000);
     assignmentsQuery = applyHierarchyFilters(assignmentsQuery, userContext);
 
-    const [callsResult, assignmentsResult] = await Promise.all([callsQuery, assignmentsQuery]);
+    const [callsResult, assignmentsResult, reviewHistory] = await Promise.all([
+      callsQuery,
+      assignmentsQuery,
+      fetchReviewedCallIds(supa, since),
+    ]);
 
     if (callsResult.error) throw callsResult.error;
     if (assignmentsResult.error) throw assignmentsResult.error;
@@ -343,9 +404,18 @@ router.get("/command-centre", async (req: Request, res: Response) => {
 
     const teamAverage = teamScoreCount > 0 ? Math.round(teamScoreSum / teamScoreCount) : null;
 
-    // ── Calls needing review (lowest score first, cap 10) ──
-    const reviewCalls = scoredCalls
-      .filter(needsReview)
+    // ── Manager review history (Day 91) ──
+    // Reviewed = a row in call_manager_reviews for a call in the scoped window.
+    // Intersecting with the hierarchy-scoped call set keeps tenant isolation.
+    const reviewedScopedCalls = scoredCalls.filter((c) => reviewHistory.ids.has(String(c.id)));
+    const reviewedCount = reviewedScopedCalls.length;
+
+    // ── Calls needing review (unreviewed only, lowest score first, cap 10) ──
+    const unreviewedNeedingReview = scoredCalls.filter(
+      (c) => !reviewHistory.ids.has(String(c.id)) && needsReview(c)
+    );
+    const reviewCalls = unreviewedNeedingReview
+      .slice()
       .sort((a, b) => Number(a.score_overall ?? 101) - Number(b.score_overall ?? 101))
       .slice(0, 10)
       .map((call) => {
@@ -360,7 +430,7 @@ router.get("/command-centre", async (req: Request, res: Response) => {
           createdAt: String(call.created_at || ""),
         };
       });
-    const callsNeedingReviewCount = scoredCalls.filter(needsReview).length;
+    const callsNeedingReviewCount = unreviewedNeedingReview.length;
 
     // ── Reps needing attention (red first, then lowest average, cap 10) ──
     // Exclude the requesting manager's own calls from the attention list.
@@ -430,14 +500,15 @@ router.get("/command-centre", async (req: Request, res: Response) => {
       .filter((s) => s.count > 0)
       .sort((a, b) => a.averageScore - b.averageScore);
 
-    // ── ROI (Day 90: reviewed = scored; switches to call_manager_reviews on Day 91) ──
-    const callsReviewed = scoredCalls.length;
+    // ── ROI (Day 91: real manager reviews from call_manager_reviews) ──
+    const callsReviewed = reviewedCount;
     const estimatedMinutesSaved = callsReviewed * MINUTES_SAVED_PER_REVIEWED_CALL;
     const estimatedHoursSaved = Math.round((estimatedMinutesSaved / 60) * 10) / 10;
 
     return res.json({
       ok: true,
       windowDays: days,
+      reviewHistoryAvailable: reviewHistory.available,
       teamHealth: {
         status: computeTeamHealthStatus({
           averageScore: teamAverage,
@@ -445,7 +516,7 @@ router.get("/command-centre", async (req: Request, res: Response) => {
           overdueAssignments: overdueAssignmentRows.length,
         }),
         averageScore: teamAverage ?? 0,
-        reviewedCalls: scoredCalls.length,
+        reviewedCalls: reviewedCount,
         callsNeedingReview: callsNeedingReviewCount,
         openAssignments: openAssignmentRows.length,
         overdueAssignments: overdueAssignmentRows.length,
@@ -467,6 +538,93 @@ router.get("/command-centre", async (req: Request, res: Response) => {
       return res.status(500).json({ ok: false, error: msg });
     }
     return res.status(500).json({ ok: false, error: msg });
+  }
+});
+
+// ── GET /v1/manager/review-queue ─────────────────────────────────────────────
+// Scored calls that still need a manager review (excludes call_manager_reviews).
+
+router.get("/review-queue", async (req: Request, res: Response) => {
+  try {
+    if (!supa) throw new Error("server_missing_supabase_env");
+
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+
+    const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? "30"), 10) || 30));
+    const since = isoDaysAgo(days);
+
+    const rawLimit = parseInt(String(req.query.limit ?? "25"), 10);
+    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 25, 1), 100);
+
+    const userContext = await getUserContext(supa, userId);
+
+    let callsQuery = supa
+      .from("calls")
+      .select("id, user_id, filename, status, score_overall, analysis_json, created_at, office_id, company_id")
+      .eq("status", "scored")
+      .gte("created_at", since)
+      .order("created_at", { ascending: false })
+      .limit(2000);
+    callsQuery = applyHierarchyFilters(callsQuery, userContext);
+
+    const [callsResult, reviewHistory] = await Promise.all([
+      callsQuery,
+      fetchReviewedCallIds(supa, since),
+    ]);
+    if (callsResult.error) throw callsResult.error;
+
+    const scoredCalls = (callsResult.data ?? []) as ScoredCallRow[];
+
+    const queue = scoredCalls
+      .filter((c) => !reviewHistory.ids.has(String(c.id)))
+      .map((call) => ({ call, reasons: reviewReasons(call) }))
+      .filter(({ reasons }) => reasons.length > 0)
+      .sort((a, b) => {
+        const scoreDelta =
+          Number(a.call.score_overall ?? 101) - Number(b.call.score_overall ?? 101);
+        if (scoreDelta !== 0) return scoreDelta;
+        // Newest first as tie-breaker
+        return String(b.call.created_at || "").localeCompare(String(a.call.created_at || ""));
+      })
+      .slice(0, limit);
+
+    // Rep names (single best-effort lookup)
+    const repIds = Array.from(new Set(queue.map(({ call }) => String(call.user_id || "")).filter(Boolean)));
+    const repNames = new Map<string, string>();
+    if (repIds.length > 0) {
+      const { data: repRows } = await supa.from("reps").select("id, name").in("id", repIds);
+      for (const r of repRows ?? []) {
+        const name = String((r as any).name || "").trim();
+        if (name) repNames.set(String((r as any).id), name);
+      }
+    }
+
+    const items = queue.map(({ call, reasons }) => {
+      const stages = extractStageScores(call.analysis_json);
+      const weakest = weakestSkillOf(stages);
+      return {
+        callId: String(call.id),
+        repId: call.user_id ? String(call.user_id) : null,
+        repName: (call.user_id && repNames.get(String(call.user_id))) || "Unknown rep",
+        title: String(call.filename || "Untitled call"),
+        overallScore: Number.isFinite(Number(call.score_overall)) ? Number(call.score_overall) : 0,
+        weakestSkill: weakest ? SKILL_LABELS[weakest] : "Unknown",
+        createdAt: String(call.created_at || ""),
+        reasons,
+      };
+    });
+
+    return res.json({
+      ok: true,
+      windowDays: days,
+      reviewHistoryAvailable: reviewHistory.available,
+      items,
+      count: items.length,
+    });
+  } catch (e: any) {
+    console.error("[manager.review-queue] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "review_queue_failed" });
   }
 });
 

@@ -4,6 +4,12 @@ import { createClient } from "@supabase/supabase-js";
 import { postSlack } from "../lib/slack";
 import { completeAssignmentsForTarget } from "../lib/assignmentsComplete";
 import { sendReviewFeedbackEmail } from "../lib/email";
+import { requireManager } from "../middleware/requireManager";
+import {
+  isCompanyManager,
+  isOfficeManager,
+  type UserContext,
+} from "../lib/permissions";
 import 'dotenv/config';
 
 const router = Router();
@@ -80,6 +86,38 @@ async function getUserHierarchy(supa: any, userId: string) {
     office_id: data?.office_id || null,
     company_id: data?.company_id || null,
   };
+}
+
+// SPRINT 4 — Day 91: hierarchy context for manager-review scope checks.
+// Same users-table lookup pattern as dashboard.ts / manager.ts.
+async function getManagerUserContext(userId: string): Promise<UserContext | null> {
+  if (!userId) return null;
+
+  const { data } = await supa
+    .from("users")
+    .select("id, role, office_id, company_id, is_admin")
+    .eq("id", userId)
+    .maybeSingle();
+
+  if (!data) return null;
+
+  return {
+    id: String(data.id),
+    role: String(data.role || "rep"),
+    office_id: data.office_id || null,
+    company_id: data.company_id || null,
+    is_admin: Boolean(data.is_admin),
+  };
+}
+
+// True when call_manager_reviews has not been migrated yet (Day 91 migration).
+function isMissingReviewTableError(error: any): boolean {
+  const msg = String(error?.message || "").toLowerCase();
+  return msg.includes("call_manager_reviews") && (
+    msg.includes("does not exist") ||
+    msg.includes("could not find") ||
+    msg.includes("schema cache")
+  );
 }
 
 async function getManagerForRep(supa: any, repId: string) {
@@ -1449,6 +1487,90 @@ router.post("/:id/score", async (req, res) => {
       xp_awarded_total: xpAwardedTotal,
     });
   } catch (e: any) {
+    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+  }
+});
+
+/* -----------------------------------------------------------
+   POST /v1/calls/:id/manager-review → record a manager review
+   (SPRINT 4 — Day 91)
+   Gate: requireManager (reps.tier). Scope: hierarchy check against
+   the manager's UserContext (users.role), mirroring the visibility
+   rules used by /v1/manager/command-centre and review-queue.
+   Upserts into call_manager_reviews (unique on call_id — one review
+   clears the call for the team).
+------------------------------------------------------------ */
+router.post("/:id/manager-review", requireManager, async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    if (!UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid id" });
+
+    const requester = getUserIdHeader(req);
+
+    const { data: call, error: callErr } = await supa
+      .from("calls")
+      .select("id, user_id, org_id, office_id, company_id")
+      .eq("id", id)
+      .single();
+
+    if (callErr || !call) return res.status(404).json({ ok: false, error: "not_found" });
+
+    // Hierarchy scope: the manager must be able to see this call under the
+    // same rules as the command-centre/review-queue queries.
+    const ctx = await getManagerUserContext(requester);
+    if (isOfficeManager(ctx) && String(call.office_id || "") !== String(ctx?.office_id || "x")) {
+      return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
+    }
+    if (isCompanyManager(ctx) && String(call.company_id || "") !== String(ctx?.company_id || "x")) {
+      return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
+    }
+
+    const rawNote = (req.body as any)?.note;
+    const note =
+      typeof rawNote === "string" && rawNote.trim() ? rawNote.trim().slice(0, 2000) : null;
+
+    const nowIso = new Date().toISOString();
+    const { data: review, error: upsertErr } = await supa
+      .from("call_manager_reviews")
+      .upsert(
+        {
+          call_id: id,
+          manager_id: requester,
+          org_id: call.org_id ?? null,
+          company_id: call.company_id ?? ctx?.company_id ?? null,
+          office_id: call.office_id ?? ctx?.office_id ?? null,
+          status: "reviewed",
+          note,
+          updated_at: nowIso,
+        },
+        { onConflict: "call_id" }
+      )
+      .select("call_id, manager_id, status, note, created_at")
+      .single();
+
+    if (upsertErr) {
+      if (isMissingReviewTableError(upsertErr)) {
+        return res.status(503).json({
+          ok: false,
+          error: "migration_required",
+          hint: "Run sql/20260610_call_manager_reviews.sql in the Supabase SQL editor",
+        });
+      }
+      throw upsertErr;
+    }
+
+    return res.json({
+      ok: true,
+      review: {
+        callId: String(review.call_id),
+        managerId: String(review.manager_id),
+        status: String(review.status),
+        note: review.note ?? null,
+        createdAt: String(review.created_at),
+      },
+    });
+  } catch (e: any) {
+    console.error("[POST /:id/manager-review] error", e);
     res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
 });
