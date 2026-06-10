@@ -33,6 +33,7 @@ import accountsRouter from "./routes/accounts";
 import { usersRouter } from "./routes/users";
 import { authRouter }  from "./routes/auth";
 import debugRouter from "./routes/debug";
+import managerRouter from "./routes/manager";
 
 
 const REQUIRED_ENV = [
@@ -1767,6 +1768,7 @@ app.use("/v1/sparring", sparringRouter);
 app.use("/v1/whisperer", whispererRouter);
 app.use("/v1/admin", adminRouter);
 app.use("/v1/assignments", assignmentsRoutes());
+app.use("/v1/manager", managerRouter);
 app.use("/v1/users", usersRouter);
 app.use("/v1/auth",  authRouter);
 app.use("/v1/debug", debugRouter);
