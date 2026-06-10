@@ -423,6 +423,7 @@ router.get("/command-centre", async (req: Request, res: Response) => {
         const weakest = weakestSkillOf(stages);
         return {
           callId: String(call.id),
+          repId: call.user_id ? String(call.user_id) : null,
           repName: nameOf(call.user_id),
           title: String(call.filename || "Untitled call"),
           overallScore: Number.isFinite(Number(call.score_overall)) ? Number(call.score_overall) : 0,
