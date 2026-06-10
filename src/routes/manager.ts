@@ -268,8 +268,43 @@ function assignmentPriority(dueAt: string | null, now: number): "low" | "medium"
   const dueMs = new Date(dueAt).getTime();
   if (!Number.isFinite(dueMs)) return "low";
   if (dueMs < now) return "high";
-  if (dueMs < now + 48 * 3600 * 1000) return "medium";
+  if (dueMs < now + 24 * 3600 * 1000) return "medium";
   return "low";
+}
+
+// Day 93: prefer the manager-chosen meta.priority, fall back to due-date rule.
+function resolveAssignmentPriority(
+  meta: any,
+  dueAt: string | null,
+  now: number
+): "low" | "medium" | "high" {
+  const stored = String(meta?.priority || "").toLowerCase();
+  if (stored === "low" || stored === "medium" || stored === "high") return stored;
+  return assignmentPriority(dueAt, now);
+}
+
+// Day 93: normalised origin for assignment tracking badges.
+function assignmentOrigin(
+  source: string | null | undefined,
+  meta: any
+): { source: "manager_review" | "auto" | "manual" | "unknown"; label: string } {
+  const src = String(source || meta?.assignment_origin || "").toLowerCase();
+  if (src === "manager_review") return { source: "manager_review", label: "Assigned via review" };
+  if (src.includes("auto")) return { source: "auto", label: "Auto-created" };
+  if (src) return { source: "manual", label: "Manual assignment" };
+  return { source: "unknown", label: "Unknown" };
+}
+
+// Day 93: linked source call — meta.source_call_id, else target_id for call reviews.
+function assignmentSourceCallId(row: {
+  type?: string | null;
+  target_id?: string | null;
+  meta?: any;
+}): string | null {
+  const fromMeta = String(row.meta?.source_call_id || "").trim();
+  if (fromMeta) return fromMeta;
+  if (String(row.type || "") === "call_review" && row.target_id) return String(row.target_id);
+  return null;
 }
 
 // ── GET /v1/manager/command-centre ───────────────────────────────────────────
@@ -298,20 +333,46 @@ router.get("/command-centre", async (req: Request, res: Response) => {
 
     let assignmentsQuery = supa
       .from("assignments")
-      .select("id, rep_id, title, status, due_at, created_at, office_id, company_id")
+      .select("id, rep_id, title, status, due_at, created_at, type, target_id, source, meta, office_id, company_id")
       .eq("status", "assigned")
       .order("due_at", { ascending: true, nullsFirst: false })
       .limit(1000);
     assignmentsQuery = applyHierarchyFilters(assignmentsQuery, userContext);
 
-    const [callsResult, assignmentsResult, reviewHistory] = await Promise.all([
-      callsQuery,
-      assignmentsQuery,
-      fetchReviewedCallIds(supa, since),
-    ]);
+    // Day 94: previous matching window (the N days before `since`) for skill trends.
+    const prevSince = isoDaysAgo(days * 2);
+    let prevCallsQuery = supa
+      .from("calls")
+      .select("id, analysis_json, office_id, company_id")
+      .eq("status", "scored")
+      .gte("created_at", prevSince)
+      .lt("created_at", since)
+      .limit(2000);
+    prevCallsQuery = applyHierarchyFilters(prevCallsQuery, userContext);
+
+    // Day 94: completed assignments in the current window (count only).
+    let completedCountQuery = supa
+      .from("assignments")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "completed")
+      .gte("completed_at", since);
+    completedCountQuery = applyHierarchyFilters(completedCountQuery, userContext);
+
+    const [callsResult, assignmentsResult, reviewHistory, prevCallsResult, completedResult] =
+      await Promise.all([
+        callsQuery,
+        assignmentsQuery,
+        fetchReviewedCallIds(supa, since),
+        prevCallsQuery,
+        completedCountQuery,
+      ]);
 
     if (callsResult.error) throw callsResult.error;
     if (assignmentsResult.error) throw assignmentsResult.error;
+    // Trend/impact data is enrichment — fail soft so the command centre still loads.
+    if (prevCallsResult.error) console.warn("[manager.command-centre] prev window query failed", prevCallsResult.error.message);
+    const completedAssignments = completedResult.error ? 0 : (completedResult.count ?? 0);
+    if (completedResult.error) console.warn("[manager.command-centre] completed count failed", completedResult.error.message);
 
     const scoredCalls = (callsResult.data ?? []) as ScoredCallRow[];
     const openAssignmentRows = (assignmentsResult.data ?? []) as Array<{
@@ -321,6 +382,10 @@ router.get("/command-centre", async (req: Request, res: Response) => {
       status: string;
       due_at: string | null;
       created_at: string;
+      type: string | null;
+      target_id: string | null;
+      source: string | null;
+      meta: any;
     }>;
 
     // ── Rep name lookup (best-effort, single query) ──
@@ -474,13 +539,21 @@ router.get("/command-centre", async (req: Request, res: Response) => {
       .map((a) => {
         const dueMs = a.due_at ? new Date(a.due_at).getTime() : NaN;
         const isOverdue = Number.isFinite(dueMs) && dueMs < now;
+        const origin = assignmentOrigin(a.source, a.meta);
+        const notes = String(a.meta?.coaching_notes || "").trim() || null;
         return {
           assignmentId: String(a.id),
+          repId: a.rep_id ? String(a.rep_id) : null,
           repName: nameOf(a.rep_id),
           title: String(a.title || "Coaching assignment"),
           status: (isOverdue ? "overdue" : "open") as "open" | "overdue",
           dueAt: a.due_at ?? null,
-          priority: assignmentPriority(a.due_at, now),
+          priority: resolveAssignmentPriority(a.meta, a.due_at, now),
+          type: String(a.type || "custom"),
+          source: origin.source,
+          sourceCallId: assignmentSourceCallId(a),
+          originLabel: origin.label,
+          notes,
         };
       })
       .sort((a, b) => {
@@ -491,15 +564,73 @@ router.get("/command-centre", async (req: Request, res: Response) => {
       })
       .slice(0, 10);
 
+    // ── Previous-window skill averages (Day 94 trends) ──
+    const prevSkillAgg = new Map<SkillKey, { sum: number; count: number }>();
+    for (const call of (prevCallsResult.data ?? []) as Array<{ analysis_json: any }>) {
+      const stages = extractStageScores(call.analysis_json);
+      for (const key of SKILL_KEYS) {
+        const score = stages[key];
+        if (typeof score !== "number") continue;
+        const agg = prevSkillAgg.get(key) ?? { sum: 0, count: 0 };
+        agg.sum += score;
+        agg.count += 1;
+        prevSkillAgg.set(key, agg);
+      }
+    }
+
     // ── Weakest skills (weak occurrences, lowest average first) ──
+    // Trend: vs the previous matching window. Lower score = weaker, so
+    // "up" (delta >= 3) means the skill improved.
     const weakestSkills = Array.from(skillAgg.entries())
-      .map(([key, agg]) => ({
-        skill: SKILL_LABELS[key],
-        count: agg.weakCount,
-        averageScore: agg.count > 0 ? Math.round(agg.sum / agg.count) : 0,
-      }))
+      .map(([key, agg]) => {
+        const averageScore = agg.count > 0 ? Math.round(agg.sum / agg.count) : 0;
+        const prev = prevSkillAgg.get(key);
+        const previousAverageScore =
+          prev && prev.count > 0 ? Math.round(prev.sum / prev.count) : null;
+
+        let trend: "up" | "down" | "flat" | "new";
+        let trendLabel: string;
+        let delta: number | null = null;
+
+        if (previousAverageScore === null) {
+          trend = "new";
+          trendLabel = "New this period";
+        } else {
+          delta = averageScore - previousAverageScore;
+          if (delta >= 3) {
+            trend = "up";
+            trendLabel = `↑ from ${previousAverageScore}`;
+          } else if (delta <= -3) {
+            trend = "down";
+            trendLabel = `↓ from ${previousAverageScore}`;
+          } else {
+            trend = "flat";
+            trendLabel = "No major change";
+          }
+        }
+
+        return {
+          skill: SKILL_LABELS[key],
+          count: agg.weakCount,
+          averageScore,
+          previousAverageScore,
+          delta,
+          trend,
+          trendLabel,
+        };
+      })
       .filter((s) => s.count > 0)
       .sort((a, b) => a.averageScore - b.averageScore);
+
+    // ── Coaching impact (Day 94: cheap rule-based summary) ──
+    const skillsImproving = weakestSkills.filter((s) => s.trend === "up").length;
+    const skillsDeclining = weakestSkills.filter((s) => s.trend === "down").length;
+    const coachingImpact = {
+      completedAssignments,
+      skillsImproving,
+      skillsDeclining,
+      summary: `${skillsImproving} skill${skillsImproving === 1 ? "" : "s"} improving, ${skillsDeclining} declining`,
+    };
 
     // ── ROI (Day 91: real manager reviews from call_manager_reviews) ──
     const callsReviewed = reviewedCount;
@@ -526,6 +657,7 @@ router.get("/command-centre", async (req: Request, res: Response) => {
       callsNeedingReview: reviewCalls,
       openAssignments,
       weakestSkills,
+      coachingImpact,
       roi: {
         callsReviewed,
         estimatedMinutesSaved,
