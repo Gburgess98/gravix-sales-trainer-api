@@ -5,6 +5,7 @@ import { postSlack } from "../lib/slack";
 import { completeAssignmentsForTarget } from "../lib/assignmentsComplete";
 import { sendReviewFeedbackEmail } from "../lib/email";
 import { requireManager } from "../middleware/requireManager";
+import { logAuditEvent } from "../lib/audit";
 import {
   isCompanyManager,
   isOfficeManager,
@@ -1558,6 +1559,20 @@ router.post("/:id/manager-review", requireManager, async (req, res) => {
       }
       throw upsertErr;
     }
+
+    // Day 95: audit trail (fail-soft — logAuditEvent never throws)
+    void logAuditEvent({
+      actorUserId: requester,
+      action: "manager.call_reviewed",
+      entityType: "call",
+      entityId: id,
+      metadata: {
+        org_id: call.org_id ?? null,
+        company_id: call.company_id ?? ctx?.company_id ?? null,
+        office_id: call.office_id ?? ctx?.office_id ?? null,
+        note_present: Boolean(note),
+      },
+    });
 
     return res.json({
       ok: true,

@@ -10,6 +10,7 @@ import {
   canAccessCompany,
   type UserContext,
 } from "../lib/permissions.ts";
+import { logAuditEvent } from "../lib/audit";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -982,6 +983,26 @@ export function assignmentsRoutes() {
       .single();
 
     if (error) return res.status(500).json({ ok: false, error: error.message });
+
+    // Day 95: audit trail for review-driven coaching (fail-soft).
+    const assignmentOrigin = String(payload?.meta?.assignment_origin || payload?.source || "");
+    if (type === "call_review" && assignmentOrigin === "manager_review") {
+      void logAuditEvent({
+        actorUserId: managerId,
+        targetUserId: rep_id,
+        action: "manager.coaching_assigned_from_call",
+        entityType: "assignment",
+        entityId: String((data as any)?.id || ""),
+        metadata: {
+          rep_id,
+          call_id: payload?.target_id ?? safeMeta?.source_call_id ?? null,
+          flag_section: safeMeta?.flag_section ?? null,
+          priority: safeMeta?.priority ?? null,
+          company_id: repCompanyId,
+          office_id: repOfficeId,
+        },
+      });
+    }
 
     // 🔥 FAILURE TRACKING (CRITICAL)
     try {
