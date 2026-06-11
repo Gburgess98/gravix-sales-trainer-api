@@ -1493,6 +1493,66 @@ router.post("/:id/score", async (req, res) => {
 });
 
 /* -----------------------------------------------------------
+   GET /v1/calls/:id/manager-review → read manager review state
+   (SPRINT 4 — Day 96)
+   Same gate + hierarchy scope rules as the POST below.
+------------------------------------------------------------ */
+router.get("/:id/manager-review", requireManager, async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    if (!UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid id" });
+
+    const requester = getUserIdHeader(req);
+
+    const { data: call, error: callErr } = await supa
+      .from("calls")
+      .select("id, user_id, org_id, office_id, company_id")
+      .eq("id", id)
+      .single();
+
+    if (callErr || !call) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const ctx = await getManagerUserContext(requester);
+    if (isOfficeManager(ctx) && String(call.office_id || "") !== String(ctx?.office_id || "x")) {
+      return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
+    }
+    if (isCompanyManager(ctx) && String(call.company_id || "") !== String(ctx?.company_id || "x")) {
+      return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
+    }
+
+    const { data: review, error: reviewErr } = await supa
+      .from("call_manager_reviews")
+      .select("call_id, manager_id, status, note, created_at")
+      .eq("call_id", id)
+      .maybeSingle();
+
+    if (reviewErr) {
+      if (isMissingReviewTableError(reviewErr)) {
+        return res.json({ ok: true, reviewed: false, review: null, reviewHistoryAvailable: false });
+      }
+      throw reviewErr;
+    }
+
+    if (!review) return res.json({ ok: true, reviewed: false, review: null });
+
+    return res.json({
+      ok: true,
+      reviewed: true,
+      review: {
+        callId: String(review.call_id),
+        managerId: String(review.manager_id),
+        status: String(review.status),
+        note: review.note ?? null,
+        createdAt: String(review.created_at),
+      },
+    });
+  } catch (e: any) {
+    console.error("[GET /:id/manager-review] error", e);
+    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+  }
+});
+
+/* -----------------------------------------------------------
    POST /v1/calls/:id/manager-review → record a manager review
    (SPRINT 4 — Day 91)
    Gate: requireManager (reps.tier). Scope: hierarchy check against
