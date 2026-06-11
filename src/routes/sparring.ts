@@ -2996,6 +2996,12 @@ INSTRUCTIONS:
         throw insertErr;
       }
 
+      // Day 102 fix: the micro-score block and the emotional/state block both
+      // built their meta from the stale `session.meta` and wrote twice — the
+      // second write dropped micro_scores/failed_moments. The micro block now
+      // accumulates its additions here and the final block writes ONCE.
+      const pendingMetaPatch: Record<string, any> = {};
+
       // -----------------------------
       // Micro-score the REP turn (best-effort)
       // -----------------------------
@@ -3063,20 +3069,12 @@ INSTRUCTIONS:
               ? (currentMeta as any).failed_moments
               : [];
 
-            const mergedMeta: Record<string, any> = {
-              ...currentMeta,
-              micro_scores: [...existing, entry].slice(-200),
-
-              failed_moments: failedMoment
-                ? [...existingFailedMoments, failedMoment].slice(-50)
-                : existingFailedMoments,
-            };
-
-            // Preserve emotional_state / end flags which are also being written later
-            await supa
-              .from("sparring_sessions")
-              .update({ meta: mergedMeta } as any)
-              .eq("id", id);
+            // Day 102: accumulate instead of writing — the final merged write
+            // below persists these together with emotional state + brain state.
+            pendingMetaPatch.micro_scores = [...existing, entry].slice(-200);
+            pendingMetaPatch.failed_moments = failedMoment
+              ? [...existingFailedMoments, failedMoment].slice(-50)
+              : existingFailedMoments;
           } catch (e: any) {
             // non-fatal
           }
@@ -3086,6 +3084,8 @@ INSTRUCTIONS:
       }
 
       // Persist updated emotional state (and hang-up info if relevant) on the session meta (best-effort)
+      // Day 102: this is now the SINGLE meta write for the turn — it merges the
+      // micro-score additions (pendingMetaPatch) so nothing is dropped.
       try {
         const currentMeta =
           (session as any)?.meta && typeof (session as any).meta === "object"
@@ -3101,6 +3101,7 @@ INSTRUCTIONS:
 
         const mergedMeta: Record<string, any> = {
           ...currentMeta,
+          ...pendingMetaPatch,
           emotional_state: updatedEmotion,
           emotional_timeline: emotionalTimeline,
 
