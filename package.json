@@ -58,6 +58,8 @@
     "validate:security-audit": "tsx scripts/validate-security-audit.ts",
     "validate:rls": "tsx scripts/validate-rls.ts",
     "validate:final-security": "tsx scripts/validate-final-security.ts",
-    "validate:identity-architecture": "tsx scripts/validate-identity-architecture.ts"
+    "validate:identity-architecture": "tsx scripts/validate-identity-architecture.ts",
+    "validate-tier-2a-day-101": "bash scripts/validate-tier-2a-day-101.sh",
+    "validate:sparring-state": "tsx scripts/validate-sparring-state.ts"
   }
 }

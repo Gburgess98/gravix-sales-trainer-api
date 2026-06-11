@@ -2,6 +2,12 @@ import { Router } from "express";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { postSlack } from "../lib/slack";
+import { completeAssignmentsForTarget } from "../lib/assignmentsComplete";
+import { sendReviewFeedbackEmail } from "../lib/email";
+import { requireManager } from "../middleware/requireManager";
+import { logAuditEvent } from "../lib/audit";
+import { isCompanyManager, isOfficeManager, } from "../lib/permissions";
+import 'dotenv/config';
 const router = Router();
 const supa = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 const CreateCallSchema = z.object({
@@ -16,13 +22,586 @@ const CreateCallSchema = z.object({
 const ScoreSchema = z.object({
     score_overall: z.number().min(0).max(100),
     rubric: z.any().optional(),
+    transcript_text: z.string().optional(),
+    summary: z.string().optional(),
+    // Optional: if the client launched this score action from an assignment CTA (used for auto-complete)
+    assignmentId: z.string().uuid().optional(),
 });
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 function getUserIdHeader(req) {
-    const uid = req.header("x-user-id");
-    if (!uid || !UUID_RE.test(uid))
+    // Accept a few aliases to be resilient across proxies/CDNs
+    const cand = req.header("x-user-id") ||
+        req.header("x-gravix-user-id") ||
+        req.header("x-forwarded-user-id") ||
+        null;
+    // Optional DEV-only escape hatch via query string (ONLY if you enable it)
+    const allowQs = process.env.ALLOW_DEV_UID_QS === "1";
+    const qsUid = allowQs ? req.query?.dev_uid : undefined;
+    const uid = (cand || qsUid || "").trim();
+    if (!uid || !UUID_RE.test(uid)) {
         throw new Error("Missing or invalid x-user-id");
+    }
     return uid;
+}
+async function getRequesterOrgId(requester) {
+    const { data, error } = await supa
+        .from("calls")
+        .select("org_id")
+        .eq("user_id", requester)
+        .not("org_id", "is", null)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+    if (error)
+        throw error;
+    return data?.org_id ?? null;
+}
+async function getUserHierarchy(supa, userId) {
+    const { data } = await supa
+        .from("users")
+        .select("office_id, company_id")
+        .eq("id", userId)
+        .maybeSingle();
+    return {
+        office_id: data?.office_id || null,
+        company_id: data?.company_id || null,
+    };
+}
+// SPRINT 4 — Day 91: hierarchy context for manager-review scope checks.
+// Same users-table lookup pattern as dashboard.ts / manager.ts.
+async function getManagerUserContext(userId) {
+    if (!userId)
+        return null;
+    const { data } = await supa
+        .from("users")
+        .select("id, role, office_id, company_id, is_admin")
+        .eq("id", userId)
+        .maybeSingle();
+    if (!data)
+        return null;
+    return {
+        id: String(data.id),
+        role: String(data.role || "rep"),
+        office_id: data.office_id || null,
+        company_id: data.company_id || null,
+        is_admin: Boolean(data.is_admin),
+    };
+}
+// True when call_manager_reviews has not been migrated yet (Day 91 migration).
+function isMissingReviewTableError(error) {
+    const msg = String(error?.message || "").toLowerCase();
+    return msg.includes("call_manager_reviews") && (msg.includes("does not exist") ||
+        msg.includes("could not find") ||
+        msg.includes("schema cache"));
+}
+async function getManagerForRep(supa, repId) {
+    const { data: user } = await supa
+        .from("users")
+        .select("manager_id, office_id")
+        .eq("id", repId)
+        .maybeSingle();
+    if (!user?.manager_id) {
+        return {
+            manager: null,
+            office_id: user?.office_id || null,
+        };
+    }
+    const { data: manager } = await supa
+        .from("users")
+        .select("id, email, role, office_id")
+        .eq("id", user.manager_id)
+        .maybeSingle();
+    return {
+        manager: manager || null,
+        office_id: user?.office_id || null,
+    };
+}
+import { getOrgCallVisibility } from "../lib/adminConfig";
+async function canAccessCall(requester, callUserId, callOrgId) {
+    if (callUserId === requester)
+        return true;
+    if (!callOrgId)
+        return false;
+    const requesterOrgId = await getRequesterOrgId(requester);
+    if (!requesterOrgId || requesterOrgId !== callOrgId)
+        return false;
+    const visibility = await getOrgCallVisibility(callOrgId);
+    if (visibility === "disabled")
+        return false;
+    if (visibility === "everyone")
+        return true;
+    if (visibility === "managers") {
+        // TEMP: treat users with assignments as "managers"
+        const { data } = await supa
+            .from("assignments")
+            .select("id")
+            .eq("manager_id", requester)
+            .limit(1);
+        return (data?.length ?? 0) > 0;
+    }
+    return false;
+}
+async function getOpenAssignmentCallIds(callIds) {
+    const ids = Array.from(new Set(callIds.map((x) => String(x || "").trim()).filter(Boolean)));
+    if (!ids.length)
+        return new Set();
+    const { data, error } = await supa
+        .from("assignments")
+        .select("target_id,type,status")
+        .in("target_id", ids)
+        .eq("type", "call_review")
+        .in("status", ["open", "assigned", "todo", "in_progress"]);
+    if (error) {
+        console.warn("[calls] open assignment lookup failed", error.message || error);
+        return new Set();
+    }
+    const out = new Set();
+    for (const row of data ?? []) {
+        const targetId = String(row?.target_id ?? "").trim();
+        if (targetId)
+            out.add(targetId);
+    }
+    return out;
+}
+const FILLER_WORDS = [
+    "um",
+    "uh",
+    "like",
+    "you know",
+    "sort of",
+    "kind of",
+    "basically",
+    "actually",
+    "literally",
+    "i mean",
+];
+function clampScore(n) {
+    return Math.max(0, Math.min(100, Math.round(n)));
+}
+function analyseFillers(text) {
+    const raw = String(text || "").toLowerCase();
+    const words = raw.match(/\b[\w']+\b/g) ?? [];
+    const totalWords = words.length;
+    let totalFillers = 0;
+    const hits = new Map();
+    for (const filler of FILLER_WORDS) {
+        const escaped = filler.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const re = new RegExp(`\\b${escaped}\\b`, "gi");
+        const matches = raw.match(re) ?? [];
+        if (matches.length) {
+            totalFillers += matches.length;
+            hits.set(filler, matches.length);
+        }
+    }
+    return {
+        total_words: totalWords,
+        filler_count: totalFillers,
+        filler_words: Array.from(hits.keys()),
+        filler_breakdown: Object.fromEntries(hits.entries()),
+        filler_density: totalWords > 0 ? totalFillers / totalWords : 0,
+    };
+}
+function detectWeakClose(args) {
+    const closeScore = typeof args.closeScore === "number" ? args.closeScore : null;
+    const text = String(args.text || "").toLowerCase();
+    const strongCloseSignals = [
+        "next step",
+        "book a time",
+        "schedule",
+        "calendar",
+        "let's do",
+        "shall we",
+        "send over",
+        "move forward",
+        "get started",
+        "does that sound fair",
+        "how does that sound",
+    ];
+    const hasStrongCloseLanguage = strongCloseSignals.some((s) => text.includes(s));
+    if (closeScore !== null && closeScore < 60)
+        return true;
+    if (text && !hasStrongCloseLanguage)
+        return true;
+    return false;
+}
+// 🔥 OBJECTION + TIMESTAMP DETECTION (Day 66)
+function detectObjectionMoments(text) {
+    const lower = String(text || "").toLowerCase();
+    const objectionPhrases = [
+        "too expensive",
+        "not interested",
+        "need to think",
+        "send me info",
+        "call me back",
+        "already using",
+        "happy with",
+        "no budget",
+        "not right now",
+    ];
+    const events = [];
+    const sentences = lower.split(/[.!?]/);
+    let wordIndex = 0;
+    for (const sentence of sentences) {
+        const words = sentence.trim().split(/\s+/);
+        if (!words.length)
+            continue;
+        for (const phrase of objectionPhrases) {
+            if (sentence.includes(phrase)) {
+                events.push({
+                    type: "objection",
+                    timestamp: wordIndex, // simple proxy (can upgrade later)
+                    phrase,
+                });
+            }
+        }
+        wordIndex += words.length;
+    }
+    return events;
+}
+// 🔥 STAGE CLASSIFICATION (Day 66)
+function classifyCallStages(text) {
+    const lower = String(text || "").toLowerCase();
+    const words = lower.split(/\s+/);
+    const total = words.length;
+    const stages = [];
+    if (total === 0)
+        return stages;
+    // Simple heuristic split (can upgrade later with AI)
+    const introEnd = Math.floor(total * 0.15);
+    const discoveryEnd = Math.floor(total * 0.5);
+    const objectionEnd = Math.floor(total * 0.8);
+    stages.push({ stage: "intro", start: 0, end: introEnd });
+    stages.push({ stage: "discovery", start: introEnd, end: discoveryEnd });
+    stages.push({ stage: "objection", start: discoveryEnd, end: objectionEnd });
+    stages.push({ stage: "close", start: objectionEnd, end: total });
+    return stages;
+}
+function buildVoiceScore(args) {
+    const transcriptText = String(args.transcriptText || "");
+    const filler = analyseFillers(transcriptText);
+    const weakClose = detectWeakClose({ closeScore: args.closeScore, text: transcriptText });
+    const objectionEvents = detectObjectionMoments(transcriptText);
+    const stages = classifyCallStages(transcriptText);
+    // attach stage to each event
+    const enrichedEvents = objectionEvents.map((e) => {
+        const stage = stages.find(s => e.timestamp >= s.start && e.timestamp < s.end);
+        return {
+            ...e,
+            stage: stage?.stage || "unknown"
+        };
+    });
+    const fillerPenalty = filler.filler_density * 220;
+    const fillerScore = clampScore(100 - fillerPenalty);
+    const clarity = clampScore(92 - filler.filler_density * 160);
+    const tone = clampScore(82 - filler.filler_density * 70 + (weakClose ? -4 : 4));
+    const confidence = clampScore(84 - filler.filler_density * 110 - (weakClose ? 10 : 0));
+    const close = clampScore(args.closeScore ?? (weakClose ? 50 : 78));
+    const voice_rubric = {
+        tone,
+        clarity,
+        confidence,
+        filler: fillerScore,
+        close,
+    };
+    const voice_score = clampScore(tone * 0.2 + clarity * 0.25 + confidence * 0.2 + fillerScore * 0.15 + close * 0.2);
+    const stageSummary = {};
+    for (const e of enrichedEvents) {
+        stageSummary[e.stage] = (stageSummary[e.stage] || 0) + 1;
+    }
+    const review_tags = {
+        filler_words: filler.filler_words,
+        filler_count: filler.filler_count,
+        filler_density: Number(filler.filler_density.toFixed(4)),
+        weak_close: weakClose,
+        objection_count: enrichedEvents.length,
+        objection_phrases: enrichedEvents.map(e => e.phrase),
+        stage_breakdown: stageSummary,
+        events: [
+            ...enrichedEvents,
+            ...(weakClose ? [{ type: "weak_close", timestamp: transcriptText.length, stage: "close" }] : []),
+        ],
+    };
+    return { voice_score, voice_rubric, review_tags };
+}
+function compactText(value, max = 240) {
+    const s = String(value ?? "").replace(/\s+/g, " ").trim();
+    if (!s)
+        return "";
+    return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+async function resolveReviewFeedbackContext(args) {
+    const { assignmentId, callId, repId } = args;
+    let managerId = null;
+    let resolvedAssignmentId = assignmentId ?? null;
+    if (assignmentId) {
+        const r = await supa
+            .from("assignments")
+            .select("id,rep_id,manager_id,target_id,type,status")
+            .eq("id", assignmentId)
+            .maybeSingle();
+        if (!r.error && r.data) {
+            managerId = r.data.manager_id ? String(r.data.manager_id) : null;
+            resolvedAssignmentId = r.data.id ? String(r.data.id) : assignmentId;
+        }
+    }
+    if (!managerId) {
+        const managerContext = await getManagerForRep(supa, repId);
+        if (managerContext?.manager?.id) {
+            managerId = String(managerContext.manager.id);
+        }
+        const fallback = await supa
+            .from("assignments")
+            .select("id,rep_id,manager_id,target_id,type,status,created_at")
+            .eq("rep_id", repId)
+            .eq("type", "call_review")
+            .eq("target_id", callId)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        if (!fallback.error && fallback.data) {
+            managerId = fallback.data.manager_id
+                ? String(fallback.data.manager_id)
+                : managerId;
+            resolvedAssignmentId = fallback.data.id
+                ? String(fallback.data.id)
+                : resolvedAssignmentId;
+        }
+    }
+    return {
+        repId,
+        managerId,
+        assignmentId: resolvedAssignmentId,
+    };
+}
+async function lookupUserContactBestEffort(userId) {
+    const tablePlans = [
+        {
+            table: "profiles",
+            selects: [
+                "id,email,full_name,name",
+                "id,email,full_name",
+                "id,email,name",
+                "id,email",
+            ],
+            predicates: [{ col: "id", value: userId }],
+            emailKeys: ["email"],
+            nameKeys: ["full_name", "name"],
+        },
+        {
+            table: "users",
+            selects: [
+                "id,email,full_name,name",
+                "id,email,full_name",
+                "id,email,name",
+                "id,email",
+            ],
+            predicates: [{ col: "id", value: userId }],
+            emailKeys: ["email"],
+            nameKeys: ["full_name", "name"],
+        },
+        {
+            table: "team_users",
+            selects: [
+                "id,email,full_name,name",
+                "id,email,full_name",
+                "id,email,name",
+                "id,email",
+            ],
+            predicates: [{ col: "id", value: userId }],
+            emailKeys: ["email"],
+            nameKeys: ["full_name", "name"],
+        },
+        {
+            table: "reps",
+            selects: [
+                "id,email,full_name,name",
+                "id,email,full_name",
+                "id,email,name",
+                "id,email",
+            ],
+            predicates: [{ col: "id", value: userId }],
+            emailKeys: ["email"],
+            nameKeys: ["full_name", "name"],
+        },
+    ];
+    for (const plan of tablePlans) {
+        for (const select of plan.selects) {
+            let q = supa.from(plan.table).select(select).limit(1);
+            for (const predicate of plan.predicates) {
+                q = q.eq(predicate.col, predicate.value);
+            }
+            const r = await q.maybeSingle();
+            if (r.error) {
+                const msg = String(r.error?.message ?? "").toLowerCase();
+                if ((msg.includes("relation") && msg.includes("does not exist")) ||
+                    msg.includes("could not find the table") ||
+                    (msg.includes("column") && msg.includes("does not exist")) ||
+                    (msg.includes("schema cache") && msg.includes("column"))) {
+                    continue;
+                }
+                continue;
+            }
+            const row = r.data;
+            if (!row)
+                continue;
+            const email = plan.emailKeys
+                .map((k) => String(row?.[k] ?? "").trim())
+                .find(Boolean) || null;
+            const name = plan.nameKeys
+                .map((k) => String(row?.[k] ?? "").trim())
+                .find(Boolean) || null;
+            if (email || name) {
+                return { email, name };
+            }
+        }
+    }
+    return { email: null, name: null };
+}
+async function autoSendReviewFeedbackEmailBestEffort(args) {
+    try {
+        const context = await resolveReviewFeedbackContext({
+            assignmentId: args.assignmentId ?? null,
+            callId: args.callId,
+            repId: args.repId,
+        });
+        const repContact = await lookupUserContactBestEffort(context.repId);
+        const managerContact = context.managerId
+            ? await lookupUserContactBestEffort(context.managerId)
+            : { email: null, name: null };
+        console.log("[review feedback email] attempting", {
+            callId: args.callId,
+            repId: context.repId,
+            managerId: context.managerId,
+            repEmail: repContact.email,
+            managerEmail: managerContact.email,
+            assignmentId: context.assignmentId,
+        });
+        if (!repContact.email && !managerContact.email) {
+            console.warn("[review feedback email] skipped: no email recipients", {
+                repId: context.repId,
+                managerId: context.managerId,
+                callId: args.callId,
+            });
+            return;
+        }
+        const result = await sendReviewFeedbackEmail({
+            repEmail: repContact.email,
+            managerEmail: managerContact.email,
+            repName: repContact.name,
+            managerName: managerContact.name,
+            callId: args.callId,
+            scoreOverall: args.scoreOverall,
+            voiceScore: args.voiceScore,
+            summary: args.summary ?? null,
+            weakClose: Boolean(args.reviewTags?.weak_close),
+            fillerCount: Number(args.reviewTags?.filler_count ?? 0),
+            fillerWords: Array.isArray(args.reviewTags?.filler_words) ? args.reviewTags.filler_words : [],
+            assignmentId: context.assignmentId,
+            appUrl: process.env.WEB_APP_URL || process.env.WEB_ORIGIN || "http://localhost:3000",
+        });
+        if (result?.ok) {
+            console.log("[review feedback email] sent", {
+                callId: args.callId,
+                messageId: result.id ?? null,
+                repEmail: repContact.email,
+                managerEmail: managerContact.email,
+            });
+        }
+        else {
+            console.warn("[review feedback email] send failed", {
+                callId: args.callId,
+                error: result?.error || "unknown_email_send_failure",
+                repEmail: repContact.email,
+                managerEmail: managerContact.email,
+            });
+        }
+    }
+    catch (e) {
+        console.warn("[review feedback email] failed", e?.message || e);
+    }
+}
+async function autoSendReviewFeedbackBestEffort(args) {
+    try {
+        const context = await resolveReviewFeedbackContext({
+            assignmentId: args.assignmentId ?? null,
+            callId: args.callId,
+            repId: args.repId,
+        });
+        const appUrl = process.env.WEB_APP_URL || process.env.WEB_ORIGIN || "http://localhost:3000";
+        const callUrl = `${appUrl}/calls/${args.callId}`;
+        const score = Number.isFinite(args.scoreOverall) ? Math.round(args.scoreOverall) : 0;
+        const voice = Number.isFinite(args.voiceScore) ? Math.round(args.voiceScore) : 0;
+        const weakClose = Boolean(args.reviewTags?.weak_close);
+        const fillerCount = Number(args.reviewTags?.filler_count ?? 0);
+        const fillerWords = Array.isArray(args.reviewTags?.filler_words)
+            ? args.reviewTags.filler_words.slice(0, 5).join(", ")
+            : "";
+        const audience = [
+            `Rep: ${context.repId}`,
+            context.managerId ? `Manager: ${context.managerId}` : null,
+            context.assignmentId ? `Assignment: ${context.assignmentId}` : null,
+        ]
+            .filter(Boolean)
+            .join("\n");
+        const coachingFlags = [
+            weakClose ? "Weak close" : null,
+            fillerCount > 0 ? `Fillers: ${fillerCount}` : null,
+            fillerWords ? `Top fillers: ${fillerWords}` : null,
+        ]
+            .filter(Boolean)
+            .join("\n");
+        await postSlack(`Review complete · score ${score} · rep ${context.repId}`, [
+            {
+                type: "section",
+                text: {
+                    type: "mrkdwn",
+                    text: `*Review complete*\n${audience || `Rep: ${context.repId}`}`,
+                },
+            },
+            {
+                type: "section",
+                fields: [
+                    { type: "mrkdwn", text: `*Call score*\n${score}` },
+                    { type: "mrkdwn", text: `*Voice score*\n${voice}` },
+                ],
+            },
+            ...(coachingFlags
+                ? [
+                    {
+                        type: "section",
+                        text: {
+                            type: "mrkdwn",
+                            text: `*Coaching flags*\n${coachingFlags}`,
+                        },
+                    },
+                ]
+                : []),
+            ...(compactText(args.summary)
+                ? [
+                    {
+                        type: "section",
+                        text: {
+                            type: "mrkdwn",
+                            text: `*Summary*\n${compactText(args.summary)}`,
+                        },
+                    },
+                ]
+                : []),
+            {
+                type: "actions",
+                elements: [
+                    {
+                        type: "button",
+                        text: { type: "plain_text", text: "Open reviewed call" },
+                        url: callUrl,
+                    },
+                ],
+            },
+        ]);
+    }
+    catch (e) {
+        console.warn("[review feedback dispatch] failed", e?.message || e);
+    }
 }
 /* ---------------------------------------------
    POST /v1/calls  → insert (upsert) + Slack ping
@@ -30,13 +609,27 @@ function getUserIdHeader(req) {
 router.post("/", async (req, res) => {
     try {
         const body = CreateCallSchema.parse(req.body);
+        const hierarchy = await getUserHierarchy(supa, body.userId);
+        if (!hierarchy.office_id) {
+            return res.status(400).json({
+                ok: false,
+                error: "user_missing_office",
+            });
+        }
+        if (!hierarchy.company_id) {
+            return res.status(400).json({
+                ok: false,
+                error: "user_missing_company",
+            });
+        }
         const insert = {
             user_id: body.userId,
             org_id: process.env.DEFAULT_ORG_ID ?? null, // adapt if NOT NULL
+            office_id: hierarchy.office_id,
+            company_id: hierarchy.company_id,
             filename: body.fileName,
             storage_path: body.storagePath,
             size_bytes: body.sizeBytes ?? null,
-            // keep other fields null; your /v1/upload flow also inserts, but this route is
             // specifically for "upload from web already done" → Slack + mirror row if needed.
             status: "uploaded",
             kind: "audio",
@@ -52,8 +645,11 @@ router.post("/", async (req, res) => {
             .single();
         if (error)
             throw error;
+        if (!data)
+            throw new Error("upsert returned no row");
         const appUrl = process.env.WEB_APP_URL || process.env.WEB_ORIGIN || "http://localhost:3000";
         const recentLink = `${appUrl}/recent-calls`;
+        const callLink = `${appUrl}/calls/${data.id}`;
         await postSlack(`New call from ${body.userEmail}`, [
             {
                 type: "section",
@@ -77,6 +673,15 @@ router.post("/", async (req, res) => {
                         text: { type: "plain_text", text: "Open Recent Calls" },
                         url: recentLink,
                     },
+                    ...(data?.id
+                        ? [
+                            {
+                                type: "button",
+                                text: { type: "plain_text", text: "Open This Call" },
+                                url: callLink,
+                            },
+                        ]
+                        : []),
                 ],
             },
         ]);
@@ -93,27 +698,103 @@ router.post("/", async (req, res) => {
 ------------------------------------------------------------ */
 router.get("/", async (req, res) => {
     try {
-        const userId = String(req.query.userId ?? "");
-        const limit = Math.min(Number(req.query.limit ?? 10), 50);
-        if (!userId)
-            return res.status(400).json({ ok: false, error: "userId required" });
-        const { data, error } = await supa
+        const requester = getUserIdHeader(req);
+        const rawLimit = Number(req.query.limit ?? 10);
+        const limit = Math.min(Math.max(rawLimit, 1), 50);
+        const search = req.query.q?.trim() ?? "";
+        const scope = String(req.query.scope ?? "mine").toLowerCase() === "company" ? "company" : "mine";
+        const requesterOrgId = scope === "company"
+            ? (await getRequesterOrgId(requester)) ??
+                (process.env.NODE_ENV !== "production" ? process.env.DEFAULT_ORG_ID ?? null : null)
+            : null;
+        console.log("[calls/list]", {
+            requester,
+            scope,
+            requesterOrgId,
+            search,
+            limit,
+        });
+        let q = supa
             .from("calls")
-            .select("*")
-            .eq("user_id", userId)
+            .select(`
+        id,
+        user_id,
+        org_id,
+        filename,
+        storage_path,
+        status,
+        created_at,
+        duration_sec,
+        duration_ms,
+        score_overall,
+        ai_model,
+        rep_name,
+        tags,
+        summary,
+        flags
+      `)
             .order("created_at", { ascending: false })
             .limit(limit);
+        if (scope === "company") {
+            if (!requesterOrgId) {
+                return res.status(403).json({ ok: false, error: "missing_org_scope" });
+            }
+            const visibility = await getOrgCallVisibility(requesterOrgId);
+            if (visibility === "disabled") {
+                return res.status(403).json({ ok: false, error: "company_calls_disabled" });
+            }
+            if (visibility === "managers") {
+                const { data } = await supa
+                    .from("assignments")
+                    .select("id")
+                    .eq("manager_id", requester)
+                    .limit(1);
+                if (!data?.length) {
+                    return res.status(403).json({ ok: false, error: "manager_only_access" });
+                }
+            }
+            q = q.eq("org_id", requesterOrgId);
+        }
+        else {
+            q = q.eq("user_id", requester);
+        }
+        if (search) {
+            q = q.or(`filename.ilike.%${search}%,summary.ilike.%${search}%`);
+        }
+        const { data, error } = await q;
         if (error)
             throw error;
-        res.json({ ok: true, calls: data });
+        const openAssignmentCallIds = await getOpenAssignmentCallIds((data ?? []).map((c) => String(c.id ?? "")));
+        const calls = (data ?? []).map((c) => ({
+            id: c.id,
+            filename: c.filename,
+            status: c.status,
+            created_at: c.created_at,
+            duration_sec: c.duration_sec,
+            duration_ms: c.duration_ms ?? null,
+            score_overall: c.score_overall,
+            ai_model: c.ai_model,
+            type: c.storage_path ? "upload" : "live",
+            rep_name: c.rep_name ?? null,
+            tags: c.tags ?? null,
+            summary: c.summary ?? null,
+            flags: c.flags ?? [],
+            has_open_assignment: openAssignmentCallIds.has(String(c.id)),
+        }));
+        console.log("[calls/list/result]", {
+            scope,
+            requester,
+            requesterOrgId,
+            returned: calls.length,
+        });
+        res.json({ ok: true, calls });
     }
     catch (e) {
-        res.status(400).json({ ok: false, error: e.message });
+        res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
     }
 });
 /* -----------------------------------------------------------------
-   GET /v1/calls/paged?limit=10&cursor=<ISO or epoch>  → cursor paging
-   - Uses x-user-id header for the requester (safer for service-role API)
+   GET /v1/calls/paged?limit=10&cursor=...
 ------------------------------------------------------------------ */
 router.get("/paged", async (req, res) => {
     try {
@@ -121,40 +802,127 @@ router.get("/paged", async (req, res) => {
         const rawLimit = Number(req.query.limit ?? 10);
         const limit = Math.min(Math.max(rawLimit, 1), 50);
         const cursor = req.query.cursor ? String(req.query.cursor) : null;
+        const search = req.query.q?.trim() ?? "";
+        const scope = String(req.query.scope ?? "mine").toLowerCase() === "company" ? "company" : "mine";
+        const requesterOrgId = scope === "company"
+            ? (await getRequesterOrgId(requester)) ??
+                (process.env.NODE_ENV !== "production" ? process.env.DEFAULT_ORG_ID ?? null : null)
+            : null;
+        console.log("[calls/paged]", {
+            requester,
+            scope,
+            requesterOrgId,
+            search,
+            cursor,
+            limit,
+        });
         let q = supa
             .from("calls")
-            .select("*")
-            .eq("user_id", requester)
+            .select(`
+          id,
+          user_id,
+          org_id,
+          filename,
+          storage_path,
+          status,
+          created_at,
+          duration_sec,
+          duration_ms,
+          score_overall,
+          ai_model,
+          rep_name,
+          tags,
+          summary,
+          flags
+        `)
             .order("created_at", { ascending: false })
-            .limit(limit + 1); // one extra to compute nextCursor
+            .limit(limit + 1);
+        if (scope === "company") {
+            if (!requesterOrgId) {
+                return res.status(403).json({ ok: false, error: "missing_org_scope" });
+            }
+            const visibility = await getOrgCallVisibility(requesterOrgId);
+            if (visibility === "disabled") {
+                return res.status(403).json({ ok: false, error: "company_calls_disabled" });
+            }
+            if (visibility === "managers") {
+                const { data } = await supa
+                    .from("assignments")
+                    .select("id")
+                    .eq("manager_id", requester)
+                    .limit(1);
+                if (!data?.length) {
+                    return res.status(403).json({ ok: false, error: "manager_only_access" });
+                }
+            }
+            q = q.eq("org_id", requesterOrgId);
+        }
+        else {
+            q = q.eq("user_id", requester);
+        }
+        // cursor-based pagination (keep existing behaviour)
         if (cursor) {
-            const cursorDate = isNaN(Number(cursor)) ? new Date(cursor) : new Date(Number(cursor));
+            const cursorDate = isNaN(Number(cursor))
+                ? new Date(cursor)
+                : new Date(Number(cursor));
             if (isNaN(cursorDate.getTime())) {
                 return res.status(400).json({ ok: false, error: "invalid cursor" });
             }
             q = q.lt("created_at", cursorDate.toISOString());
         }
+        // simple search on filename + summary
+        if (search) {
+            q = q.or(`filename.ilike.%${search}%,summary.ilike.%${search}%`);
+        }
         const { data, error } = await q;
         if (error)
             throw error;
-        let nextCursor = null;
         let items = data ?? [];
+        let nextCursor = null;
         if (items.length > limit) {
             const last = items[limit - 1];
             nextCursor = last.created_at;
             items = items.slice(0, limit);
         }
-        res.json({ ok: true, calls: items, nextCursor });
+        const openAssignmentCallIds = await getOpenAssignmentCallIds(items.map((c) => String(c.id ?? "")));
+        // Shape payload for web: keep existing fields, add new UX bits
+        const mapped = items.map((c) => ({
+            id: c.id,
+            filename: c.filename,
+            status: c.status,
+            created_at: c.created_at,
+            duration_sec: c.duration_sec,
+            duration_ms: c.duration_ms ?? null,
+            score_overall: c.score_overall,
+            ai_model: c.ai_model,
+            type: c.storage_path ? "upload" : "live",
+            rep_name: c.rep_name ?? null,
+            tags: c.tags ?? null,
+            summary: c.summary ?? null,
+            flags: c.flags ?? [],
+            has_open_assignment: openAssignmentCallIds.has(String(c.id)),
+        }));
+        console.log("[calls/paged/result]", {
+            scope,
+            requester,
+            requesterOrgId,
+            returned: mapped.length,
+            nextCursor,
+        });
+        return res.json({ ok: true, calls: mapped, nextCursor });
     }
     catch (e) {
-        res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+        console.error(e);
+        return res
+            .status(400)
+            .json({ ok: false, error: e.message ?? "bad_request" });
     }
 });
 /* ----------------------------------------------------------------
-   GET /v1/calls/:id/audio-url → signed URL for secure audio playback
+   GET /v1/calls/:id/signed-audio → signed URL for audio playback
    (ORDERED BEFORE /:id so it doesn't get captured by the :id route)
 ----------------------------------------------------------------- */
-router.get("/:id/audio-url", async (req, res) => {
+router.get("/:id/signed-audio", async (req, res) => {
     try {
         const id = String(req.params.id);
         if (!UUID_RE.test(id)) {
@@ -164,19 +932,20 @@ router.get("/:id/audio-url", async (req, res) => {
         // ensure call exists and belongs to requester
         const { data: call, error } = await supa
             .from("calls")
-            .select("user_id,audio_path")
+            .select("user_id,org_id,audio_path")
             .eq("id", id)
             .single();
         if (error || !call)
             return res.status(404).json({ ok: false, error: "not_found" });
-        if (call.user_id !== requester) {
+        const allowed = await canAccessCall(requester, call.user_id, call.org_id ?? null);
+        if (!allowed) {
             return res.status(403).json({ ok: false, error: "forbidden" });
         }
         if (!call.audio_path) {
             return res.status(400).json({ ok: false, error: "no_audio_path" });
         }
         const bucket = process.env.SUPABASE_STORAGE_BUCKET || "calls";
-        const ttl = Number(process.env.SIGNED_URL_TTL_SEC || 3600); // seconds
+        const ttl = Number(process.env.SIGNED_URL_TTL_SEC || 300); // default 5 min
         const { data: signed, error: signErr } = await supa
             .storage
             .from(bucket)
@@ -203,38 +972,488 @@ router.post("/:id/score", async (req, res) => {
             return res.status(400).json({ ok: false, error: "invalid id" });
         const requester = getUserIdHeader(req);
         const body = ScoreSchema.parse(req.body);
+        // Back-compat: allow assignmentId via query string too
+        const assignmentIdFromQuery = typeof req.query.assignmentId === "string" ? req.query.assignmentId : undefined;
+        const effectiveAssignmentId = body.assignmentId || assignmentIdFromQuery || undefined;
         // verify ownership
         const { data: call, error: callErr } = await supa
             .from("calls")
-            .select("id,user_id")
+            .select("id,user_id,summary")
             .eq("id", id)
             .single();
         if (callErr || !call)
             return res.status(404).json({ ok: false, error: "not_found" });
         if (call.user_id !== requester)
             return res.status(403).json({ ok: false, error: "forbidden" });
+        const reviewText = String(body.transcript_text ?? call?.summary ?? "");
+        // 🔥 CONTEXT INJECTION FOR REVIEW BOT (Day 66)
+        let contextNote = "";
+        try {
+            const { data: recentFlags } = await supa
+                .from("crm_activities")
+                .select("meta")
+                .eq("type", "review_flag")
+                .eq("rep_id", requester)
+                .limit(20);
+            const sectionCounts = {};
+            for (const row of recentFlags || []) {
+                const section = row?.meta?.flag_section || "general";
+                sectionCounts[section] = (sectionCounts[section] || 0) + 1;
+            }
+            const topWeakness = Object.entries(sectionCounts)
+                .sort((a, b) => b[1] - a[1])[0]?.[0];
+            if (topWeakness) {
+                contextNote = `Rep historically struggles with ${topWeakness}. Prioritise this in analysis.`;
+            }
+        }
+        catch (e) {
+            console.warn("[review_context_injection_failed]", e);
+        }
+        const enrichedReviewText = contextNote
+            ? `${reviewText}\n\n[CONTEXT]\n${contextNote}`
+            : reviewText;
+        const closeScore = typeof body.rubric?.close === "number" ? Number(body.rubric.close) : null;
+        const { voice_score, voice_rubric, review_tags } = buildVoiceScore({
+            transcriptText: enrichedReviewText,
+            closeScore,
+        });
+        // 🔥 ROUTE FEEDBACK TO MANAGER (Day 67)
+        const managerContext = await getManagerForRep(supa, call.user_id);
+        const manager = managerContext?.manager;
+        if (manager?.email) {
+            console.log("📣 Send feedback to manager:", manager.email);
+        }
+        const transcriptText = String(body.transcript_text ?? "").trim();
         const patch = {
             score_overall: body.score_overall,
             status: "scored",
+            voice_score,
+            voice_rubric,
+            review_tags,
+            transcript: transcriptText || null,
         };
-        if (typeof body.rubric !== "undefined")
-            patch.rubric = body.rubric;
-        const { data, error } = await supa
+        if (typeof body.summary === "string" && String(body.summary).trim()) {
+            patch.summary = String(body.summary).trim();
+        }
+        patch.rubric = {
+            ...(typeof body.rubric === "object" && body.rubric ? body.rubric : {}),
+            voice_score,
+            voice_rubric,
+            review_tags,
+        };
+        let updatePatch = { ...patch };
+        let { data, error } = await supa
             .from("calls")
-            .update(patch)
+            .update(updatePatch)
             .eq("id", id)
             .select()
             .single();
+        if (error) {
+            const msg = String(error?.message ?? "").toLowerCase();
+            const missingVoiceCols = (msg.includes("voice_score") || msg.includes("voice_rubric") || msg.includes("review_tags")) &&
+                (msg.includes("column") || msg.includes("schema cache"));
+            if (missingVoiceCols) {
+                updatePatch = { ...patch };
+                delete updatePatch.voice_score;
+                delete updatePatch.voice_rubric;
+                delete updatePatch.review_tags;
+                const retry = await supa
+                    .from("calls")
+                    .update(updatePatch)
+                    .eq("id", id)
+                    .select()
+                    .single();
+                data = retry.data;
+                error = retry.error;
+            }
+        }
         if (error)
             throw error;
-        res.json({ ok: true, call: data });
+        // --- Assignment Engine v2: auto-complete + XP (never blocks scoring) ---
+        // If the client passed assignmentId, we complete that.
+        // Otherwise, we fall back to matching targetId (call id) or latest open call_review.
+        // Award baseline XP based on score band.
+        let completedCount = 0;
+        let xpAwardedTotal = 0;
+        try {
+            const score = Number(body.score_overall);
+            const xpAwarded = Number.isFinite(score)
+                ? score >= 80
+                    ? 35
+                    : score >= 60
+                        ? 25
+                        : 15
+                : 25;
+            const result = await completeAssignmentsForTarget({
+                repId: call.user_id,
+                assignmentId: effectiveAssignmentId || null,
+                type: "call_review",
+                targetId: id,
+                completedVia: "call_review",
+                xpAwarded,
+                // helpful metadata for audits
+                metaPatch: { call_id: id, score_overall: body.score_overall },
+            });
+            completedCount =
+                typeof result?.completedCount === "number"
+                    ? result.completedCount
+                    : 0;
+            xpAwardedTotal =
+                typeof result?.xpAwardedTotal === "number"
+                    ? result.xpAwardedTotal
+                    : 0;
+            if (result?.completedCount) {
+                console.info("[assignments:lifecycle]", {
+                    event: "auto_completed",
+                    via: "call_review",
+                    rep_id: call.user_id,
+                    call_id: id,
+                    assignment_id: effectiveAssignmentId || null,
+                    completed_count: result.completedCount,
+                    method: result.method || null,
+                    xp_awarded: xpAwardedTotal,
+                });
+            }
+            else {
+                console.info("[assignments:lifecycle]", {
+                    event: "auto_complete_noop",
+                    via: "call_review",
+                    rep_id: call.user_id,
+                    call_id: id,
+                    assignment_id: effectiveAssignmentId || null,
+                    reason: result?.reason || "no_matching_open_assignment",
+                });
+            }
+        }
+        catch (e) {
+            console.warn("[assignments:lifecycle]", {
+                event: "auto_complete_failed",
+                via: "call_review",
+                rep_id: call.user_id,
+                call_id: id,
+                assignment_id: effectiveAssignmentId || null,
+                error: e?.message || String(e),
+            });
+        }
+        // ✅ NEW: append a score snapshot to call_scores
+        const hist = {
+            call_id: id,
+            user_id: requester,
+            score: body.score_overall,
+            rubric: {
+                ...(typeof body.rubric === "object" && body.rubric ? body.rubric : {}),
+                voice_score,
+                voice_rubric,
+                review_tags,
+            },
+        };
+        const { error: histErr } = await supa.from("call_scores").insert(hist);
+        if (histErr) {
+            // don't fail the whole request for history insert
+            console.warn("[score history] insert failed", histErr);
+        }
+        // ---------------------------------------------------------
+        // DAY 64 — AUTO FEEDBACK DISPATCH (fail-soft)
+        // Sends reviewed-call feedback to the shared feedback channel with
+        // rep/manager context when an assignment relationship exists.
+        // ---------------------------------------------------------
+        await autoSendReviewFeedbackBestEffort({
+            callId: id,
+            repId: call.user_id,
+            assignmentId: effectiveAssignmentId || null,
+            scoreOverall: body.score_overall,
+            voiceScore: voice_score,
+            summary: typeof body.summary === "string" ? body.summary : patch.summary ?? null,
+            reviewTags,
+        });
+        console.log("[score route] feedback email dispatch attempted", { callId: id, repId: call.user_id });
+        await autoSendReviewFeedbackEmailBestEffort({
+            callId: id,
+            repId: call.user_id,
+            assignmentId: effectiveAssignmentId || null,
+            scoreOverall: body.score_overall,
+            voiceScore: voice_score,
+            summary: typeof body.summary === "string" ? body.summary : patch.summary ?? null,
+            reviewTags,
+        });
+        // ---------------------------------------------------------
+        // DAY 52 — AUTO COACHING TRIGGERS
+        // Detect weak close / objection and auto-create CRM tasks
+        // Future-safe: include coaching_reason metadata when schema supports it
+        // ---------------------------------------------------------
+        try {
+            const rubric = body.rubric ?? {};
+            const closeScore = typeof rubric?.close === "number" ? rubric.close : null;
+            const objectionScore = typeof rubric?.objection === "number" ? rubric.objection : null;
+            const due = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString();
+            const ensureCoachingTask = async (args) => {
+                const { title, reason } = args;
+                // Prevent duplicate open coaching tasks for the same reason/title
+                const existingTask = await supa
+                    .from("crm_activities")
+                    .select("id")
+                    .eq("user_id", requester)
+                    .eq("title", title)
+                    .eq("status", "open")
+                    .limit(1)
+                    .maybeSingle();
+                if (existingTask.data)
+                    return;
+                const payloadWithMeta = {
+                    type: "task",
+                    title,
+                    status: "open",
+                    due_at: due,
+                    user_id: requester,
+                    opportunity_id: null,
+                    contact_id: null,
+                    account_id: null,
+                    meta: {
+                        coaching_reason: reason,
+                        source: "call_score",
+                        source_call_id: id,
+                    },
+                };
+                const insertWithMeta = await supa.from("crm_activities").insert(payloadWithMeta);
+                if (!insertWithMeta.error)
+                    return;
+                const metaErr = String(insertWithMeta.error?.message ?? "").toLowerCase();
+                // Backwards-compatible fallback if meta column does not exist yet
+                if (metaErr.includes("column") && metaErr.includes("meta")) {
+                    const payloadNoMeta = {
+                        type: "task",
+                        title,
+                        status: "open",
+                        due_at: due,
+                        user_id: requester,
+                        opportunity_id: null,
+                        contact_id: null,
+                        account_id: null,
+                    };
+                    const retry = await supa.from("crm_activities").insert(payloadNoMeta);
+                    if (retry.error)
+                        throw retry.error;
+                    return;
+                }
+                throw insertWithMeta.error;
+            };
+            // Weak close trigger
+            if (closeScore !== null && closeScore < 60) {
+                await ensureCoachingTask({
+                    title: "Review and strengthen close before next call",
+                    reason: "weak_close",
+                });
+            }
+            // Weak objection handling trigger
+            if (objectionScore !== null && objectionScore < 60) {
+                await ensureCoachingTask({
+                    title: "Practise objection handling before next follow-up",
+                    reason: "objection_handling",
+                });
+            }
+        }
+        catch (coachErr) {
+            console.warn("[coaching auto-task] failed", coachErr);
+        }
+        res.json({
+            ok: true,
+            call: data,
+            voice_score,
+            voice_rubric,
+            review_tags,
+            assignment: effectiveAssignmentId
+                ? { assignmentId: effectiveAssignmentId, via: "call_review" }
+                : undefined,
+            completed_count: completedCount,
+            xp_awarded: xpAwardedTotal,
+            xp_awarded_total: xpAwardedTotal,
+        });
     }
     catch (e) {
         res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
     }
 });
+/* -----------------------------------------------------------
+   GET /v1/calls/:id/manager-review → read manager review state
+   (SPRINT 4 — Day 96)
+   Same gate + hierarchy scope rules as the POST below.
+------------------------------------------------------------ */
+router.get("/:id/manager-review", requireManager, async (req, res) => {
+    try {
+        const id = String(req.params.id);
+        if (!UUID_RE.test(id))
+            return res.status(400).json({ ok: false, error: "invalid id" });
+        const requester = getUserIdHeader(req);
+        const { data: call, error: callErr } = await supa
+            .from("calls")
+            .select("id, user_id, org_id, office_id, company_id")
+            .eq("id", id)
+            .single();
+        if (callErr || !call)
+            return res.status(404).json({ ok: false, error: "not_found" });
+        const ctx = await getManagerUserContext(requester);
+        if (isOfficeManager(ctx) && String(call.office_id || "") !== String(ctx?.office_id || "x")) {
+            return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
+        }
+        if (isCompanyManager(ctx) && String(call.company_id || "") !== String(ctx?.company_id || "x")) {
+            return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
+        }
+        const { data: review, error: reviewErr } = await supa
+            .from("call_manager_reviews")
+            .select("call_id, manager_id, status, note, created_at")
+            .eq("call_id", id)
+            .maybeSingle();
+        if (reviewErr) {
+            if (isMissingReviewTableError(reviewErr)) {
+                return res.json({ ok: true, reviewed: false, review: null, reviewHistoryAvailable: false });
+            }
+            throw reviewErr;
+        }
+        if (!review)
+            return res.json({ ok: true, reviewed: false, review: null });
+        return res.json({
+            ok: true,
+            reviewed: true,
+            review: {
+                callId: String(review.call_id),
+                managerId: String(review.manager_id),
+                status: String(review.status),
+                note: review.note ?? null,
+                createdAt: String(review.created_at),
+            },
+        });
+    }
+    catch (e) {
+        console.error("[GET /:id/manager-review] error", e);
+        res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
+/* -----------------------------------------------------------
+   POST /v1/calls/:id/manager-review → record a manager review
+   (SPRINT 4 — Day 91)
+   Gate: requireManager (reps.tier). Scope: hierarchy check against
+   the manager's UserContext (users.role), mirroring the visibility
+   rules used by /v1/manager/command-centre and review-queue.
+   Upserts into call_manager_reviews (unique on call_id — one review
+   clears the call for the team).
+------------------------------------------------------------ */
+router.post("/:id/manager-review", requireManager, async (req, res) => {
+    try {
+        const id = String(req.params.id);
+        if (!UUID_RE.test(id))
+            return res.status(400).json({ ok: false, error: "invalid id" });
+        const requester = getUserIdHeader(req);
+        const { data: call, error: callErr } = await supa
+            .from("calls")
+            .select("id, user_id, org_id, office_id, company_id")
+            .eq("id", id)
+            .single();
+        if (callErr || !call)
+            return res.status(404).json({ ok: false, error: "not_found" });
+        // Hierarchy scope: the manager must be able to see this call under the
+        // same rules as the command-centre/review-queue queries.
+        const ctx = await getManagerUserContext(requester);
+        if (isOfficeManager(ctx) && String(call.office_id || "") !== String(ctx?.office_id || "x")) {
+            return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
+        }
+        if (isCompanyManager(ctx) && String(call.company_id || "") !== String(ctx?.company_id || "x")) {
+            return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
+        }
+        const rawNote = req.body?.note;
+        const note = typeof rawNote === "string" && rawNote.trim() ? rawNote.trim().slice(0, 2000) : null;
+        const nowIso = new Date().toISOString();
+        const { data: review, error: upsertErr } = await supa
+            .from("call_manager_reviews")
+            .upsert({
+            call_id: id,
+            manager_id: requester,
+            org_id: call.org_id ?? null,
+            company_id: call.company_id ?? ctx?.company_id ?? null,
+            office_id: call.office_id ?? ctx?.office_id ?? null,
+            status: "reviewed",
+            note,
+            updated_at: nowIso,
+        }, { onConflict: "call_id" })
+            .select("call_id, manager_id, status, note, created_at")
+            .single();
+        if (upsertErr) {
+            if (isMissingReviewTableError(upsertErr)) {
+                return res.status(503).json({
+                    ok: false,
+                    error: "migration_required",
+                    hint: "Run sql/20260610_call_manager_reviews.sql in the Supabase SQL editor",
+                });
+            }
+            throw upsertErr;
+        }
+        // Day 95: audit trail (fail-soft — logAuditEvent never throws)
+        void logAuditEvent({
+            actorUserId: requester,
+            action: "manager.call_reviewed",
+            entityType: "call",
+            entityId: id,
+            metadata: {
+                org_id: call.org_id ?? null,
+                company_id: call.company_id ?? ctx?.company_id ?? null,
+                office_id: call.office_id ?? ctx?.office_id ?? null,
+                note_present: Boolean(note),
+            },
+        });
+        return res.json({
+            ok: true,
+            review: {
+                callId: String(review.call_id),
+                managerId: String(review.manager_id),
+                status: String(review.status),
+                note: review.note ?? null,
+                createdAt: String(review.created_at),
+            },
+        });
+    }
+    catch (e) {
+        console.error("[POST /:id/manager-review] error", e);
+        res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
+/* -----------------------------------------------------------
+   GET /v1/calls/:id/scores → score history for sparklines
+   (ORDERED BEFORE /:id to avoid route capture)
+------------------------------------------------------------ */
+router.get("/:id/scores", async (req, res) => {
+    try {
+        const id = String(req.params.id);
+        if (!UUID_RE.test(id))
+            return res.status(400).json({ ok: false, error: "invalid id" });
+        const requester = getUserIdHeader(req);
+        // verify ownership
+        const { data: call, error: callErr } = await supa
+            .from("calls")
+            .select("id,user_id,org_id")
+            .eq("id", id)
+            .single();
+        if (callErr || !call)
+            return res.status(404).json({ ok: false, error: "not_found" });
+        const allowed = await canAccessCall(requester, call.user_id, call.org_id ?? null);
+        if (!allowed)
+            return res.status(403).json({ ok: false, error: "forbidden" });
+        const { data, error } = await supa
+            .from("call_scores")
+            .select("score, created_at")
+            .eq("call_id", id)
+            .order("created_at", { ascending: true })
+            .limit(100);
+        if (error)
+            throw error;
+        res.json({ ok: true, items: data ?? [] });
+    }
+    catch (e) {
+        console.error("[GET /:id/scores] error", e);
+        res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
 /* -------------------------------------------
    GET /v1/calls/:id → call detail (ownership)
+   (KEEP THIS LAST among /:id* routes)
 -------------------------------------------- */
 router.get("/:id", async (req, res) => {
     try {
@@ -243,20 +1462,88 @@ router.get("/:id", async (req, res) => {
             return res.status(400).json({ ok: false, error: "invalid id" });
         }
         const requester = getUserIdHeader(req);
-        const { data: call, error } = await supa
+        const baseSelect = `
+  id,
+  user_id,
+  org_id,
+  filename,
+  storage_path,
+  status,
+  created_at,
+  duration_sec,
+  duration_ms,
+  score_overall,
+  ai_model,
+  rep_name,
+  tags,
+  summary,
+  flags,
+  transcript,
+  rubric,
+  analysis_json
+`;
+        const extendedSelect = `
+      ${baseSelect},
+      voice_score,
+      voice_rubric,
+      review_tags
+    `;
+        let { data: call, error } = await supa
             .from("calls")
-            .select("*")
+            .select(extendedSelect)
             .eq("id", id)
             .single();
-        if (error || !call)
+        if (error) {
+            const msg = String(error?.message ?? "").toLowerCase();
+            const missingVoiceCols = (msg.includes("voice_score") || msg.includes("voice_rubric") || msg.includes("review_tags")) &&
+                (msg.includes("column") || msg.includes("schema cache"));
+            if (missingVoiceCols) {
+                const retry = await supa
+                    .from("calls")
+                    .select(baseSelect)
+                    .eq("id", id)
+                    .single();
+                call = retry.data;
+                error = retry.error;
+            }
+        }
+        if (error || !call) {
             return res.status(404).json({ ok: false, error: "not_found" });
-        if (call.user_id !== requester) {
+        }
+        const allowed = await canAccessCall(requester, call.user_id, call.org_id ?? null);
+        if (!allowed) {
             return res.status(403).json({ ok: false, error: "forbidden" });
         }
-        res.json({ ok: true, call });
+        const mapped = {
+            id: call.id,
+            filename: call.filename,
+            status: call.status,
+            created_at: call.created_at,
+            duration_sec: call.duration_sec,
+            duration_ms: call.duration_ms ?? null,
+            score_overall: call.score_overall,
+            ai_model: call.ai_model,
+            type: call.storage_path ? "upload" : "live",
+            rep_name: call.rep_name ?? null,
+            tags: call.tags ?? null,
+            summary: call.summary ?? null,
+            flags: call.flags ?? [],
+            transcript: call.transcript ?? null,
+            rubric: call.rubric ?? null,
+            analysis_json: call.analysis_json ?? null,
+            voice_score: call.voice_score ?? null,
+            voice_rubric: call.voice_rubric ?? null,
+            review_tags: call.review_tags ?? null,
+            user_id: call.user_id,
+            org_id: call.org_id,
+        };
+        return res.json({ ok: true, call: mapped });
     }
     catch (e) {
-        res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+        console.error(e);
+        return res
+            .status(400)
+            .json({ ok: false, error: e.message ?? "bad_request" });
     }
 });
-export default router;
+module.exports = router;

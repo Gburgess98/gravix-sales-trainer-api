@@ -1,16 +1,229 @@
-// No import needed; Node 18+ has global fetch
-const WEBHOOK = process.env.SLACK_WEBHOOK_URL || "";
-export async function postSlack(text, blocks) {
-    if (!WEBHOOK)
-        return; // silently skip in dev if unset
-    const body = blocks ? { text, blocks } : { text };
-    const res = await fetch(WEBHOOK, {
+// src/lib/slack.ts
+// --- Dry-run flag (used inside poster functions) ---
+const SLACK_DRY_RUN = (process.env.SLACK_DRY_RUN || "false").toLowerCase() === "true";
+export function getAssignWebhook() {
+    return process.env.SLACK_ASSIGN_WEBHOOK || process.env.SLACK_WEBHOOK_URL || null;
+}
+// ---------- Low-level posters ----------
+export async function postSlack(text, blocks, explicitWebhook) {
+    const url = explicitWebhook || process.env.SLACK_WEBHOOK_URL;
+    const body = blocks?.length ? { text, blocks } : { text };
+    // Dry-run: log and skip network
+    if (SLACK_DRY_RUN) {
+        console.log("[slack] DRY RUN postSlack payload:", JSON.stringify(body, null, 2));
+        return { ok: true };
+    }
+    if (!url)
+        return { ok: false, skipped: true }; // non-fatal
+    const r = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
     });
-    if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        console.error("Slack post failed:", res.status, t);
+    if (!r.ok) {
+        const msg = await r.text().catch(() => r.statusText);
+        throw new Error(`Slack webhook failed: HTTP ${r.status} ${msg}`);
     }
+    return { ok: true };
+}
+export async function postSlackSummary(payload, explicitWebhook) {
+    const url = explicitWebhook || process.env.SLACK_WEBHOOK_URL;
+    const body = { text: payload.text, blocks: payload.blocks };
+    if (SLACK_DRY_RUN) {
+        console.log("[slack] DRY RUN postSlackSummary payload:", JSON.stringify(body, null, 2));
+        return { ok: true };
+    }
+    if (!url)
+        return { ok: false, skipped: true }; // non-fatal
+    const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+        const msg = await r.text().catch(() => r.statusText);
+        throw new Error(`Slack webhook failed: HTTP ${r.status} ${msg}`);
+    }
+    return { ok: true };
+}
+// =========================================================
+// CRM auto-assign run alerts (cron/manual)
+// =========================================================
+const CRM_RUN_SLACK_ALERT_ACTIONS_CREATED_THRESHOLD = 25;
+export async function postCrmAutoAssignRunSlack(args) {
+    const { run_id, org_id, mode, totals, source } = args;
+    const errors = Number(totals?.errors ?? 0);
+    const created = Number(totals?.actions_created ?? 0);
+    // Only alert when there is signal
+    if (errors === 0 && created < CRM_RUN_SLACK_ALERT_ACTIONS_CREATED_THRESHOLD)
+        return;
+    const icon = errors > 0 ? "⚠️" : "👀";
+    const text = `${icon} CRM auto-assign (${source})\n` +
+        `run_id: ${run_id}\n` +
+        `mode: ${mode}\n` +
+        `org: ${org_id}\n` +
+        `reps: ${Number(totals?.reps_considered ?? 0)}, contacts: ${Number(totals?.contacts_considered ?? 0)}\n` +
+        `created: ${created}, skipped: ${Number(totals?.skipped_dedupe ?? 0)}, errors: ${errors}`;
+    // postSlack is fail-open when webhook is missing; do not throw here.
+    try {
+        await postSlack(text);
+    }
+    catch (e) {
+        console.error("[slack] postCrmAutoAssignRunSlack failed", e);
+    }
+}
+/** Build human-friendly text for a rubric section */
+function secText(label, s) {
+    const score = typeof s?.score === "number" ? Math.round(s.score) : "—";
+    const notes = (s?.notes ? String(s.notes).trim().slice(0, 700) : "—") // trim long notes
+        || "—";
+    return `*${label}*: ${score}\n${notes}`;
+}
+// --- ADD: robust base + URL builders ---
+const PUBLIC_WEB_BASE_RAW = (process.env.PUBLIC_WEB_BASE || "").trim();
+function resolveWebBase() { return (PUBLIC_WEB_BASE_RAW || "http://localhost:3000").replace(/\/+$/, ""); }
+function buildCallUrl(callId, params) {
+    const url = new URL(`${resolveWebBase()}/calls/${encodeURIComponent(callId)}`);
+    if (params)
+        for (const [k, v] of Object.entries(params))
+            if (v != null && v !== "")
+                url.searchParams.set(k, String(v));
+    return url.toString();
+}
+/** Compose Slack blocks for a scored call (with notes + action buttons) */
+export function buildScoreBlocksFromRubric(input) {
+    const { callId, filename, overall, rubric, durationSec, repName, contactName, company, } = input;
+    const overallStr = typeof overall === "number" ? `${Math.round(overall)}/100` : "—";
+    const title = filename || `Call ${callId.slice(0, 8)}…`;
+    const dur = typeof durationSec === "number"
+        ? `${Math.floor(durationSec / 60)}m ${Math.floor(durationSec % 60)}s`
+        : "—";
+    const metaParts = [
+        repName ? `*Rep*: ${repName}` : null,
+        contactName ? `*Contact*: ${contactName}` : null,
+        company ? `*Company*: ${company}` : null,
+        `*Duration*: ${dur}`,
+        `*Call ID*: \`${callId}\``,
+    ].filter(Boolean);
+    const blocks = [
+        { type: "header", text: { type: "plain_text", text: `Call scored: ${overallStr} • ${title}`, emoji: true } },
+        { type: "section", text: { type: "mrkdwn", text: metaParts.join("  •  ") || "—" } },
+        { type: "divider" },
+        { type: "section", text: { type: "mrkdwn", text: secText("Intro", rubric?.intro) } },
+        { type: "section", text: { type: "mrkdwn", text: secText("Discovery", rubric?.discovery) } },
+        { type: "section", text: { type: "mrkdwn", text: secText("Objection", rubric?.objection) } },
+        { type: "section", text: { type: "mrkdwn", text: secText("Close", rubric?.close) } },
+    ];
+    // Add action buttons using robust URL builder
+    {
+        const openUrl = buildCallUrl(callId);
+        const crmUrl = buildCallUrl(callId, { panel: "crm" });
+        const coachUrl = buildCallUrl(callId, { panel: "coach", assign: 1 });
+        blocks.push({ type: "divider" });
+        blocks.push({
+            type: "actions",
+            elements: [
+                { type: "button", text: { type: "plain_text", text: "🔊 Open Call" }, url: openUrl, action_id: "open_call" },
+                { type: "button", text: { type: "plain_text", text: "📇 Link / Review CRM" }, url: crmUrl, action_id: "open_crm" },
+                { type: "button", text: { type: "plain_text", text: "🎯 Assign Drill" }, url: coachUrl, action_id: "assign_drill" }
+            ]
+        });
+    }
+    return { blocks };
+}
+/** Legacy builder kept for compatibility with existing callers */
+export function buildScoreBlocks(s) {
+    const dur = typeof s.durationSec === "number"
+        ? `${Math.floor(s.durationSec / 60)}m ${s.durationSec % 60}s`
+        : "—";
+    const header = `*${Math.round(s.overallScore)}* / 100  •  Intro ${s.section.intro} | Disc ${s.section.discovery} | Obj ${s.section.objection} | Close ${s.section.close}`;
+    const baseFromCall = s.callUrl ? s.callUrl.replace(/\/calls\/[^\/?#]+.*/, "") : "";
+    const coachUrl = baseFromCall ? `${baseFromCall}/calls/${s.callId}?panel=coach&assign=1` : s.callUrl;
+    const subtitleParts = [
+        s.repName ? `Rep: ${s.repName}` : null,
+        s.contactName ? `Contact: ${s.contactName}` : null,
+        s.company ? `@ ${s.company}` : null,
+        `Duration: ${dur}`,
+    ].filter(Boolean);
+    const blocks = [
+        { type: "header", text: { type: "plain_text", text: "Call Scored", emoji: true } },
+        { type: "section", text: { type: "mrkdwn", text: header } },
+        { type: "context", elements: [{ type: "mrkdwn", text: subtitleParts.join("  •  ") || "—" }] },
+        {
+            type: "section",
+            fields: [
+                { type: "mrkdwn", text: `*Intro*\n${s.section.intro}` },
+                { type: "mrkdwn", text: `*Discovery*\n${s.section.discovery}` },
+                { type: "mrkdwn", text: `*Objection*\n${s.section.objection}` },
+                { type: "mrkdwn", text: `*Close*\n${s.section.close}` },
+            ],
+        },
+        {
+            type: "actions",
+            elements: [
+                { type: "button", text: { type: "plain_text", text: "Open Call" }, url: s.callUrl, action_id: "open_call" },
+                { type: "button", text: { type: "plain_text", text: "Assign Drill" }, url: coachUrl, action_id: "assign_drill" },
+                { type: "button", text: { type: "plain_text", text: "Recent Calls" }, url: s.recentUrl, action_id: "open_recent" },
+            ],
+        },
+    ];
+    return { blocks };
+}
+// ---------- Single entry point for scoring code ----------
+/**
+ * New preferred entry:
+ *   await postScoreSummary({
+ *     callId, filename: call.filename, overall: call.score_overall,
+ *     rubric: call.rubric, durationSec: call.duration_sec,
+ *     appUrlBase: process.env.APP_URL_BASE
+ *   });
+ *
+ * (Falls back to no-op if SLACK_WEBHOOK_URL is not set.)
+ */
+export async function postScoreSummary(input) {
+    if ("overallScore" in input || "section" in input) {
+        const payload = buildScoreBlocks(input);
+        return postSlackSummary(payload);
+    }
+    if (input.sections && !input.rubric) {
+        const summaryInput = {
+            callId: input.callId,
+            repName: input.repName ?? undefined,
+            contactName: input.contactName ?? undefined,
+            company: input.company ?? undefined,
+            overallScore: Number(input.overall ?? 0),
+            section: {
+                intro: Number(input.sections.intro ?? 0),
+                discovery: Number(input.sections.discovery ?? 0),
+                objection: Number(input.sections.objection ?? 0),
+                close: Number(input.sections.close ?? 0),
+            },
+            durationSec: input.durationSec ?? undefined,
+            callUrl: input.callUrl || buildCallUrl(input.callId),
+            recentUrl: input.recentUrl || `${resolveWebBase()}/call-library`,
+        };
+        const payload = buildScoreBlocks(summaryInput);
+        return postSlackSummary(payload);
+    }
+    const payload = buildScoreBlocksFromRubric(input);
+    return postSlackSummary(payload);
+}
+export async function postAssignNotification(input) {
+    const { callId, assigneeName, assigneeWebhook, drillId, notes } = input;
+    const text = `New coaching assignment: ${drillId}`;
+    const url = buildCallUrl(callId, { panel: "coach", assign: 1 });
+    const blocks = [
+        { type: "header", text: { type: "plain_text", text: "New Coaching Assignment", emoji: true } },
+        { type: "section", text: { type: "mrkdwn", text: `*Drill:* \`${drillId}\`\n*Call:* \`${callId}\`${assigneeName ? `\n*For:* ${assigneeName}` : ""}${notes ? `\n*Notes:* ${notes}` : ""}` } },
+        { type: "actions", elements: [
+                { type: "button", text: { type: "plain_text", text: "Open Coach Panel" }, url, action_id: "open_coach" }
+            ] },
+    ];
+    const resolvedWebhook = (assigneeWebhook && assigneeWebhook.trim()) ||
+        getAssignWebhook();
+    if (!resolvedWebhook) {
+        // No webhook configured; skip without throwing
+        return { ok: false, skipped: true };
+    }
+    return postSlack("New Coaching Assignment", blocks, resolvedWebhook);
 }

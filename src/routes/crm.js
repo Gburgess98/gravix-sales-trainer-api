@@ -1,0 +1,6499 @@
+import { Router } from "express";
+import { randomUUID } from "crypto";
+import { z } from "zod";
+import { createClient } from "@supabase/supabase-js";
+import { postCrmAutoAssignRunSlack } from "../lib/slack";
+const router = Router();
+const supa = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const ZERO_UUID = "00000000-0000-0000-0000-000000000000";
+function getUserIdHeader(req) {
+    const uid = String(req.userId ||
+        req.header("x-user-id") ||
+        req.header("x-gravix-user-id") ||
+        "").trim();
+    if (!uid || !UUID_RE.test(uid))
+        throw new Error("Missing or invalid x-user-id");
+    return uid;
+}
+function getOrgIdHeader(req) {
+    // Prefer request header; allow a safe dev/default fallback via env.
+    const raw = String(req.header("x-org-id") || "").trim();
+    if (raw && (raw === ZERO_UUID || UUID_RE.test(raw)))
+        return raw;
+    const fallback = String(process.env.DEFAULT_ORG_ID || "").trim();
+    if (fallback && (fallback === ZERO_UUID || UUID_RE.test(fallback)))
+        return fallback;
+    throw new Error("Missing or invalid x-org-id");
+}
+// ------------------- Contact Health Score (v1) -------------------
+function healthClamp(n, min, max) {
+    return Math.max(min, Math.min(max, n));
+}
+function healthDaysSince(iso) {
+    if (!iso)
+        return null;
+    const t = new Date(iso).getTime();
+    if (!Number.isFinite(t))
+        return null;
+    const diffMs = Date.now() - t;
+    return diffMs < 0 ? 0 : Math.floor(diffMs / (1000 * 60 * 60 * 24));
+}
+function computeContactHealthV1(args) {
+    const reasons = [];
+    let score = 100;
+    const ds = healthDaysSince(args.last_contacted_at);
+    if (ds !== null && ds >= 14) {
+        score -= 30;
+        reasons.push(`No contact in ${ds} days`);
+    }
+    if ((args.overdue_actions ?? 0) > 0) {
+        score -= 20;
+        reasons.push(`${args.overdue_actions} overdue action${args.overdue_actions === 1 ? "" : "s"}`);
+    }
+    const openOver3 = Math.max(0, (args.open_actions ?? 0) - 3);
+    if (openOver3 > 0) {
+        score -= 10 * openOver3;
+        reasons.push(`${args.open_actions} open actions`);
+    }
+    // Activity awareness (best-effort signals)
+    if (args.has_recent_call) {
+        score += 10;
+        reasons.push("Recent call activity");
+    }
+    if (args.has_notes) {
+        score += 5;
+        reasons.push("Notes present");
+    }
+    score = healthClamp(score, 0, 100);
+    let band = "healthy";
+    if (score < 50)
+        band = "at_risk";
+    else if (score < 75)
+        band = "watch";
+    const health = {
+        score,
+        band,
+        reasons,
+        stats: {
+            open_actions: args.open_actions ?? 0,
+            overdue_actions: args.overdue_actions ?? 0,
+            last_contacted_days: ds,
+            has_notes: Boolean(args.has_notes),
+            has_recent_call: Boolean(args.has_recent_call),
+        },
+    };
+    const next_action = deriveNextAction(health);
+    return {
+        ...health,
+        next_action,
+    };
+}
+function deriveNextAction(health) {
+    const overdue = health?.stats?.overdue_actions ?? 0;
+    const open = health?.stats?.open_actions ?? 0;
+    const days = health?.stats?.last_contacted_days;
+    if (overdue > 0) {
+        return {
+            type: "resolve_overdue",
+            label: "Resolve overdue actions",
+            severity: "high",
+        };
+    }
+    if (typeof days === "number" && days > 14) {
+        return {
+            type: "follow_up",
+            label: "Schedule follow-up",
+            severity: "medium",
+        };
+    }
+    if (open === 0) {
+        return {
+            type: "log_next_step",
+            label: "Log next step",
+            severity: "low",
+        };
+    }
+    return {
+        type: "none",
+        label: "Contact healthy",
+        severity: "none",
+    };
+}
+// Org-scope guard (fail-closed)
+// Requires a `reps.org_id` column. If missing, fail closed (500) so we don't leak cross-org.
+async function assertRequesterInOrg(args) {
+    const { requester, orgId } = args;
+    // Fail-closed: we require reps.id + reps.org_id. (No reps.user_id support.)
+    const { data, error } = await supa
+        .from("reps")
+        .select("id, org_id")
+        .eq("id", requester)
+        .limit(1)
+        .maybeSingle();
+    if (error) {
+        const msg = String(error?.message ?? "");
+        const lower = msg.toLowerCase();
+        // Missing org_id column or reps table => fail closed
+        if ((lower.includes("could not find") && lower.includes("org_id")) ||
+            (lower.includes("column") && lower.includes("org_id") && lower.includes("does not exist")) ||
+            (lower.includes("relation") && lower.includes("reps") && lower.includes("does not exist"))) {
+            throw new Error("org_scope_not_supported");
+        }
+        throw new Error(msg || "requester_lookup_failed");
+    }
+    if (!data)
+        throw new Error("requester_not_found");
+    const repOrg = data.org_id ?? null;
+    if (!repOrg)
+        throw new Error("org_scope_not_supported");
+    if (String(repOrg) !== orgId)
+        throw new Error("forbidden_org_scope");
+}
+// Manager org scope helper (fail-closed by default)
+// Requires:
+// - x-user-id header (already enforced)
+// - x-org-id header (UUID)
+// - requester must belong to org (assertRequesterInOrg)
+//
+// Dev bypass:
+// - If x-org-id is the all-zero UUID OR env ALLOW_ORG_BYPASS=1, we skip org membership checks.
+// - This avoids blocking local smoke tests before org plumbing is fully wired.
+async function requireManagerOrg(req) {
+    const requester = getUserIdHeader(req);
+    // Header preferred; env fallback supported (DEFAULT_ORG_ID).
+    const orgId = getOrgIdHeader(req);
+    const allowBypass = String(process.env.ALLOW_ORG_BYPASS || "").trim() === "1";
+    const isZeroOrg = orgId === "00000000-0000-0000-0000-000000000000";
+    const headerProvided = !!String(req.header("x-org-id") || "").trim();
+    if (allowBypass || isZeroOrg || !headerProvided) {
+        // When header is missing we cannot safely validate membership; treat as bypassed (dev/local).
+        return { requester, orgId, bypassed: true };
+    }
+    await assertRequesterInOrg({ requester, orgId });
+    return { requester, orgId, bypassed: false };
+}
+// ------------------------------
+// Cron auth helper (fail-closed)
+// ------------------------------
+function requireCronAuth(req) {
+    const expected = String(process.env.CRON_SECRET || "").trim();
+    if (!expected)
+        throw new Error("cron_secret_not_configured");
+    const provided = String(req.header("x-cron-secret") || "").trim();
+    if (!provided || provided !== expected)
+        throw new Error("invalid_cron_secret");
+}
+// Helper for safe contacts query (handles last_contacted_at column missing)
+async function selectContactsSafe(args) {
+    const { requester, query, limit } = args;
+    const orFilter = `first_name.ilike.%${query}%` +
+        `,last_name.ilike.%${query}%` +
+        `,email.ilike.%${query}%` +
+        `,company.ilike.%${query}%`;
+    // Try with last_contacted_at first (if column exists)
+    const attempt1 = await supa
+        .from("crm_contacts")
+        .select("id, first_name, last_name, email, company, last_contacted_at, created_at")
+        .eq("user_id", requester)
+        .or(orFilter)
+        .order("created_at", { ascending: false })
+        .limit(limit);
+    if (!attempt1.error)
+        return { rows: attempt1.data ?? [], hasLastContacted: true };
+    // If the error is "column ... does not exist", retry without it
+    const msg = String(attempt1.error?.message ?? "");
+    if (msg.toLowerCase().includes("last_contacted_at") && msg.toLowerCase().includes("does not exist")) {
+        const attempt2 = await supa
+            .from("crm_contacts")
+            .select("id, first_name, last_name, email, company, created_at")
+            .eq("user_id", requester)
+            .or(orFilter)
+            .order("created_at", { ascending: false })
+            .limit(limit);
+        if (attempt2.error)
+            throw attempt2.error;
+        return { rows: attempt2.data ?? [], hasLastContacted: false };
+    }
+    // Any other error: surface it
+    throw attempt1.error;
+}
+// GET /v1/crm/health
+router.get("/health", async (_req, res) => {
+    return res.json({ ok: true, service: "gravix-crm", ts: new Date().toISOString() });
+});
+// ---------------------------------------------------------
+// DAY 56 — MANAGER BATCH DRILL ASSIGNMENTS
+// ---------------------------------------------------------
+const BatchAssignCriteriaSchema = z
+    .object({
+    voice_score_lt: z.number().finite().optional(),
+    voice_score_gt: z.number().finite().optional(),
+    weak_close: z.boolean().optional(),
+    inactive_days_gt: z.number().int().positive().optional(),
+})
+    .refine((v) => v.voice_score_lt !== undefined ||
+    v.voice_score_gt !== undefined ||
+    v.weak_close !== undefined ||
+    v.inactive_days_gt !== undefined, { message: "criteria_required" });
+const BatchAssignSchema = z.object({
+    drill_id: z.string().trim().min(1).max(120),
+    criteria: BatchAssignCriteriaSchema,
+    title: z.string().trim().min(1).max(200).optional(),
+    due_at: z.string().trim().min(1).max(80).optional().nullable(),
+    meta: z.record(z.string(), z.any()).optional(),
+});
+function readRubricNumber(rubric, key) {
+    const raw = rubric?.[key];
+    if (raw == null)
+        return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+}
+function readRubricBoolean(rubric, key) {
+    const raw = rubric?.[key];
+    if (typeof raw === "boolean")
+        return raw;
+    if (typeof raw === "string") {
+        const s = raw.trim().toLowerCase();
+        if (s === "true")
+            return true;
+        if (s === "false")
+            return false;
+    }
+    return null;
+}
+async function listLatestCallScoresBestEffort(limit = 2000) {
+    const selectCandidates = [
+        "id, user_id, rubric, created_at",
+        "id, user_id, rubric",
+        "id, user_id",
+    ];
+    for (const sel of selectCandidates) {
+        const r = await supa
+            .from("call_scores")
+            .select(sel)
+            .order("created_at", { ascending: false })
+            .limit(limit);
+        if (!r.error)
+            return r.data ?? [];
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+            return [];
+        }
+        if (msg.includes("column") && msg.includes("does not exist")) {
+            continue;
+        }
+        throw new Error(r.error?.message ?? "call_scores_fetch_failed");
+    }
+    return [];
+}
+async function listRepActivityBestEffort(limit = 2000) {
+    const selectCandidates = [
+        "id, org_id, tier, last_active_at, created_at",
+        "id, org_id, tier, last_active_at",
+        "id, org_id, tier, created_at",
+        "id, org_id, tier",
+        "id, org_id",
+        "id",
+    ];
+    for (const sel of selectCandidates) {
+        const r = await supa.from("reps").select(sel).limit(limit);
+        if (!r.error)
+            return r.data ?? [];
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+            return [];
+        }
+        if (msg.includes("column") && msg.includes("does not exist")) {
+            continue;
+        }
+        throw new Error(r.error?.message ?? "reps_fetch_failed");
+    }
+    return [];
+}
+// --- Inserted: listRepDirectoryBestEffort and listCrmActivityRowsBestEffort ---
+async function listRepDirectoryBestEffort(limit = 2000) {
+    const selectCandidates = [
+        // Post-Phase-1: includes company_id + office_id for proper tenant scoping
+        "id, org_id, company_id, office_id, tier, name, last_active_at, created_at",
+        "id, org_id, company_id, office_id, tier, name, created_at",
+        "id, org_id, company_id, office_id, name, tier",
+        "id, org_id, company_id, office_id, tier",
+        // Pre-Phase-1 fallbacks (no company_id / office_id columns yet)
+        "id, org_id, tier, name, last_active_at, created_at",
+        "id, org_id, name, tier, last_active_at, created_at",
+        "id, org_id, name, tier, created_at",
+        "id, org_id, name, tier",
+        "id, org_id, name",
+        "id, org_id, tier, last_active_at, created_at",
+        "id, org_id, tier, last_active_at",
+        "id, org_id, tier, created_at",
+        "id, org_id, tier",
+        "id, org_id",
+        "id",
+    ];
+    for (const sel of selectCandidates) {
+        const r = await supa.from("reps").select(sel).limit(limit);
+        if (!r.error)
+            return r.data ?? [];
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+            return [];
+        }
+        if (msg.includes("column") && msg.includes("does not exist")) {
+            continue;
+        }
+        throw new Error(r.error?.message ?? "reps_directory_fetch_failed");
+    }
+    return [];
+}
+async function listCrmActivityRowsBestEffort(limit = 5000) {
+    const selectCandidates = [
+        "id, user_id, status, due_at, completed_at, created_at",
+        "id, user_id, status, due_at, completed_at",
+        "id, user_id, status, due_at, created_at",
+        "id, user_id, status, due_at",
+        "id, user_id, status, completed_at, created_at",
+        "id, user_id, status, created_at",
+        "id, user_id, status",
+        "id, user_id",
+    ];
+    for (const sel of selectCandidates) {
+        const r = await supa
+            .from("crm_activities")
+            .select(sel)
+            .order("created_at", { ascending: false })
+            .limit(limit);
+        if (!r.error)
+            return r.data ?? [];
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+            return [];
+        }
+        if (msg.includes("column") && msg.includes("does not exist")) {
+            continue;
+        }
+        throw new Error(r.error?.message ?? "crm_activities_fetch_failed");
+    }
+    return [];
+}
+async function listLatestCallsForControlCentreBestEffort(limit = 2000) {
+    const selectCandidates = [
+        "id, user_id, created_at, tags, flags",
+        "id, user_id, created_at, tags",
+        "id, user_id, created_at, flags",
+        "id, user_id, created_at",
+        "id, user_id",
+    ];
+    for (const sel of selectCandidates) {
+        const r = await supa
+            .from("calls")
+            .select(sel)
+            .order("created_at", { ascending: false })
+            .limit(limit);
+        if (!r.error)
+            return r.data ?? [];
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        if ((msg.includes("relation") && msg.includes("does not exist")) || msg.includes("could not find the table")) {
+            return [];
+        }
+        if (msg.includes("column") && msg.includes("does not exist")) {
+            continue;
+        }
+        throw new Error(r.error?.message ?? "calls_fetch_failed");
+    }
+    return [];
+}
+const ManagerAutoAssignRunBodySchema = z.object({
+    mode: z.enum(["dry_run", "execute"]).optional(),
+    limit_reps: z.number().int().min(1).max(100).optional(),
+    contacts_per_rep: z.number().int().min(1).max(100).optional(),
+    max_total_contacts: z.number().int().min(1).max(1000).optional(),
+});
+async function listCrmAccountsBestEffort(args) {
+    const { orgId, limit = 5000 } = args;
+    if (!orgId)
+        return [];
+    const r = await supa
+        .from("crm_accounts")
+        .select("id, org_id, name, domain, created_at")
+        .eq("org_id", orgId)
+        .order("created_at", { ascending: false })
+        .limit(limit);
+    if (!r.error)
+        return r.data ?? [];
+    const msg = String(r.error?.message ?? "").toLowerCase();
+    if ((msg.includes("relation") && msg.includes("does not exist")) ||
+        msg.includes("could not find the table")) {
+        return [];
+    }
+    throw new Error(r.error?.message ?? "crm_accounts_fetch_failed");
+}
+async function listCrmOpportunitiesBestEffort(args) {
+    const { userIds, limit = 5000 } = args;
+    if (!userIds.length)
+        return [];
+    const selectCandidates = [
+        "id, user_id, stage, amount, close_date, account_id, contact_id, created_at, updated_at",
+        "id, user_id, stage, amount, close_date, account_id, contact_id, created_at",
+        "id, user_id, stage, amount, close_date, created_at",
+        "id, user_id, stage, amount, created_at",
+        "id, user_id, stage, created_at",
+        "id, user_id, stage",
+        "id, user_id",
+        "id",
+    ];
+    for (const sel of selectCandidates) {
+        const r = await supa
+            .from("crm_opportunities")
+            .select(sel)
+            .in("user_id", userIds)
+            .order("created_at", { ascending: false })
+            .limit(limit);
+        if (!r.error)
+            return r.data ?? [];
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        if ((msg.includes("relation") && msg.includes("does not exist")) || msg.includes("could not find the table")) {
+            return [];
+        }
+        if (msg.includes("column") && msg.includes("does not exist"))
+            continue;
+        throw new Error(r.error?.message ?? "crm_opportunities_fetch_failed");
+    }
+    return [];
+}
+function normaliseOpportunityStage(value) {
+    const v = String(value ?? "").trim().toLowerCase();
+    return v || "new";
+}
+async function listCrmContactsForUserBestEffort(args) {
+    const { userId, limit } = args;
+    const selectCandidates = [
+        "id, user_id, first_name, last_name, email, company, last_contacted_at, created_at",
+        "id, user_id, first_name, last_name, email, company, created_at",
+        "id, user_id, first_name, last_name, email, created_at",
+        "id, user_id, first_name, last_name, email, created_at",
+        "id, user_id, created_at",
+        "id, user_id",
+        "id",
+    ];
+    for (const sel of selectCandidates) {
+        const r = await supa
+            .from("crm_contacts")
+            .select(sel)
+            .eq("user_id", userId)
+            .order("created_at", { ascending: false })
+            .limit(limit);
+        if (!r.error)
+            return r.data ?? [];
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        if (msg.includes("relation") && msg.includes("does not exist"))
+            return [];
+        if (msg.includes("column") && msg.includes("does not exist"))
+            continue;
+        throw new Error(r.error?.message ?? "crm_contacts_fetch_failed");
+    }
+    return [];
+}
+function buildManagerAutoAssignSuggestion(args) {
+    const { rep, contact, health } = args;
+    const contactName = [contact?.first_name, contact?.last_name].filter(Boolean).join(" ").trim() || contact?.email || contact?.company || "Contact";
+    const repName = String(rep?.name ?? rep?.rep_name ?? "Rep").trim() || "Rep";
+    const due = new Date();
+    due.setDate(due.getDate() + (health.band === "at_risk" ? 1 : 2));
+    due.setHours(17, 0, 0, 0);
+    const importance = health.band === "at_risk" ? "critical" : health.band === "watch" ? "important" : "normal";
+    return {
+        type: "follow_up",
+        title: `Follow up with ${contactName}`,
+        due_at: due.toISOString(),
+        importance,
+        meta: {
+            rep_id: rep?.id ?? null,
+            rep_name: repName,
+            contact_id: contact?.id ?? null,
+            contact_name: contactName,
+            health_score: health.score,
+            health_band: health.band,
+            reasons: health.reasons,
+            next_action: health.next_action,
+            source: "manager_auto_assign_v1",
+        },
+    };
+}
+async function insertManagerAutoAssignRunBestEffort(args) {
+    const { runId, requester, orgId, mode, source, totals, preview } = args;
+    const payload = {
+        run_id: runId,
+        org_id: orgId,
+        user_id: requester,
+        requested_by: requester,
+        mode,
+        source,
+        totals,
+        preview,
+        started_at: new Date().toISOString(),
+        finished_at: new Date().toISOString(),
+    };
+    const selectCandidates = [
+        "run_id, org_id, user_id, requested_by, mode, source, totals, started_at, finished_at",
+        "run_id, org_id, user_id, mode, source, totals, started_at, finished_at",
+        "run_id, org_id, mode, source, totals, started_at",
+        "run_id, org_id, mode, source, totals",
+        "run_id, org_id, mode, source",
+        "run_id, org_id, mode",
+        "run_id, org_id",
+        "run_id",
+    ];
+    const payloadVariants = [
+        payload,
+        { ...payload, preview: undefined },
+        { ...payload, preview: undefined, requested_by: undefined },
+    ].map((x) => Object.fromEntries(Object.entries(x).filter(([, v]) => v !== undefined)));
+    for (const body of payloadVariants) {
+        for (const sel of selectCandidates) {
+            const r = await supa
+                .from("crm_auto_assign_runs")
+                .insert(body)
+                .select(sel)
+                .maybeSingle();
+            if (!r.error) {
+                return {
+                    ok: true,
+                    item: r.data ?? body,
+                    persisted: true,
+                };
+            }
+            const msg = String(r.error?.message ?? "").toLowerCase();
+            if ((msg.includes("relation") && msg.includes("does not exist")) || msg.includes("schema cache")) {
+                return {
+                    ok: true,
+                    item: body,
+                    persisted: false,
+                };
+            }
+            if (msg.includes("column") && msg.includes("does not exist")) {
+                continue;
+            }
+            return { ok: false, error: r.error };
+        }
+    }
+    return {
+        ok: true,
+        item: payload,
+        persisted: false,
+    };
+}
+async function listManagerAutoAssignRunsBestEffort(args) {
+    const { orgId, limit } = args;
+    const selectCandidates = [
+        "run_id, org_id, user_id, requested_by, mode, source, totals, started_at, finished_at, created_at",
+        "run_id, org_id, user_id, mode, source, totals, started_at, finished_at, created_at",
+        "run_id, org_id, mode, source, totals, started_at, finished_at",
+        "run_id, org_id, mode, source, totals, started_at",
+        "run_id, org_id, mode, source, totals",
+        "run_id, org_id, mode, source",
+        "run_id, org_id, mode",
+        "run_id, org_id",
+        "run_id",
+    ];
+    for (const sel of selectCandidates) {
+        const r = await supa
+            .from("crm_auto_assign_runs")
+            .select(sel)
+            .eq("org_id", orgId)
+            .order("created_at", { ascending: false })
+            .limit(limit);
+        if (!r.error)
+            return { ok: true, items: r.data ?? [] };
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        if ((msg.includes("relation") && msg.includes("does not exist")) || msg.includes("schema cache")) {
+            return { ok: true, items: [] };
+        }
+        if (msg.includes("column") && msg.includes("does not exist"))
+            continue;
+        return { ok: false, error: r.error };
+    }
+    return { ok: true, items: [] };
+}
+async function insertBatchAssignmentBestEffort(args) {
+    const { userId, requester, drillId, title, dueAt, meta } = args;
+    const payloads = [
+        {
+            table: "assignments",
+            payload: {
+                user_id: userId,
+                created_by: requester,
+                drill_id: drillId,
+                title: title ?? drillId,
+                status: "assigned",
+                due_at: dueAt ?? null,
+                meta: meta ?? null,
+            },
+        },
+        {
+            table: "assignments",
+            payload: {
+                user_id: userId,
+                drill_id: drillId,
+                title: title ?? drillId,
+                status: "assigned",
+                due_at: dueAt ?? null,
+                meta: meta ?? null,
+            },
+        },
+        {
+            table: "assignments",
+            payload: {
+                user_id: userId,
+                drill_id: drillId,
+                status: "assigned",
+                due_at: dueAt ?? null,
+                meta: meta ?? null,
+            },
+        },
+        {
+            table: "assignments",
+            payload: {
+                user_id: userId,
+                drill_id: drillId,
+                status: "assigned",
+            },
+        },
+        {
+            table: "coach_assignments",
+            payload: {
+                user_id: userId,
+                created_by: requester,
+                drill_id: drillId,
+                title: title ?? drillId,
+                status: "assigned",
+                due_at: dueAt ?? null,
+                meta: meta ?? null,
+            },
+        },
+        {
+            table: "coach_assignments",
+            payload: {
+                user_id: userId,
+                drill_id: drillId,
+                title: title ?? drillId,
+                status: "assigned",
+                due_at: dueAt ?? null,
+                meta: meta ?? null,
+            },
+        },
+        {
+            table: "coach_assignments",
+            payload: {
+                user_id: userId,
+                drill_id: drillId,
+                status: "assigned",
+            },
+        },
+        {
+            table: "crm_activities",
+            payload: {
+                user_id: userId,
+                type: "task",
+                title: title ?? `Assigned drill: ${drillId}`,
+                status: "open",
+                due_at: dueAt ?? null,
+            },
+        },
+    ];
+    let lastErr = null;
+    for (const attempt of payloads) {
+        const r = await supa.from(attempt.table).insert(attempt.payload).select("id").maybeSingle();
+        if (!r.error) {
+            return {
+                ok: true,
+                table: attempt.table,
+                id: r.data?.id ?? null,
+            };
+        }
+        lastErr = r.error;
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        const retryable = (msg.includes("relation") && msg.includes("does not exist")) ||
+            (msg.includes("column") && msg.includes("does not exist")) ||
+            msg.includes("could not find");
+        if (retryable)
+            continue;
+        break;
+    }
+    return {
+        ok: false,
+        error: lastErr,
+    };
+}
+router.post("/assignments/manager/batch-assign", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const body = BatchAssignSchema.parse(req.body ?? {});
+        const okManager = await isManagerUser(requester);
+        if (!okManager) {
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        const latestScores = await listLatestCallScoresBestEffort();
+        const latestByUser = new Map();
+        for (const row of latestScores) {
+            const uid = String(row?.user_id ?? "").trim();
+            if (!uid)
+                continue;
+            if (latestByUser.has(uid))
+                continue;
+            latestByUser.set(uid, row);
+        }
+        const repRows = await listRepActivityBestEffort();
+        const nowMs = Date.now();
+        const matchedUserIds = new Set();
+        for (const rep of repRows) {
+            const uid = String(rep?.id ?? "").trim();
+            if (!uid)
+                continue;
+            if (uid === requester)
+                continue;
+            const latestScoreRow = latestByUser.get(uid) ?? null;
+            const rubric = latestScoreRow?.rubric ?? null;
+            let matched = false;
+            if (body.criteria.voice_score_lt !== undefined) {
+                const voiceScore = readRubricNumber(rubric, "voice_score");
+                if (voiceScore !== null && voiceScore < body.criteria.voice_score_lt) {
+                    matched = true;
+                }
+            }
+            if (body.criteria.voice_score_gt !== undefined) {
+                const voiceScore = readRubricNumber(rubric, "voice_score");
+                if (voiceScore !== null && voiceScore > body.criteria.voice_score_gt) {
+                    matched = true;
+                }
+            }
+            if (body.criteria.weak_close === true) {
+                const weakClose = readRubricBoolean(rubric, "weak_close");
+                if (weakClose === true) {
+                    matched = true;
+                }
+            }
+            if (body.criteria.inactive_days_gt !== undefined) {
+                const rawLastActive = rep?.last_active_at ??
+                    rep?.created_at ??
+                    null;
+                if (rawLastActive) {
+                    const t = new Date(String(rawLastActive)).getTime();
+                    if (Number.isFinite(t)) {
+                        const inactiveDays = Math.floor((nowMs - t) / 86400000);
+                        if (inactiveDays > body.criteria.inactive_days_gt) {
+                            matched = true;
+                        }
+                    }
+                }
+            }
+            if (matched)
+                matchedUserIds.add(uid);
+        }
+        const assigned = [];
+        const failed = [];
+        for (const userId of matchedUserIds) {
+            const inserted = await insertBatchAssignmentBestEffort({
+                userId,
+                requester,
+                drillId: body.drill_id,
+                title: body.title,
+                dueAt: body.due_at ?? null,
+                meta: {
+                    ...(body.meta ?? {}),
+                    criteria: body.criteria,
+                    source: "manager_batch_assign",
+                },
+            });
+            if (inserted.ok) {
+                assigned.push({ user_id: userId, id: inserted.id, table: inserted.table });
+            }
+            else {
+                failed.push({
+                    user_id: userId,
+                    error: String(inserted.error?.message ?? "assignment_insert_failed"),
+                });
+            }
+        }
+        return res.json({
+            ok: true,
+            matched_count: matchedUserIds.size,
+            assigned_count: assigned.length,
+            failed_count: failed.length,
+            assigned,
+            failed,
+        });
+    }
+    catch (e) {
+        return res.status(500).json({
+            ok: false,
+            error: e?.message ?? "batch_assignment_failed",
+        });
+    }
+});
+// ---------------------------------------------------------
+// DAY 56 — TEAM SETTINGS (manager configurable coaching engine)
+// ---------------------------------------------------------
+const DEFAULT_TEAM_SETTINGS = {
+    streak_threshold: 3,
+    xp_multiplier: 1,
+    comeback_bonus: 0,
+    xp_cap_daily: 500,
+    voice_score_threshold: 60,
+    weak_close_threshold: 60,
+    filler_density_threshold: 0.08,
+    coaching_trigger_thresholds: {
+        voice_score_lt: 60,
+        weak_close: true,
+        inactive_days_gt: 3,
+    },
+};
+const TeamSettingsSchema = z.object({
+    streak_threshold: z.number().int().min(1).max(365).optional(),
+    xp_multiplier: z.number().finite().min(0).max(100).optional(),
+    comeback_bonus: z.number().int().min(0).max(100000).optional(),
+    xp_cap_daily: z.number().int().min(0).max(100000).optional(),
+    voice_score_threshold: z.number().int().min(0).max(100).optional(),
+    weak_close_threshold: z.number().int().min(0).max(100).optional(),
+    filler_density_threshold: z.number().finite().min(0).max(1).optional(),
+    coaching_trigger_thresholds: z.record(z.string(), z.any()).optional(),
+});
+function buildDefaultTeamSettings(orgId) {
+    return {
+        org_id: orgId,
+        ...DEFAULT_TEAM_SETTINGS,
+        updated_at: null,
+        updated_by: null,
+    };
+}
+function normaliseTeamSettingsRow(row, orgId) {
+    const base = buildDefaultTeamSettings(orgId);
+    return {
+        org_id: orgId,
+        streak_threshold: typeof row?.streak_threshold === "number"
+            ? row.streak_threshold
+            : Number.isFinite(Number(row?.streak_threshold))
+                ? Number(row?.streak_threshold)
+                : base.streak_threshold,
+        xp_multiplier: typeof row?.xp_multiplier === "number"
+            ? row.xp_multiplier
+            : Number.isFinite(Number(row?.xp_multiplier))
+                ? Number(row?.xp_multiplier)
+                : base.xp_multiplier,
+        comeback_bonus: typeof row?.comeback_bonus === "number"
+            ? row.comeback_bonus
+            : Number.isFinite(Number(row?.comeback_bonus))
+                ? Number(row?.comeback_bonus)
+                : base.comeback_bonus,
+        xp_cap_daily: typeof row?.xp_cap_daily === "number"
+            ? row.xp_cap_daily
+            : Number.isFinite(Number(row?.xp_cap_daily))
+                ? Number(row?.xp_cap_daily)
+                : base.xp_cap_daily,
+        voice_score_threshold: typeof row?.voice_score_threshold === "number"
+            ? row.voice_score_threshold
+            : Number.isFinite(Number(row?.voice_score_threshold))
+                ? Number(row?.voice_score_threshold)
+                : base.voice_score_threshold,
+        weak_close_threshold: typeof row?.weak_close_threshold === "number"
+            ? row.weak_close_threshold
+            : Number.isFinite(Number(row?.weak_close_threshold))
+                ? Number(row?.weak_close_threshold)
+                : base.weak_close_threshold,
+        filler_density_threshold: typeof row?.filler_density_threshold === "number"
+            ? row.filler_density_threshold
+            : Number.isFinite(Number(row?.filler_density_threshold))
+                ? Number(row?.filler_density_threshold)
+                : base.filler_density_threshold,
+        coaching_trigger_thresholds: row?.coaching_trigger_thresholds && typeof row.coaching_trigger_thresholds === "object"
+            ? row.coaching_trigger_thresholds
+            : base.coaching_trigger_thresholds,
+        updated_at: row?.updated_at ?? null,
+        updated_by: row?.updated_by ?? null,
+    };
+}
+async function getTeamSettingsBestEffort(orgId) {
+    const selectCandidates = [
+        "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold, coaching_trigger_thresholds, updated_at, updated_by",
+        "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold, updated_at, updated_by",
+        "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold, updated_at",
+        "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold",
+        "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold",
+        "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold",
+        "org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily",
+        "org_id, streak_threshold, xp_multiplier, comeback_bonus",
+        "org_id, streak_threshold, xp_multiplier",
+        "org_id, streak_threshold",
+        "org_id",
+    ];
+    for (const sel of selectCandidates) {
+        const r = await supa
+            .from("team_settings")
+            .select(sel)
+            .eq("org_id", orgId)
+            .limit(1)
+            .maybeSingle();
+        if (!r.error) {
+            return {
+                ok: true,
+                exists: !!r.data,
+                settings: normaliseTeamSettingsRow(r.data ?? {}, orgId),
+            };
+        }
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        if ((msg.includes("relation") && msg.includes("does not exist")) ||
+            (msg.includes("could not find the table") && msg.includes("team_settings")) ||
+            (msg.includes("schema cache") && msg.includes("team_settings"))) {
+            return {
+                ok: true,
+                exists: false,
+                settings: buildDefaultTeamSettings(orgId),
+            };
+        }
+        if (msg.includes("column") && msg.includes("does not exist")) {
+            continue;
+        }
+        return {
+            ok: false,
+            error: r.error,
+        };
+    }
+    return {
+        ok: true,
+        exists: false,
+        settings: buildDefaultTeamSettings(orgId),
+    };
+}
+async function upsertTeamSettingsBestEffort(args) {
+    const { orgId, requester, patch } = args;
+    const payloads = [
+        {
+            org_id: orgId,
+            ...patch,
+            updated_at: new Date().toISOString(),
+            updated_by: requester,
+        },
+        {
+            org_id: orgId,
+            ...patch,
+            updated_at: new Date().toISOString(),
+        },
+        {
+            org_id: orgId,
+            ...patch,
+        },
+    ];
+    for (const payload of payloads) {
+        const r = await supa
+            .from("team_settings")
+            .upsert(payload, { onConflict: "org_id" })
+            .select("org_id, streak_threshold, xp_multiplier, comeback_bonus, xp_cap_daily, voice_score_threshold, weak_close_threshold, filler_density_threshold, coaching_trigger_thresholds, updated_at, updated_by")
+            .maybeSingle();
+        if (!r.error) {
+            return {
+                ok: true,
+                settings: normaliseTeamSettingsRow(r.data ?? payload, orgId),
+            };
+        }
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        const retryable = (msg.includes("column") && msg.includes("does not exist")) ||
+            msg.includes("could not find") ||
+            (msg.includes("schema cache") && msg.includes("team_settings"));
+        if (retryable)
+            continue;
+        return {
+            ok: false,
+            error: r.error,
+        };
+    }
+    return {
+        ok: false,
+        error: new Error("team_settings_upsert_failed"),
+    };
+}
+router.get("/reporting-summary", async (req, res) => {
+    try {
+        const { requester, orgId, bypassed } = await requireManagerOrg(req);
+        const okManager = await isManagerUser(requester);
+        if (!okManager) {
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        const visibleReps = await resolveVisibleReps({ requester, orgId, bypassed, limit: 2000 });
+        const userIds = visibleReps.map((rep) => String(rep?.id ?? "").trim()).filter(Boolean);
+        const [contacts, accounts, opportunities] = await Promise.all([
+            Promise.all(userIds.map((userId) => listCrmContactsForUserBestEffort({ userId, limit: 500 }))).then((chunks) => chunks.flat()),
+            listCrmAccountsBestEffort({ orgId, limit: 5000 }),
+            listCrmOpportunitiesBestEffort({ userIds, limit: 5000 }),
+        ]);
+        const contactRows = (contacts || []);
+        const accountRows = (accounts || []);
+        const opportunityRows = (opportunities || []);
+        const contactsAtRisk = contactRows.filter((contact) => {
+            const health = computeContactHealthV1({
+                last_contacted_at: contact?.last_contacted_at ?? null,
+                open_actions: 0,
+                overdue_actions: 0,
+                has_notes: false,
+                has_recent_call: false,
+            });
+            return health.band === "at_risk";
+        }).length;
+        const opportunitiesByStage = opportunityRows.reduce((acc, row) => {
+            const stage = normaliseOpportunityStage(row?.stage);
+            acc[stage] = (acc[stage] ?? 0) + 1;
+            return acc;
+        }, {});
+        const openOpportunityStages = new Set(["new", "qualified", "proposal", "negotiation"]);
+        const openOpportunities = opportunityRows.filter((row) => openOpportunityStages.has(normaliseOpportunityStage(row?.stage))).length;
+        const wonOpportunities = opportunityRows.filter((row) => normaliseOpportunityStage(row?.stage) === "won").length;
+        const lostOpportunities = opportunityRows.filter((row) => normaliseOpportunityStage(row?.stage) === "lost").length;
+        const pipelineAmount = opportunityRows.reduce((sum, row) => {
+            const raw = row?.amount;
+            const n = typeof raw === "number" ? raw : Number(raw);
+            return Number.isFinite(n) ? sum + n : sum;
+        }, 0);
+        const contactsByRep = new Map();
+        const oppsByRep = new Map();
+        const accountsByRep = new Map();
+        for (const row of contactRows) {
+            const repId = String(row?.user_id ?? "").trim();
+            if (!repId)
+                continue;
+            contactsByRep.set(repId, (contactsByRep.get(repId) ?? 0) + 1);
+        }
+        for (const row of opportunityRows) {
+            const repId = String(row?.user_id ?? "").trim();
+            if (!repId)
+                continue;
+            oppsByRep.set(repId, (oppsByRep.get(repId) ?? 0) + 1);
+        }
+        for (const row of accountRows) {
+            const repId = String(row?.user_id ?? "").trim();
+            if (!repId)
+                continue;
+            accountsByRep.set(repId, (accountsByRep.get(repId) ?? 0) + 1);
+        }
+        const reps = visibleReps.map((rep) => {
+            const repId = String(rep?.id ?? "").trim();
+            return {
+                rep_id: repId,
+                rep_name: String(rep?.name ?? "").trim() || `Rep ${repId.slice(0, 8)}`,
+                contacts: contactsByRep.get(repId) ?? 0,
+                accounts: accountsByRep.get(repId) ?? 0,
+                opportunities: oppsByRep.get(repId) ?? 0,
+            };
+        }).sort((a, b) => {
+            if (b.opportunities !== a.opportunities)
+                return b.opportunities - a.opportunities;
+            if (b.contacts !== a.contacts)
+                return b.contacts - a.contacts;
+            return a.rep_name.localeCompare(b.rep_name);
+        });
+        return res.json({
+            ok: true,
+            mode: bypassed ? "fallback" : "org",
+            company: {
+                contacts_total: contactRows.length,
+                contacts_at_risk: contactsAtRisk,
+                accounts_total: accountRows.length,
+                opportunities_total: opportunityRows.length,
+                opportunities_open: openOpportunities,
+                opportunities_won: wonOpportunities,
+                opportunities_lost: lostOpportunities,
+                pipeline_amount: pipelineAmount,
+                opportunities_by_stage: opportunitiesByStage,
+            },
+            reps,
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "bad_request");
+        if (msg === "forbidden_org_scope")
+            return res.status(403).json({ ok: false, error: msg });
+        if (msg === "org_scope_not_supported")
+            return res.status(500).json({ ok: false, error: msg });
+        return res.status(400).json({ ok: false, error: msg });
+    }
+});
+// --- Inserted: manager overview route ---
+router.get("/manager/overview", async (req, res) => {
+    try {
+        const { requester, orgId, bypassed } = await requireManagerOrg(req);
+        const okManager = await isManagerUser(requester);
+        if (!okManager) {
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        const [visibleReps, activityRows] = await Promise.all([
+            resolveVisibleReps({ requester, orgId, bypassed }),
+            listCrmActivityRowsBestEffort(),
+        ]);
+        const nowMs = Date.now();
+        const startOfToday = new Date();
+        startOfToday.setHours(0, 0, 0, 0);
+        const startOfTodayMs = startOfToday.getTime();
+        const countsByUser = new Map();
+        for (const row of activityRows) {
+            const uid = String(row?.user_id ?? "").trim();
+            if (!uid)
+                continue;
+            const bucket = countsByUser.get(uid) ?? { open: 0, overdue: 0, completed_today: 0 };
+            const completedAt = row?.completed_at ?? null;
+            const dueAt = row?.due_at ?? null;
+            const status = String(row?.status ?? "").trim().toLowerCase();
+            const isCompleted = !!completedAt || status === "done" || status === "completed" || status === "closed";
+            if (isCompleted) {
+                const completedMs = completedAt ? new Date(String(completedAt)).getTime() : NaN;
+                if (Number.isFinite(completedMs) && completedMs >= startOfTodayMs) {
+                    bucket.completed_today += 1;
+                }
+            }
+            else {
+                bucket.open += 1;
+                const dueMs = dueAt ? new Date(String(dueAt)).getTime() : NaN;
+                if (Number.isFinite(dueMs) && dueMs < nowMs) {
+                    bucket.overdue += 1;
+                }
+            }
+            countsByUser.set(uid, bucket);
+        }
+        const items = visibleReps
+            .map((rep) => {
+            const repId = String(rep?.id ?? "").trim();
+            const repNameRaw = String(rep?.name ?? "").trim();
+            const counts = countsByUser.get(repId) ?? { open: 0, overdue: 0, completed_today: 0 };
+            return {
+                rep_id: repId,
+                rep_name: repNameRaw || `Rep ${repId.slice(0, 8)}`,
+                counts,
+                meta: {
+                    tier: rep?.tier ?? null,
+                    org_id: rep?.org_id ?? null,
+                    last_active_at: rep?.last_active_at ?? null,
+                    created_at: rep?.created_at ?? null,
+                },
+            };
+        })
+            .sort((a, b) => {
+            const overdueDelta = Number(b.counts?.overdue ?? 0) - Number(a.counts?.overdue ?? 0);
+            if (overdueDelta !== 0)
+                return overdueDelta;
+            const openDelta = Number(b.counts?.open ?? 0) - Number(a.counts?.open ?? 0);
+            if (openDelta !== 0)
+                return openDelta;
+            return a.rep_name.localeCompare(b.rep_name);
+        });
+        return res.json({
+            ok: true,
+            mode: bypassed ? "fallback" : "org",
+            items,
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "bad_request");
+        if (msg === "forbidden_org_scope")
+            return res.status(403).json({ ok: false, error: msg });
+        if (msg === "org_scope_not_supported")
+            return res.status(500).json({ ok: false, error: msg });
+        return res.status(400).json({ ok: false, error: msg });
+    }
+});
+// ------------------------------
+// Rep Control Centre helpers and route
+// ------------------------------
+function daysSinceIso(value) {
+    if (!value)
+        return null;
+    const ms = new Date(String(value)).getTime();
+    if (!Number.isFinite(ms))
+        return null;
+    return Math.max(0, Math.floor((Date.now() - ms) / 86400000));
+}
+function newerIso(a, b) {
+    const ta = a ? new Date(String(a)).getTime() : NaN;
+    const tb = b ? new Date(String(b)).getTime() : NaN;
+    if (!Number.isFinite(ta) && !Number.isFinite(tb))
+        return null;
+    if (!Number.isFinite(ta))
+        return b ?? null;
+    if (!Number.isFinite(tb))
+        return a ?? null;
+    return ta >= tb ? String(a) : String(b);
+}
+function computeActivityScore(args) {
+    const latest = newerIso(args.lastLoginAt ?? null, args.lastCallAt ?? null);
+    const days = daysSinceIso(latest);
+    if (days === null) {
+        return { score: 0, label: "No activity data", latest_at: null, days_since: null };
+    }
+    if (days <= 1)
+        return { score: 100, label: "Active in last 24h", latest_at: latest, days_since: days };
+    if (days <= 3)
+        return { score: 80, label: `Active ${days}d ago`, latest_at: latest, days_since: days };
+    if (days <= 7)
+        return { score: 60, label: `Active ${days}d ago`, latest_at: latest, days_since: days };
+    if (days <= 14)
+        return { score: 35, label: `Inactive ${days}d`, latest_at: latest, days_since: days };
+    return { score: 10, label: `Inactive ${days}d`, latest_at: latest, days_since: days };
+}
+function readRubricMetricAliases(rubric, aliases) {
+    for (const key of aliases) {
+        const n = readRubricNumber(rubric, key);
+        if (n !== null)
+            return n;
+    }
+    return null;
+}
+function inferWeakestSkillFromRubric(rubric) {
+    if (!rubric || typeof rubric !== "object")
+        return null;
+    const skillCandidates = [
+        { label: "Intro", value: readRubricMetricAliases(rubric, ["intro", "intro_score", "opening", "opener_score"]) },
+        { label: "Discovery", value: readRubricMetricAliases(rubric, ["discovery", "discovery_score"]) },
+        { label: "Objection handling", value: readRubricMetricAliases(rubric, ["objection", "objection_score", "objection_handling", "objection_handling_score"]) },
+        { label: "Closing", value: readRubricMetricAliases(rubric, ["close", "close_score", "closing", "closing_score"]) },
+    ].filter((x) => x.value !== null);
+    if (!skillCandidates.length)
+        return null;
+    skillCandidates.sort((a, b) => a.value - b.value);
+    return skillCandidates[0]?.label ?? null;
+}
+function buildCoachingReasons(args) {
+    const reasons = new Set();
+    const tags = Array.isArray(args.latestCall?.tags) ? args.latestCall.tags : [];
+    const flags = Array.isArray(args.latestCall?.flags) ? args.latestCall.flags : [];
+    const blobs = [...tags, ...flags].map((x) => String(x || "").trim().toLowerCase());
+    for (const value of blobs) {
+        if (!value)
+            continue;
+        if (value.includes("price"))
+            reasons.add("price_objection");
+        if (value.includes("objection"))
+            reasons.add("objection_handling");
+        if (value.includes("weak close") || value.includes("closing"))
+            reasons.add("weak_close");
+        if (value.includes("discovery"))
+            reasons.add("discovery");
+        if (value.includes("intro") || value.includes("opening") || value.includes("opener"))
+            reasons.add("intro");
+        if (value.includes("next step"))
+            reasons.add("next_steps");
+    }
+    if (readRubricBoolean(args.rubric, "weak_close") === true) {
+        reasons.add("weak_close");
+        reasons.add("next_steps");
+    }
+    if (args.weakestSkill === "Objection handling")
+        reasons.add("objection_handling");
+    if (args.weakestSkill === "Closing")
+        reasons.add("weak_close");
+    if (args.weakestSkill === "Discovery")
+        reasons.add("discovery");
+    if (args.weakestSkill === "Intro")
+        reasons.add("intro");
+    return Array.from(reasons);
+}
+function deriveWeakestSkillFromReasons(reasons) {
+    const joined = reasons.map((x) => String(x || "").trim().toLowerCase()).filter(Boolean).join(" | ");
+    if (!joined)
+        return null;
+    if (joined.includes("objection"))
+        return "Objection handling";
+    if (joined.includes("weak_close") || joined.includes("closing") || joined.includes("next_steps"))
+        return "Closing";
+    if (joined.includes("discovery"))
+        return "Discovery";
+    if (joined.includes("intro") || joined.includes("opening") || joined.includes("opener"))
+        return "Intro";
+    if (joined.includes("price"))
+        return "Price handling";
+    return null;
+}
+function buildRepControlCentreRow(args) {
+    const { rep, counts, latestCall, latestScore } = args;
+    const repId = String(rep?.id ?? "").trim();
+    const repNameRaw = String(rep?.name ?? "").trim();
+    const lastLoginAt = rep?.last_active_at ?? null;
+    const lastCallAt = latestCall?.created_at ?? null;
+    const activity = computeActivityScore({ lastLoginAt, lastCallAt });
+    const rubric = latestScore?.rubric ?? null;
+    const weakestFromRubric = inferWeakestSkillFromRubric(rubric);
+    const coachingReasons = buildCoachingReasons({
+        latestCall,
+        rubric,
+        weakestSkill: weakestFromRubric,
+    });
+    const weakestFromReasons = deriveWeakestSkillFromReasons(coachingReasons);
+    let weakestSkill = null;
+    let weakestSkillSource = "activity_fallback";
+    if (weakestFromRubric) {
+        weakestSkill = weakestFromRubric;
+        weakestSkillSource = "rubric";
+    }
+    else if (weakestFromReasons) {
+        weakestSkill = weakestFromReasons;
+        weakestSkillSource = "reasons";
+    }
+    else {
+        weakestSkill = "Consistency";
+        weakestSkillSource = "activity_fallback";
+    }
+    const inactiveDays = activity.days_since;
+    const overdue = Number(counts?.overdue ?? 0);
+    const open = Number(counts?.open ?? 0);
+    const completedToday = Number(counts?.completed_today ?? 0);
+    const reasons = [...coachingReasons];
+    let riskScore = 0;
+    if (overdue > 0) {
+        reasons.push(`overdue_${overdue}`);
+        riskScore += overdue * 100;
+    }
+    if (open >= 8) {
+        reasons.push("workload_open_actions");
+        riskScore += 80;
+    }
+    else if (open >= 4) {
+        reasons.push("follow_up_open_actions");
+        riskScore += 35;
+    }
+    if (typeof inactiveDays === "number" && inactiveDays >= 7) {
+        reasons.push("inactive_7d");
+        riskScore += 90;
+    }
+    else if (typeof inactiveDays === "number" && inactiveDays >= 3) {
+        reasons.push("inactive_3d");
+        riskScore += 40;
+    }
+    if (completedToday === 0 && open > 0 && weakestSkillSource === "activity_fallback") {
+        reasons.push("no_activity_today");
+        riskScore += 15;
+    }
+    let band = "ok";
+    if (overdue > 0 || riskScore >= 120)
+        band = "at_risk";
+    else if (riskScore >= 50)
+        band = "watch";
+    return {
+        rep_id: repId,
+        rep_name: repNameRaw || `Rep ${repId.slice(0, 8)}`,
+        band,
+        risk_score: riskScore,
+        reasons,
+        counts: {
+            open,
+            overdue,
+            completed_today: completedToday,
+        },
+        weakest_skill: weakestSkill,
+        weakest_skill_source: weakestSkillSource,
+        activity_score: activity.score,
+        activity_label: activity.label,
+        meta: {
+            tier: rep?.tier ?? null,
+            org_id: rep?.org_id ?? null,
+            last_active_at: activity.latest_at,
+            last_login_at: lastLoginAt,
+            last_call_at: lastCallAt,
+            created_at: rep?.created_at ?? null,
+            inactive_days: inactiveDays,
+            weakest_skill: weakestSkill,
+            weakest_skill_source: weakestSkillSource,
+            activity_score: activity.score,
+            activity_label: activity.label,
+        },
+    };
+}
+router.get("/manager/control-centre", async (req, res) => {
+    try {
+        const { requester, orgId, bypassed } = await requireManagerOrg(req);
+        const okManager = await isManagerUser(requester);
+        if (!okManager) {
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        const [visibleReps, activityRows, latestCallRows, latestScoreRows] = await Promise.all([
+            resolveVisibleReps({ requester, orgId, bypassed, excludeSelf: true }),
+            listCrmActivityRowsBestEffort(),
+            listLatestCallsForControlCentreBestEffort(),
+            listLatestCallScoresBestEffort(),
+        ]);
+        const nowMs = Date.now();
+        const countsByUser = new Map();
+        for (const row of activityRows) {
+            const uid = String(row?.user_id ?? "").trim();
+            if (!uid)
+                continue;
+            const bucket = countsByUser.get(uid) ?? { open: 0, overdue: 0, completed_today: 0 };
+            const completedAt = row?.completed_at ?? null;
+            const dueAt = row?.due_at ?? null;
+            const status = String(row?.status ?? "").trim().toLowerCase();
+            const isCompleted = !!completedAt || status === "done" || status === "completed" || status === "closed";
+            if (isCompleted) {
+                const completedMs = completedAt ? new Date(String(completedAt)).getTime() : NaN;
+                if (Number.isFinite(completedMs) && completedMs >= nowMs - 86400000) {
+                    bucket.completed_today += 1;
+                }
+            }
+            else {
+                bucket.open += 1;
+                const dueMs = dueAt ? new Date(String(dueAt)).getTime() : NaN;
+                if (Number.isFinite(dueMs) && dueMs < nowMs) {
+                    bucket.overdue += 1;
+                }
+            }
+            countsByUser.set(uid, bucket);
+        }
+        const latestCallByUser = new Map();
+        for (const row of latestCallRows) {
+            const uid = String(row?.user_id ?? "").trim();
+            if (!uid)
+                continue;
+            if (latestCallByUser.has(uid))
+                continue;
+            latestCallByUser.set(uid, row);
+        }
+        const latestScoreByUser = new Map();
+        for (const row of latestScoreRows) {
+            const uid = String(row?.user_id ?? "").trim();
+            if (!uid)
+                continue;
+            if (latestScoreByUser.has(uid))
+                continue;
+            latestScoreByUser.set(uid, row);
+        }
+        const repsAll = visibleReps
+            .map((rep) => {
+            const repId = String(rep?.id ?? "").trim();
+            return buildRepControlCentreRow({
+                rep,
+                counts: countsByUser.get(repId) ?? { open: 0, overdue: 0, completed_today: 0 },
+                latestCall: latestCallByUser.get(repId) ?? null,
+                latestScore: latestScoreByUser.get(repId) ?? null,
+            });
+        })
+            .sort((a, b) => {
+            const riskDelta = Number(b.risk_score ?? 0) - Number(a.risk_score ?? 0);
+            if (riskDelta !== 0)
+                return riskDelta;
+            const overdueDelta = Number(b.counts?.overdue ?? 0) - Number(a.counts?.overdue ?? 0);
+            if (overdueDelta !== 0)
+                return overdueDelta;
+            const openDelta = Number(b.counts?.open ?? 0) - Number(a.counts?.open ?? 0);
+            if (openDelta !== 0)
+                return openDelta;
+            return String(a.rep_name ?? "").localeCompare(String(b.rep_name ?? ""));
+        });
+        const repsAtRisk = repsAll.filter((r) => r.band === "at_risk");
+        const repsWatch = repsAll.filter((r) => r.band === "watch");
+        const repsOk = repsAll.filter((r) => r.band === "ok");
+        const headline = {
+            reps_total: repsAll.length,
+            reps_at_risk: repsAtRisk.length,
+            reps_watch: repsWatch.length,
+            reps_ok: repsOk.length,
+            open_actions_total: repsAll.reduce((sum, r) => sum + Number(r.counts?.open ?? 0), 0),
+            overdue_actions_total: repsAll.reduce((sum, r) => sum + Number(r.counts?.overdue ?? 0), 0),
+        };
+        return res.json({
+            ok: true,
+            mode: bypassed ? "fallback" : "org",
+            headline,
+            reps_all: repsAll,
+            reps_at_risk: repsAtRisk,
+            reps_watch: repsWatch,
+            reps_ok: repsOk,
+            items: repsAll,
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "bad_request");
+        if (msg === "forbidden_org_scope")
+            return res.status(403).json({ ok: false, error: msg });
+        if (msg === "org_scope_not_supported")
+            return res.status(500).json({ ok: false, error: msg });
+        return res.status(400).json({ ok: false, error: msg });
+    }
+});
+router.post("/manager/auto-assign/run", async (req, res) => {
+    try {
+        const { requester, orgId, bypassed } = await requireManagerOrg(req);
+        const okManager = await isManagerUser(requester);
+        if (!okManager) {
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        const body = ManagerAutoAssignRunBodySchema.parse(req.body ?? {});
+        const mode = body.mode ?? "dry_run";
+        const limitReps = body.limit_reps ?? 10;
+        const contactsPerRep = body.contacts_per_rep ?? 5;
+        const maxTotalContacts = body.max_total_contacts ?? 25;
+        const source = String(req.header("x-cron-secret") || "").trim() ? "cron" : "manual";
+        const visibleReps = (await resolveVisibleReps({ requester, orgId, bypassed, excludeSelf: true, limit: limitReps * 5 })).slice(0, limitReps);
+        const preview = [];
+        const assigned = [];
+        const failed = [];
+        let contactsConsidered = 0;
+        outer: for (const rep of visibleReps) {
+            const repId = String(rep?.id ?? "").trim();
+            if (!repId)
+                continue;
+            const contacts = await listCrmContactsForUserBestEffort({
+                userId: repId,
+                limit: Math.max(contactsPerRep * 3, contactsPerRep),
+            });
+            const ranked = contacts
+                .map((contact) => {
+                const lastContacted = contact?.last_contacted_at ?? null;
+                const health = computeContactHealthV1({
+                    last_contacted_at: lastContacted,
+                    open_actions: 0,
+                    overdue_actions: 0,
+                    has_notes: false,
+                    has_recent_call: false,
+                });
+                return { contact, health };
+            })
+                .sort((a, b) => a.health.score - b.health.score)
+                .slice(0, contactsPerRep);
+            for (const entry of ranked) {
+                if (contactsConsidered >= maxTotalContacts)
+                    break outer;
+                const suggestion = buildManagerAutoAssignSuggestion({ rep, contact: entry.contact, health: entry.health });
+                contactsConsidered += 1;
+                const previewItem = {
+                    rep_id: repId,
+                    rep_name: String(rep?.name ?? "").trim() || `Rep ${repId.slice(0, 8)}`,
+                    contact_id: entry.contact?.id ?? null,
+                    contact_email: entry.contact?.email ?? null,
+                    suggestion,
+                };
+                preview.push(previewItem);
+                if (mode === "execute") {
+                    const inserted = await insertCrmActionBestEffort({
+                        requester,
+                        repId,
+                        contactId: String(entry.contact?.id ?? "").trim(),
+                        type: suggestion.type,
+                        title: suggestion.title,
+                        due_at: suggestion.due_at,
+                        importance: suggestion.importance,
+                        meta: suggestion.meta,
+                    });
+                    if (inserted.ok) {
+                        assigned.push(previewItem);
+                    }
+                    else {
+                        failed.push({
+                            rep_id: repId,
+                            contact_id: entry.contact?.id ?? null,
+                            error: String(inserted.error?.message ?? "crm_action_insert_failed"),
+                        });
+                    }
+                }
+            }
+        }
+        const totals = {
+            reps_considered: visibleReps.length,
+            contacts_considered: contactsConsidered,
+            actions_created: assigned.length,
+            skipped_dedupe: 0,
+            errors: failed.length,
+        };
+        const runId = randomUUID();
+        const persisted = await insertManagerAutoAssignRunBestEffort({
+            runId,
+            requester,
+            orgId,
+            mode,
+            source,
+            totals,
+            preview,
+        });
+        if (!persisted.ok) {
+            return res.status(500).json({
+                ok: false,
+                error: String(persisted.error?.message ?? "auto_assign_run_persist_failed"),
+            });
+        }
+        try {
+            await postCrmAutoAssignRunSlack({
+                run_id: runId,
+                org_id: orgId,
+                mode,
+                totals,
+                source,
+            });
+        }
+        catch {
+            // fail-soft
+        }
+        return res.json({
+            ok: true,
+            run_id: runId,
+            mode,
+            source,
+            persisted: persisted.persisted,
+            totals,
+            preview,
+            started_at: persisted.item?.started_at ?? new Date().toISOString(),
+            finished_at: persisted.item?.finished_at ?? new Date().toISOString(),
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "bad_request");
+        if (msg === "forbidden_org_scope")
+            return res.status(403).json({ ok: false, error: msg });
+        if (msg === "org_scope_not_supported")
+            return res.status(500).json({ ok: false, error: msg });
+        return res.status(400).json({ ok: false, error: msg });
+    }
+});
+router.get("/manager/auto-assign/runs/latest", async (req, res) => {
+    try {
+        const { requester, orgId } = await requireManagerOrg(req);
+        const okManager = await isManagerUser(requester);
+        if (!okManager) {
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        const runsRes = await listManagerAutoAssignRunsBestEffort({ orgId, limit: 1 });
+        if (!runsRes.ok) {
+            return res.status(500).json({ ok: false, error: String(runsRes.error?.message ?? "auto_assign_runs_fetch_failed") });
+        }
+        return res.json({
+            ok: true,
+            item: runsRes.items[0] ?? null,
+            source: "crm_auto_assign_runs",
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "bad_request");
+        if (msg === "forbidden_org_scope")
+            return res.status(403).json({ ok: false, error: msg });
+        if (msg === "org_scope_not_supported")
+            return res.status(500).json({ ok: false, error: msg });
+        return res.status(400).json({ ok: false, error: msg });
+    }
+});
+router.get("/manager/auto-assign/runs", async (req, res) => {
+    try {
+        const { requester, orgId } = await requireManagerOrg(req);
+        const okManager = await isManagerUser(requester);
+        if (!okManager) {
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        const limit = Math.min(Math.max(Number(req.query?.limit ?? 10), 1), 50);
+        const runsRes = await listManagerAutoAssignRunsBestEffort({ orgId, limit });
+        if (!runsRes.ok) {
+            return res.status(500).json({ ok: false, error: String(runsRes.error?.message ?? "auto_assign_runs_fetch_failed") });
+        }
+        return res.json({
+            ok: true,
+            items: runsRes.items,
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "bad_request");
+        if (msg === "forbidden_org_scope")
+            return res.status(403).json({ ok: false, error: msg });
+        if (msg === "org_scope_not_supported")
+            return res.status(500).json({ ok: false, error: msg });
+        return res.status(400).json({ ok: false, error: msg });
+    }
+});
+router.get("/manager/settings", async (req, res) => {
+    try {
+        const { requester, orgId } = await requireManagerOrg(req);
+        const okManager = await isManagerUser(requester);
+        if (!okManager) {
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        const settingsRes = await getTeamSettingsBestEffort(orgId);
+        if (!settingsRes.ok) {
+            return res.status(500).json({
+                ok: false,
+                error: settingsRes.error?.message ?? "team_settings_fetch_failed",
+            });
+        }
+        return res.json({
+            ok: true,
+            exists: settingsRes.exists,
+            settings: settingsRes.settings,
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "bad_request");
+        if (msg === "forbidden_org_scope")
+            return res.status(403).json({ ok: false, error: msg });
+        if (msg === "org_scope_not_supported")
+            return res.status(500).json({ ok: false, error: msg });
+        return res.status(400).json({ ok: false, error: msg });
+    }
+});
+router.post("/manager/settings", async (req, res) => {
+    try {
+        const { requester, orgId } = await requireManagerOrg(req);
+        const okManager = await isManagerUser(requester);
+        if (!okManager) {
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        const body = TeamSettingsSchema.parse(req.body ?? {});
+        const currentRes = await getTeamSettingsBestEffort(orgId);
+        if (!currentRes.ok) {
+            return res.status(500).json({
+                ok: false,
+                error: currentRes.error?.message ?? "team_settings_fetch_failed",
+            });
+        }
+        const merged = {
+            ...currentRes.settings,
+            ...body,
+            org_id: orgId,
+        };
+        const upsertRes = await upsertTeamSettingsBestEffort({
+            orgId,
+            requester,
+            patch: {
+                streak_threshold: merged.streak_threshold,
+                xp_multiplier: merged.xp_multiplier,
+                comeback_bonus: merged.comeback_bonus,
+                xp_cap_daily: merged.xp_cap_daily,
+                voice_score_threshold: merged.voice_score_threshold,
+                weak_close_threshold: merged.weak_close_threshold,
+                filler_density_threshold: merged.filler_density_threshold,
+                coaching_trigger_thresholds: merged.coaching_trigger_thresholds,
+            },
+        });
+        if (!upsertRes.ok) {
+            return res.status(500).json({
+                ok: false,
+                error: upsertRes.error?.message ?? "team_settings_upsert_failed",
+            });
+        }
+        return res.json({
+            ok: true,
+            settings: upsertRes.settings,
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "bad_request");
+        if (msg === "forbidden_org_scope")
+            return res.status(403).json({ ok: false, error: msg });
+        if (msg === "org_scope_not_supported")
+            return res.status(500).json({ ok: false, error: msg });
+        return res.status(400).json({ ok: false, error: msg });
+    }
+});
+/* ---------------------------------------------
+   GET /v1/crm/manager/contacts
+
+   Manager view of all contacts across every rep in the org.
+   - Scoped by org_id (via requireManagerOrg)
+   - Enriched with rep ownership + account linkage (best-effort)
+   - Supports: ?repId= ?q= ?limit= ?sort=
+---------------------------------------------- */
+router.get("/manager/contacts", async (req, res) => {
+    try {
+        const { requester, orgId, bypassed } = await requireManagerOrg(req);
+        const okManager = await isManagerUser(requester);
+        if (!okManager) {
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        const limit = Math.min(Math.max(Number(req.query.limit ?? 100), 1), 500);
+        const repIdFilter = String(req.query.repId ?? "").trim();
+        const searchRaw = String(req.query.q ?? req.query.query ?? "").trim();
+        const sortBy = String(req.query.sort ?? "created_at").trim();
+        // 1) Resolve which rep IDs are visible to this manager
+        const visibleReps = await resolveVisibleReps({ requester, orgId, bypassed, limit: 2000 });
+        // Optional: narrow to single rep
+        const targetReps = repIdFilter
+            ? visibleReps.filter((r) => String(r.id) === repIdFilter)
+            : visibleReps;
+        const repIds = targetReps.map((r) => String(r.id)).filter(Boolean);
+        if (!repIds.length) {
+            return res.json({ ok: true, contacts: [], total: 0, reps_included: 0 });
+        }
+        // Build fast lookup: repId → rep info
+        const repById = new Map();
+        for (const rep of targetReps) {
+            repById.set(String(rep.id), rep);
+        }
+        // 2) Fetch contacts for all visible reps — schema-tolerant fallback chain
+        const contactSelectCandidates = [
+            "id, user_id, first_name, last_name, email, company, last_contacted_at, created_at",
+            "id, user_id, first_name, last_name, email, company, created_at",
+            "id, user_id, first_name, last_name, email, created_at",
+            "id, user_id, first_name, last_name, created_at",
+            "id, user_id, created_at",
+        ];
+        let contactRows = [];
+        for (const sel of contactSelectCandidates) {
+            let q = supa
+                .from("crm_contacts")
+                .select(sel)
+                .in("user_id", repIds)
+                .order("created_at", { ascending: false })
+                .limit(limit);
+            const { data, error } = await q;
+            if (!error) {
+                contactRows = data ?? [];
+                break;
+            }
+            const msg = String(error?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist"))
+                break;
+            if (msg.includes("column") && msg.includes("does not exist"))
+                continue;
+            return res.status(500).json({ ok: false, error: error?.message ?? "contacts_fetch_failed" });
+        }
+        // 3) Optional search filter (applied in-memory after fetch)
+        if (searchRaw) {
+            const q = searchRaw.toLowerCase();
+            contactRows = contactRows.filter((c) => {
+                const hay = [c.first_name, c.last_name, c.email, c.company]
+                    .filter(Boolean)
+                    .join(" ")
+                    .toLowerCase();
+                return hay.includes(q);
+            });
+        }
+        // 4) Fetch accounts for enrichment (best-effort — null if table missing)
+        const accountRows = await listCrmAccountsBestEffort({ orgId, limit: 2000 });
+        const accountByUserId = new Map();
+        for (const acc of accountRows) {
+            const uid = String(acc.user_id ?? "").trim();
+            if (uid && !accountByUserId.has(uid))
+                accountByUserId.set(uid, acc);
+        }
+        // 5) Sort
+        const sortDir = sortBy === "name" || sortBy === "company" ? 1 : -1;
+        contactRows.sort((a, b) => {
+            if (sortBy === "last_contacted_at") {
+                const ta = a.last_contacted_at ? new Date(a.last_contacted_at).getTime() : 0;
+                const tb = b.last_contacted_at ? new Date(b.last_contacted_at).getTime() : 0;
+                return (tb - ta);
+            }
+            if (sortBy === "name") {
+                const na = [a.first_name, a.last_name].filter(Boolean).join(" ").toLowerCase();
+                const nb = [b.first_name, b.last_name].filter(Boolean).join(" ").toLowerCase();
+                return na < nb ? -sortDir : na > nb ? sortDir : 0;
+            }
+            if (sortBy === "company") {
+                const ca = String(a.company ?? "").toLowerCase();
+                const cb = String(b.company ?? "").toLowerCase();
+                return ca < cb ? -sortDir : ca > cb ? sortDir : 0;
+            }
+            // default: created_at desc
+            const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+            const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+            return tb - ta;
+        });
+        // 6) Shape output
+        const contacts = contactRows.map((c) => {
+            const ownerId = String(c.user_id ?? "").trim();
+            const rep = repById.get(ownerId) ?? null;
+            const account = accountByUserId.get(ownerId) ?? null;
+            return {
+                id: c.id,
+                first_name: c.first_name ?? null,
+                last_name: c.last_name ?? null,
+                email: c.email ?? null,
+                company: c.company ?? null,
+                last_contacted_at: c.last_contacted_at ?? null,
+                created_at: c.created_at ?? null,
+                rep_id: ownerId || null,
+                rep_name: rep ? (String(rep.name ?? "").trim() || null) : null,
+                account: account ? { id: account.id, name: account.name ?? null } : null,
+            };
+        });
+        return res.json({
+            ok: true,
+            contacts,
+            total: contacts.length,
+            reps_included: targetReps.length,
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "bad_request");
+        if (msg === "forbidden_org_scope")
+            return res.status(403).json({ ok: false, error: msg });
+        if (msg === "org_scope_not_supported")
+            return res.status(500).json({ ok: false, error: msg });
+        if (msg === "Missing or invalid x-user-id")
+            return res.status(401).json({ ok: false, error: "missing_user" });
+        return res.status(400).json({ ok: false, error: msg });
+    }
+});
+/* ---------------------------------------------
+   OPPORTUNITIES PIPELINE (Kanban v1)
+
+   GET /v1/crm/opportunities/pipeline
+   - Returns opportunities grouped by stage for the current requester
+   - Schema tolerant: if crm_opportunities.stage missing, defaults to "new"
+
+   PATCH /v1/crm/opportunities/:id/stage
+   Body: { stage: string }
+   - Updates the stage for a single opportunity owned by requester
+   - Schema tolerant: if stage column missing, returns a clear error
+---------------------------------------------- */
+const PIPELINE_STAGES_DEFAULT = [
+    "new",
+    "qualified",
+    "proposal",
+    "negotiation",
+    "won",
+    "lost",
+];
+// PartnerAdmin and SuperAdmin have at least manager-level access to their scope.
+// Phase 2 will add partner-level enforcement on top of this.
+const MANAGER_ROLES = new Set(["Manager", "Owner", "PartnerAdmin", "SuperAdmin"]);
+async function isManagerUser(userId) {
+    try {
+        const { data, error } = await supa
+            .from("reps")
+            .select("tier")
+            .eq("id", userId)
+            .limit(1)
+            .maybeSingle();
+        if (error)
+            return false;
+        const tier = String(data?.tier || "");
+        return MANAGER_ROLES.has(tier);
+    }
+    catch {
+        return false;
+    }
+}
+async function getRepContext(userId) {
+    try {
+        const { data, error } = await supa
+            .from("reps")
+            .select("id, tier, org_id, company_id, office_id")
+            .eq("id", userId)
+            .maybeSingle();
+        if (error || !data)
+            return null;
+        return {
+            id: String(data.id),
+            tier: String(data.tier ?? ""),
+            org_id: data.org_id ?? null,
+            company_id: data.company_id ?? null,
+            office_id: data.office_id ?? null,
+        };
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Returns the full identity context for a user: tier, company, office, and
+ * the partner that owns their company (post-Phase-2-migration).
+ *
+ * Falls back gracefully when the partners table or partner_id column does not
+ * exist yet — returns partner_id: null so callers can proceed without it.
+ */
+async function getPartnerContext(userId) {
+    const repCtx = await getRepContext(userId);
+    if (!repCtx)
+        return null;
+    let partnerId = null;
+    if (repCtx.company_id) {
+        try {
+            const { data } = await supa
+                .from("companies")
+                .select("partner_id")
+                .eq("id", repCtx.company_id)
+                .maybeSingle();
+            partnerId = data?.partner_id ?? null;
+        }
+        catch {
+            // partners table or partner_id column not yet migrated — fail-soft
+        }
+    }
+    return { ...repCtx, partner_id: partnerId };
+}
+/**
+ * Returns the subset of reps visible to requester.
+ *
+ * Scoping priority:
+ *   1. company_id match — used when both requester and rep have company_id set
+ *      (post-Phase-1-migration). Office managers are further scoped to their
+ *      office_id if both sides have it populated.
+ *   2. org_id match — legacy fallback used before the migration runs or for
+ *      reps that still have null company_id.
+ *   3. bypassed — dev/smoke-test mode (zero UUID or ALLOW_ORG_BYPASS=1).
+ */
+async function resolveVisibleReps(args) {
+    const { requester, orgId, bypassed, excludeSelf = false, limit = 2000 } = args;
+    const [allReps, requesterCtx] = await Promise.all([
+        listRepDirectoryBestEffort(limit),
+        getRepContext(requester),
+    ]);
+    const requesterCompanyId = requesterCtx?.company_id ?? null;
+    const requesterOfficeId = requesterCtx?.office_id ?? null;
+    return allReps.filter((rep) => {
+        const repId = String(rep?.id ?? "").trim();
+        if (!repId)
+            return false;
+        if (excludeSelf && repId === requester)
+            return false;
+        if (bypassed)
+            return true;
+        const repCompanyId = rep.company_id ?? null;
+        const repOfficeId = rep.office_id ?? null;
+        // company_id scoping — used when the migration has been applied
+        if (requesterCompanyId && repCompanyId) {
+            if (String(repCompanyId) !== requesterCompanyId)
+                return false;
+            // Office-level managers are further scoped to their office
+            if (requesterOfficeId && repOfficeId) {
+                return String(repOfficeId) === requesterOfficeId;
+            }
+            return true;
+        }
+        // Fallback: org_id scoping (pre-migration or incomplete data)
+        return String(rep?.org_id ?? "") === orgId;
+    });
+}
+// ─── end Phase 1 identity bridge ────────────────────────────────────────────
+async function listOrgRepIdsBestEffort(args) {
+    const { orgId } = args;
+    try {
+        const { data, error } = await supa
+            .from("reps")
+            .select("id")
+            .eq("org_id", orgId)
+            .limit(500);
+        if (error)
+            return [];
+        return (data ?? []).map((r) => String(r.id)).filter(Boolean);
+    }
+    catch {
+        return [];
+    }
+}
+function normaliseStage(s) {
+    const v = String(s ?? "").trim().toLowerCase();
+    return v || "new";
+}
+router.get("/opportunities/pipeline", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const qAny = req.query;
+        const limit = Math.min(Math.max(Number(qAny?.limit ?? 300), 1), 1000);
+        // scope:
+        // - mine (default): only my opps
+        // - team: manager view across org (optionally filtered by repId)
+        const scope = String(qAny?.scope ?? "mine").trim().toLowerCase();
+        const repIdRaw = String(qAny?.repId ?? qAny?.rep_id ?? "").trim();
+        const wantTeam = scope === "team";
+        // Resolve allowed user_ids for query
+        // - mine: use requester
+        // - team: use repId (if provided) OR all reps in org
+        let userIds = null; // null => use requester
+        if (wantTeam) {
+            const { orgId, bypassed } = await requireManagerOrg(req);
+            // Require manager tier to view team pipeline
+            const okManager = await isManagerUser(requester);
+            if (!okManager) {
+                return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+            }
+            // If a repId is provided, ensure it's a UUID and (when not bypassed) belongs to the org.
+            if (repIdRaw) {
+                if (!UUID_RE.test(repIdRaw)) {
+                    return res.status(400).json({ ok: false, error: "invalid_rep_id" });
+                }
+                if (!bypassed) {
+                    // Confirm the target rep is in the same org (fail-closed)
+                    const { data: repRow, error: repErr } = await supa
+                        .from("reps")
+                        .select("id, org_id")
+                        .eq("id", repIdRaw)
+                        .limit(1)
+                        .maybeSingle();
+                    if (repErr)
+                        return res.status(500).json({ ok: false, error: repErr.message ?? "rep_lookup_failed" });
+                    if (!repRow)
+                        return res.status(404).json({ ok: false, error: "rep_not_found" });
+                    if (String(repRow.org_id ?? "") !== orgId) {
+                        return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+                    }
+                }
+                userIds = [repIdRaw];
+            }
+            else {
+                // Team-wide: pull rep ids for org (when possible). If we can't, fail closed.
+                if (!bypassed) {
+                    const ids = await listOrgRepIdsBestEffort({ orgId });
+                    if (!ids.length) {
+                        return res.status(500).json({ ok: false, error: "org_scope_not_supported" });
+                    }
+                    userIds = ids;
+                }
+                else {
+                    // Dev bypass: fall back to requester only to avoid leaking cross-tenant data.
+                    userIds = [requester];
+                }
+            }
+        }
+        // Try a rich select first; strip missing columns if needed.
+        const selectCandidates = [
+            "id, name, stage, amount, close_date, contact_id, account_id, updated_at, created_at, user_id",
+            "id, name, stage, amount, close_date, contact_id, account_id, created_at, user_id",
+            "id, name, stage, amount, close_date, contact_id, account_id, created_at",
+            "id, name, stage, amount, close_date, contact_id, account_id",
+            "id, name, stage, created_at",
+            "id, name, stage",
+            "id, name",
+            "id",
+        ];
+        let rows = [];
+        let lastErr = null;
+        for (const sel of selectCandidates) {
+            let r;
+            if (wantTeam) {
+                r = await supa
+                    .from("crm_opportunities")
+                    .select(sel)
+                    .in("user_id", userIds ?? [requester])
+                    .order("created_at", { ascending: false })
+                    .limit(limit);
+            }
+            else {
+                r = await supa
+                    .from("crm_opportunities")
+                    .select(sel)
+                    .eq("user_id", requester)
+                    .order("created_at", { ascending: false })
+                    .limit(limit);
+            }
+            if (!r.error) {
+                rows = r.data ?? [];
+                lastErr = null;
+                break;
+            }
+            lastErr = r.error;
+            const msg = String(r.error?.message ?? "").toLowerCase();
+            // Missing table / schema-cache miss => fail-open with empty pipeline
+            if ((msg.includes("relation") && msg.includes("does not exist")) ||
+                (msg.includes("could not find the table") && msg.includes("crm_opportunities")) ||
+                (msg.includes("schema cache") && msg.includes("crm_opportunities"))) {
+                return res.json({ ok: true, stages: PIPELINE_STAGES_DEFAULT, columns: {}, items: [] });
+            }
+            // Missing column => try next candidate
+            if (msg.includes("column") && msg.includes("does not exist"))
+                continue;
+            // Unknown error => stop
+            break;
+        }
+        if (lastErr) {
+            return res
+                .status(500)
+                .json({ ok: false, error: lastErr?.message ?? "pipeline_fetch_failed" });
+        }
+        const items = rows.map((r) => {
+            const stage = normaliseStage(r.stage);
+            return {
+                id: String(r.id),
+                name: r.name ?? null,
+                stage,
+                amount: r.amount ?? null,
+                close_date: r.close_date ?? null,
+                contact_id: r.contact_id ?? null,
+                account_id: r.account_id ?? null,
+                updated_at: r.updated_at ?? null,
+                created_at: r.created_at ?? null,
+            };
+        });
+        // Derive stage list (stable default + any custom stages found)
+        const foundStages = new Set();
+        for (const it of items)
+            foundStages.add(normaliseStage(it.stage));
+        const stages = Array.from(new Set([
+            ...PIPELINE_STAGES_DEFAULT,
+            ...Array.from(foundStages).filter(Boolean),
+        ]));
+        // Build columns map
+        const columns = {};
+        for (const s of stages)
+            columns[s] = [];
+        for (const it of items) {
+            const s = normaliseStage(it.stage);
+            if (!columns[s])
+                columns[s] = [];
+            columns[s].push(it.id);
+        }
+        return res.json({ ok: true, stages, columns, items });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+/* ---------------------------------------------
+   GET /v1/crm/opportunities/pipeline/summary?scope=&repId=&limit=
+   - Returns server-computed metrics for the Kanban summary bar.
+   - Uses the SAME scope rules as /opportunities/pipeline:
+     - scope=mine (default): only requester
+     - scope=team: manager-only; optional repId filter; otherwise all reps in org
+   - Schema-tolerant: if crm_opportunities table missing, returns empty summary.
+---------------------------------------------- */
+router.get("/opportunities/pipeline/summary", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const qAny = req.query;
+        const limit = Math.min(Math.max(Number(qAny?.limit ?? 2000), 1), 5000);
+        const scope = String(qAny?.scope ?? "mine").trim().toLowerCase();
+        const repIdRaw = String(qAny?.repId ?? qAny?.rep_id ?? "").trim();
+        const wantTeam = scope === "team";
+        // Resolve allowed user_ids for query
+        let userIds = null; // null => requester only
+        if (wantTeam) {
+            const { orgId, bypassed } = await requireManagerOrg(req);
+            const okManager = await isManagerUser(requester);
+            if (!okManager) {
+                return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+            }
+            if (repIdRaw) {
+                if (!UUID_RE.test(repIdRaw)) {
+                    return res.status(400).json({ ok: false, error: "invalid_rep_id" });
+                }
+                if (!bypassed) {
+                    const { data: repRow, error: repErr } = await supa
+                        .from("reps")
+                        .select("id, org_id")
+                        .eq("id", repIdRaw)
+                        .limit(1)
+                        .maybeSingle();
+                    if (repErr)
+                        return res.status(500).json({ ok: false, error: repErr.message ?? "rep_lookup_failed" });
+                    if (!repRow)
+                        return res.status(404).json({ ok: false, error: "rep_not_found" });
+                    if (String(repRow.org_id ?? "") !== orgId) {
+                        return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+                    }
+                }
+                userIds = [repIdRaw];
+            }
+            else {
+                if (!bypassed) {
+                    const ids = await listOrgRepIdsBestEffort({ orgId });
+                    if (!ids.length) {
+                        return res.status(500).json({ ok: false, error: "org_scope_not_supported" });
+                    }
+                    userIds = ids;
+                }
+                else {
+                    // Dev bypass: safest behaviour is to scope to requester only.
+                    userIds = [requester];
+                }
+            }
+        }
+        // Schema-tolerant selects
+        const selectCandidates = [
+            "id, stage, amount, value, currency, close_date, updated_at, created_at, user_id",
+            "id, stage, amount, value, close_date, updated_at, created_at, user_id",
+            "id, stage, amount, value, close_date, created_at, user_id",
+            "id, stage, amount, close_date, created_at, user_id",
+            "id, stage, amount, close_date, created_at",
+            "id, stage, amount, created_at",
+            "id, stage",
+            "id",
+        ];
+        let rows = [];
+        let lastErr = null;
+        for (const sel of selectCandidates) {
+            let r;
+            if (wantTeam) {
+                r = await supa
+                    .from("crm_opportunities")
+                    .select(sel)
+                    .in("user_id", userIds ?? [requester])
+                    .order("created_at", { ascending: false })
+                    .limit(limit);
+            }
+            else {
+                r = await supa
+                    .from("crm_opportunities")
+                    .select(sel)
+                    .eq("user_id", requester)
+                    .order("created_at", { ascending: false })
+                    .limit(limit);
+            }
+            if (!r.error) {
+                rows = r.data ?? [];
+                lastErr = null;
+                break;
+            }
+            lastErr = r.error;
+            const msg = String(r.error?.message ?? "").toLowerCase();
+            // Missing table / schema-cache miss => return empty summary (fail-open)
+            if ((msg.includes("relation") && msg.includes("does not exist")) ||
+                (msg.includes("could not find the table") && msg.includes("crm_opportunities")) ||
+                (msg.includes("schema cache") && msg.includes("crm_opportunities"))) {
+                return res.json({
+                    ok: true,
+                    scope: wantTeam ? "team" : "mine",
+                    rep_id: wantTeam ? (repIdRaw || null) : null,
+                    stages: PIPELINE_STAGES_DEFAULT,
+                    counts_by_stage: Object.fromEntries(PIPELINE_STAGES_DEFAULT.map((s) => [s, 0])),
+                    total_count: 0,
+                    total_amount: 0,
+                    currency: null,
+                    forecast_amount: 0,
+                    forecast_count: 0,
+                });
+            }
+            // Missing column => try next candidate
+            if (msg.includes("column") && msg.includes("does not exist"))
+                continue;
+            break;
+        }
+        if (lastErr) {
+            return res.status(500).json({ ok: false, error: lastErr?.message ?? "pipeline_summary_failed" });
+        }
+        const counts = {};
+        for (const s of PIPELINE_STAGES_DEFAULT)
+            counts[s] = 0;
+        let total = 0;
+        let forecastAmount = 0;
+        let forecastCount = 0;
+        for (const r of rows) {
+            const stage = normaliseStage(r.stage);
+            if (counts[stage] == null)
+                counts[stage] = 0;
+            counts[stage] += 1;
+            const amtRaw = r.amount ?? r.value ?? null;
+            const amt = typeof amtRaw === "number" ? amtRaw : Number(amtRaw);
+            if (Number.isFinite(amt)) {
+                total += amt;
+                // MVP forecast = proposal + negotiation only (server-calculated)
+                if (stage === "proposal" || stage === "negotiation") {
+                    forecastAmount += amt;
+                    forecastCount += 1;
+                }
+            }
+            else {
+                // still count forecast items even if amount missing
+                if (stage === "proposal" || stage === "negotiation") {
+                    forecastCount += 1;
+                }
+            }
+        }
+        // Include any non-default stages that exist
+        const stages = Array.from(new Set([...PIPELINE_STAGES_DEFAULT, ...Object.keys(counts)])).filter(Boolean);
+        // Currency is not reliable when mixed; keep null for now.
+        return res.json({
+            ok: true,
+            scope: wantTeam ? "team" : "mine",
+            rep_id: wantTeam ? (repIdRaw || null) : null,
+            stages,
+            counts_by_stage: counts,
+            total_count: rows.length,
+            total_amount: total,
+            forecast_amount: forecastAmount,
+            forecast_count: forecastCount,
+            currency: null,
+        });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+const UpdateOpportunityStageSchema = z.object({
+    stage: z.string().trim().min(1).max(60),
+});
+router.patch("/opportunities/:id/stage", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const id = String(req.params?.id ?? "").trim();
+        if (!id)
+            return res.status(400).json({ ok: false, error: "id_required" });
+        if (!UUID_RE.test(id)) {
+            return res.status(400).json({ ok: false, error: "invalid_id" });
+        }
+        const body = UpdateOpportunityStageSchema.parse(req.body ?? {});
+        const stage = normaliseStage(body.stage);
+        // Default: only update my opp
+        // Manager option: allow team update via ?scope=team&repId=... (or team-wide if omitted)
+        const qAny = req.query;
+        const scope = String(qAny?.scope ?? "mine").trim().toLowerCase();
+        const wantTeam = scope === "team";
+        const repIdRaw = String(qAny?.repId ?? qAny?.rep_id ?? "").trim();
+        let repIdsForUpdate = null;
+        if (wantTeam) {
+            const { orgId, bypassed } = await requireManagerOrg(req);
+            const okManager = await isManagerUser(requester);
+            if (!okManager) {
+                return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+            }
+            if (repIdRaw) {
+                if (!UUID_RE.test(repIdRaw)) {
+                    return res.status(400).json({ ok: false, error: "invalid_rep_id" });
+                }
+                if (!bypassed) {
+                    const { data: repRow, error: repErr } = await supa
+                        .from("reps")
+                        .select("id, org_id")
+                        .eq("id", repIdRaw)
+                        .limit(1)
+                        .maybeSingle();
+                    if (repErr)
+                        return res.status(500).json({ ok: false, error: repErr.message ?? "rep_lookup_failed" });
+                    if (!repRow)
+                        return res.status(404).json({ ok: false, error: "rep_not_found" });
+                    if (String(repRow.org_id ?? "") !== orgId) {
+                        return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+                    }
+                }
+                repIdsForUpdate = [repIdRaw];
+            }
+            else {
+                if (!bypassed) {
+                    const ids = await listOrgRepIdsBestEffort({ orgId });
+                    if (!ids.length) {
+                        return res.status(500).json({ ok: false, error: "org_scope_not_supported" });
+                    }
+                    repIdsForUpdate = ids;
+                }
+                else {
+                    repIdsForUpdate = [requester];
+                }
+            }
+        }
+        // Try update; if stage column missing, return clear error.
+        let r;
+        if (wantTeam && repIdsForUpdate) {
+            r = await supa
+                .from("crm_opportunities")
+                .update({ stage })
+                .eq("id", id)
+                .in("user_id", repIdsForUpdate)
+                .select("id, stage")
+                .maybeSingle();
+        }
+        else {
+            r = await supa
+                .from("crm_opportunities")
+                .update({ stage })
+                .eq("id", id)
+                .eq("user_id", requester)
+                .select("id, stage")
+                .maybeSingle();
+        }
+        if (r.error) {
+            const msg = String(r.error?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+            }
+            if (msg.includes("column") && msg.includes("stage") && msg.includes("does not exist")) {
+                return res.status(500).json({ ok: false, error: "crm_opportunities_stage_missing" });
+            }
+            return res
+                .status(500)
+                .json({ ok: false, error: r.error?.message ?? "opportunity_stage_update_failed" });
+        }
+        if (!r.data) {
+            return res.status(404).json({ ok: false, error: "not_found" });
+        }
+        return res.json({ ok: true, opportunity: { id, stage: r.data.stage ?? stage } });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+/* ---------------------------------------------
+   OPPORTUNITY DETAIL (Drawer v1)
+
+   GET /v1/crm/opportunities/:id
+   - Returns a single opportunity (scoped like pipeline)
+
+   PATCH /v1/crm/opportunities/:id
+   - Allows editing: name, stage, amount, currency, close_date
+---------------------------------------------- */
+function parseScopeParams(qAny) {
+    const scope = String(qAny?.scope ?? "mine").trim().toLowerCase();
+    const repIdRaw = String(qAny?.repId ?? qAny?.rep_id ?? "").trim();
+    const wantTeam = scope === "team";
+    return { scope, repIdRaw, wantTeam };
+}
+async function resolveTeamUserIdsOrThrow(args) {
+    const { req, requester, repIdRaw } = args;
+    const { orgId, bypassed } = await requireManagerOrg(req);
+    const okManager = await isManagerUser(requester);
+    if (!okManager) {
+        throw new Error("forbidden_not_manager");
+    }
+    if (repIdRaw) {
+        if (!UUID_RE.test(repIdRaw)) {
+            throw new Error("invalid_rep_id");
+        }
+        if (!bypassed) {
+            const { data: repRow, error: repErr } = await supa
+                .from("reps")
+                .select("id, org_id")
+                .eq("id", repIdRaw)
+                .limit(1)
+                .maybeSingle();
+            if (repErr)
+                throw new Error(repErr.message ?? "rep_lookup_failed");
+            if (!repRow)
+                throw new Error("rep_not_found");
+            if (String(repRow.org_id ?? "") !== orgId) {
+                throw new Error("forbidden_org_scope");
+            }
+        }
+        return [repIdRaw];
+    }
+    if (!bypassed) {
+        const ids = await listOrgRepIdsBestEffort({ orgId });
+        if (!ids.length)
+            throw new Error("org_scope_not_supported");
+        return ids;
+    }
+    // Dev bypass: safest is requester-only.
+    return [requester];
+}
+const OpportunityUpdateSchema = z
+    .object({
+    name: z.string().trim().min(1).max(200).optional(),
+    stage: z.string().trim().min(1).max(60).optional(),
+    amount: z.number().finite().optional().nullable(),
+    currency: z.string().trim().min(1).max(10).optional().nullable(),
+    close_date: z.string().trim().min(1).max(40).optional().nullable(),
+})
+    .refine((b) => b.name !== undefined ||
+    b.stage !== undefined ||
+    b.amount !== undefined ||
+    b.currency !== undefined ||
+    b.close_date !== undefined, { message: "no_fields" });
+router.get("/opportunities/:id", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const id = String(req.params?.id ?? "").trim();
+        if (!id)
+            return res.status(400).json({ ok: false, error: "id_required" });
+        if (!UUID_RE.test(id))
+            return res.status(400).json({ ok: false, error: "invalid_id" });
+        const qAny = req.query;
+        const { repIdRaw, wantTeam } = parseScopeParams(qAny);
+        let allowedUserIds = [requester];
+        if (wantTeam) {
+            try {
+                allowedUserIds = await resolveTeamUserIdsOrThrow({ req, requester, repIdRaw });
+            }
+            catch (e) {
+                const msg = String(e?.message ?? e);
+                if (msg === "forbidden_not_manager")
+                    return res.status(403).json({ ok: false, error: msg });
+                if (msg === "invalid_rep_id")
+                    return res.status(400).json({ ok: false, error: msg });
+                if (msg === "rep_not_found")
+                    return res.status(404).json({ ok: false, error: msg });
+                if (msg === "forbidden_org_scope")
+                    return res.status(403).json({ ok: false, error: msg });
+                if (msg === "org_scope_not_supported")
+                    return res.status(500).json({ ok: false, error: msg });
+                return res.status(500).json({ ok: false, error: msg || "team_scope_failed" });
+            }
+        }
+        const selectCandidates = [
+            "id, user_id, name, title, stage, amount, currency, close_date, account_id, contact_id, account_name, contact_email, created_at, updated_at",
+            "id, user_id, name, title, stage, amount, currency, close_date, account_id, contact_id, created_at, updated_at",
+            "id, user_id, name, title, stage, amount, currency, close_date, account_id, contact_id, created_at",
+            "id, user_id, name, title, stage, amount, currency, close_date, created_at",
+            "id, user_id, name, title, stage, amount, close_date, created_at",
+            "id, user_id, name, title, stage, created_at",
+            "id, user_id, name, stage, created_at",
+            "id, user_id, name, stage",
+            "id, name, stage",
+            "id, name",
+            "id",
+        ];
+        let row = null;
+        let lastErr = null;
+        for (const sel of selectCandidates) {
+            const r = await supa
+                .from("crm_opportunities")
+                .select(sel)
+                .eq("id", id)
+                .in("user_id", allowedUserIds)
+                .limit(1)
+                .maybeSingle();
+            if (!r.error) {
+                row = r.data ?? null;
+                lastErr = null;
+                break;
+            }
+            lastErr = r.error;
+            const msg = String(r.error?.message ?? "").toLowerCase();
+            if ((msg.includes("relation") && msg.includes("does not exist")) ||
+                (msg.includes("could not find the table") && msg.includes("crm_opportunities")) ||
+                (msg.includes("schema cache") && msg.includes("crm_opportunities"))) {
+                return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+            }
+            if (msg.includes("column") && msg.includes("does not exist"))
+                continue;
+            break;
+        }
+        if (lastErr) {
+            return res.status(500).json({ ok: false, error: lastErr?.message ?? "opportunity_fetch_failed" });
+        }
+        if (!row)
+            return res.status(404).json({ ok: false, error: "not_found" });
+        return res.json({
+            ok: true,
+            opportunity: {
+                id: String(row.id),
+                name: row.name ?? row.title ?? null,
+                stage: normaliseStage(row.stage ?? "new"),
+                amount: row.amount ?? null,
+                currency: row.currency ?? null,
+                close_date: row.close_date ?? null,
+                account_id: row.account_id ?? null,
+                contact_id: row.contact_id ?? null,
+                account_name: row.account_name ?? null,
+                contact_email: row.contact_email ?? null,
+                created_at: row.created_at ?? null,
+                updated_at: row.updated_at ?? null,
+            },
+        });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+router.patch("/opportunities/:id", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const id = String(req.params?.id ?? "").trim();
+        if (!id)
+            return res.status(400).json({ ok: false, error: "id_required" });
+        if (!UUID_RE.test(id))
+            return res.status(400).json({ ok: false, error: "invalid_id" });
+        const qAny = req.query;
+        const { repIdRaw, wantTeam } = parseScopeParams(qAny);
+        let allowedUserIds = [requester];
+        if (wantTeam) {
+            try {
+                allowedUserIds = await resolveTeamUserIdsOrThrow({ req, requester, repIdRaw });
+            }
+            catch (e) {
+                const msg = String(e?.message ?? e);
+                if (msg === "forbidden_not_manager")
+                    return res.status(403).json({ ok: false, error: msg });
+                if (msg === "invalid_rep_id")
+                    return res.status(400).json({ ok: false, error: msg });
+                if (msg === "rep_not_found")
+                    return res.status(404).json({ ok: false, error: msg });
+                if (msg === "forbidden_org_scope")
+                    return res.status(403).json({ ok: false, error: msg });
+                if (msg === "org_scope_not_supported")
+                    return res.status(500).json({ ok: false, error: msg });
+                return res.status(500).json({ ok: false, error: msg || "team_scope_failed" });
+            }
+        }
+        const body = OpportunityUpdateSchema.parse(req.body ?? {});
+        const patchBase = {};
+        if (body.name !== undefined)
+            patchBase.name = body.name;
+        if (body.stage !== undefined)
+            patchBase.stage = normaliseStage(body.stage);
+        if (body.amount !== undefined)
+            patchBase.amount = body.amount;
+        if (body.currency !== undefined)
+            patchBase.currency = body.currency;
+        if (body.close_date !== undefined)
+            patchBase.close_date = body.close_date;
+        const attempts = [
+            { ...patchBase },
+            (() => {
+                const p = { ...patchBase };
+                delete p.close_date;
+                return p;
+            })(),
+            (() => {
+                const p = { ...patchBase };
+                delete p.currency;
+                return p;
+            })(),
+            (() => {
+                const p = { ...patchBase };
+                delete p.amount;
+                return p;
+            })(),
+            (() => {
+                const p = { ...patchBase };
+                delete p.stage;
+                return p;
+            })(),
+            (() => {
+                const p = { ...patchBase };
+                delete p.name;
+                return p;
+            })(),
+        ].filter((p) => Object.keys(p).length > 0);
+        let updated = null;
+        let lastErr = null;
+        for (const p of attempts) {
+            const r = await supa
+                .from("crm_opportunities")
+                .update(p)
+                .eq("id", id)
+                .in("user_id", allowedUserIds)
+                .select("id, name, title, stage, amount, currency, close_date, account_id, contact_id, account_name, contact_email, created_at, updated_at")
+                .maybeSingle();
+            if (!r.error) {
+                updated = r.data ?? null;
+                lastErr = null;
+                break;
+            }
+            lastErr = r.error;
+            const msg = String(r.error?.message ?? "").toLowerCase();
+            if ((msg.includes("relation") && msg.includes("does not exist")) ||
+                (msg.includes("could not find the table") && msg.includes("crm_opportunities")) ||
+                (msg.includes("schema cache") && msg.includes("crm_opportunities"))) {
+                return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+            }
+            const isMissingCol = (msg.includes("column") && msg.includes("does not exist")) ||
+                msg.includes("could not find") ||
+                msg.includes("unknown column");
+            if (isMissingCol)
+                continue;
+            break;
+        }
+        if (lastErr) {
+            return res.status(500).json({ ok: false, error: lastErr?.message ?? "opportunity_update_failed" });
+        }
+        if (!updated)
+            return res.status(404).json({ ok: false, error: "not_found" });
+        return res.json({
+            ok: true,
+            opportunity: {
+                id: String(updated.id),
+                name: updated.name ?? updated.title ?? null,
+                stage: normaliseStage(updated.stage ?? "new"),
+                amount: updated.amount ?? null,
+                currency: updated.currency ?? null,
+                close_date: updated.close_date ?? null,
+                account_id: updated.account_id ?? null,
+                contact_id: updated.contact_id ?? null,
+                account_name: updated.account_name ?? null,
+                contact_email: updated.contact_email ?? null,
+                created_at: updated.created_at ?? null,
+                updated_at: updated.updated_at ?? null,
+            },
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "");
+        if (msg === "no_fields") {
+            return res.status(400).json({ ok: false, error: "no_fields" });
+        }
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+const DEMO_CONTACTS = [
+    { id: "c_anna", first_name: "Anna", last_name: "Rivera", email: "anna@demo.co", company: "Demo Co", last_contacted_at: null },
+    { id: "c_bob", first_name: "Bob", last_name: "Trent", email: "bob@demo.co", company: "Demo Co", last_contacted_at: null },
+    { id: "c_eric", first_name: "Eric", last_name: "Cole", email: "eric@demo.co", company: "Demo Co", last_contacted_at: null },
+    { id: "c_lena", first_name: "Lena", last_name: "Yao", email: "lena@demo.co", company: "Demo Co", last_contacted_at: null },
+    { id: "c_mark", first_name: "Mark", last_name: "Patel", email: "mark@demo.co", company: "Demo Co", last_contacted_at: null },
+    { id: "c_olga", first_name: "Olga", last_name: "Smith", email: "olga@demo.co", company: "Demo Co", last_contacted_at: null },
+];
+function shapeDemoContact(c) {
+    return {
+        id: c.id,
+        name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim(),
+        email: c.email ?? null,
+        company: c.company ?? null,
+        last_contacted_at: c.last_contacted_at ?? null,
+    };
+}
+/* ---------------------------------------------
+   GET /v1/crm/contacts?query=&limit=
+   - Search contacts by name/email/company (case-insensitive)
+   - Returns minimal fields for pickers/drawers
+   - Safe: empty query => empty list (never returns demo)
+---------------------------------------------- */
+router.get("/contacts", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        // Express query params can be string | string[] | undefined.
+        // Accept aliases to avoid silent empty-query bugs.
+        const raw = req.query.query ??
+            req.query.q ??
+            req.query.term ??
+            req.query.search ??
+            "";
+        const query = typeof raw === "string"
+            ? raw.trim()
+            : Array.isArray(raw)
+                ? String(raw[0] ?? "").trim()
+                : "";
+        const limit = Math.min(Math.max(Number(req.query.limit ?? 10), 1), 50);
+        // Empty query => empty list (never spam demo)
+        if (!query)
+            return res.json({ ok: true, items: [] });
+        // 1) DB search first
+        const { rows, hasLastContacted } = await selectContactsSafe({ requester, query, limit });
+        if (rows.length) {
+            const shaped = rows.map((c) => ({
+                id: c.id,
+                name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim(),
+                email: c.email ?? null,
+                company: c.company ?? null,
+                last_contacted_at: hasLastContacted ? (c.last_contacted_at ?? null) : null,
+            }));
+            return res.json({ ok: true, items: shaped, source: "db" });
+        }
+        // 2) No DB matches — if this user has ANY real contacts, return empty (no demo pollution)
+        const { data: anyReal, error: anyErr } = await supa
+            .from("crm_contacts")
+            .select("id")
+            .eq("user_id", requester)
+            .limit(1);
+        if (anyErr) {
+            return res.status(500).json({ ok: false, error: anyErr.message ?? "contacts_count_failed" });
+        }
+        const hasRealContacts = (anyReal?.length ?? 0) > 0;
+        if (hasRealContacts) {
+            return res.json({ ok: true, items: [], source: "db_empty" });
+        }
+        // 3) Demo fallback ONLY when user has zero real contacts
+        const q = query.toLowerCase();
+        const demo = DEMO_CONTACTS.filter((c) => {
+            const hay = `${c.first_name} ${c.last_name} ${c.email} ${c.company ?? ""}`.toLowerCase();
+            return hay.includes(q);
+        })
+            .slice(0, limit)
+            .map(shapeDemoContact);
+        return res.json({ ok: true, items: demo, source: "demo" });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
+/* ---------------------------------------------
+   GET /v1/crm/contacts/:id
+   - Fetch a single contact (owned by requester)
+   - Supports demo ids (c_*) until DB is populated
+---------------------------------------------- */
+router.get("/contacts/:id", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const id = String(req.params.id);
+        // Demo id path
+        if (id.startsWith("c_")) {
+            const found = DEMO_CONTACTS.find((c) => c.id === id);
+            if (!found)
+                return res.status(404).json({ ok: false, error: "not_found" });
+            const health = computeContactHealthV1({
+                last_contacted_at: found.last_contacted_at ?? null,
+                open_actions: 0,
+                overdue_actions: 0,
+                has_notes: false,
+                has_recent_call: false,
+            });
+            return res.json({
+                ok: true,
+                contact: {
+                    id: found.id,
+                    first_name: found.first_name ?? null,
+                    last_name: found.last_name ?? null,
+                    email: found.email ?? null,
+                    company: found.company ?? null,
+                    last_contacted_at: found.last_contacted_at ?? null,
+                    created_at: null,
+                },
+                account: null,
+                health,
+            });
+        }
+        // Real DB UUID path
+        if (!UUID_RE.test(id))
+            return res.status(400).json({ ok: false, error: "invalid_id" });
+        let c = null;
+        try {
+            const a1 = await supa
+                .from("crm_contacts")
+                .select("id, first_name, last_name, email, company, last_contacted_at, created_at")
+                .eq("user_id", requester)
+                .eq("id", id)
+                .maybeSingle();
+            if (!a1.error && a1.data)
+                c = a1.data;
+            if (a1.error) {
+                const msg = String(a1.error?.message ?? "");
+                if (msg.toLowerCase().includes("last_contacted_at") && msg.toLowerCase().includes("does not exist")) {
+                    const a2 = await supa
+                        .from("crm_contacts")
+                        .select("id, first_name, last_name, email, company, created_at")
+                        .eq("user_id", requester)
+                        .eq("id", id)
+                        .maybeSingle();
+                    if (a2.error || !a2.data)
+                        return res.status(404).json({ ok: false, error: "not_found" });
+                    c = { ...a2.data, last_contacted_at: null };
+                }
+                else {
+                    return res.status(500).json({ ok: false, error: a1.error.message ?? "contact_query_failed" });
+                }
+            }
+        }
+        catch (e) {
+            return res.status(500).json({ ok: false, error: e?.message ?? "contact_query_failed" });
+        }
+        if (!c)
+            return res.status(404).json({ ok: false, error: "not_found" });
+        // ---- Contact health (best-effort; schema tolerant)
+        let open_actions = 0;
+        let overdue_actions = 0;
+        // ---- Activity awareness (best-effort): notes + recent calls
+        let has_notes = false;
+        let has_recent_call = false;
+        let activityLastIso = null;
+        const pickMaxIso = (a, b) => {
+            if (!a)
+                return b;
+            if (!b)
+                return a;
+            const ta = new Date(a).getTime();
+            const tb = new Date(b).getTime();
+            if (!Number.isFinite(ta))
+                return b;
+            if (!Number.isFinite(tb))
+                return a;
+            return tb > ta ? b : a;
+        };
+        // Notes: crm_contact_notes(created_at)
+        try {
+            const rn = await supa
+                .from("crm_contact_notes")
+                .select("created_at")
+                .eq("user_id", requester)
+                .eq("contact_id", id)
+                .order("created_at", { ascending: false })
+                .limit(1);
+            if (!rn.error) {
+                const row = rn.data?.[0] ?? null;
+                const iso = row?.created_at ? String(row.created_at) : null;
+                if (iso) {
+                    has_notes = true;
+                    activityLastIso = pickMaxIso(activityLastIso, iso);
+                }
+            }
+            else {
+                const msg = String(rn.error?.message ?? "").toLowerCase();
+                if (!(msg.includes("relation") && msg.includes("does not exist")) && !(msg.includes("does not exist") && msg.includes("column"))) {
+                    // ignore other errors (fail-soft)
+                }
+            }
+        }
+        catch {
+            // fail-soft
+        }
+        // Calls: crm_call_links(contact_id -> call_id) + calls(created_at)
+        try {
+            // Link table may not exist
+            const links = await supa
+                .from("crm_call_links")
+                .select("call_id")
+                .eq("contact_id", id)
+                .limit(25);
+            if (!links.error) {
+                const callIds = (links.data ?? []).map((r) => r?.call_id).filter(Boolean);
+                if (callIds.length) {
+                    const rc = await supa
+                        .from("calls")
+                        .select("id, created_at")
+                        .eq("user_id", requester)
+                        .in("id", callIds)
+                        .order("created_at", { ascending: false })
+                        .limit(1);
+                    if (!rc.error) {
+                        const row = rc.data?.[0] ?? null;
+                        const iso = row?.created_at ? String(row.created_at) : null;
+                        if (iso) {
+                            activityLastIso = pickMaxIso(activityLastIso, iso);
+                            const ds = healthDaysSince(iso);
+                            has_recent_call = ds !== null ? ds <= 14 : false;
+                        }
+                    }
+                }
+            }
+            else {
+                const msg = String(links.error?.message ?? "").toLowerCase();
+                if (msg.includes("relation") && msg.includes("does not exist")) {
+                    // ignore
+                }
+            }
+        }
+        catch {
+            // fail-soft
+        }
+        try {
+            const nowMs = Date.now();
+            const selCandidates = [
+                "id, due_at, completed_at, created_at",
+                "id, due_at, completed_at",
+                "id, due_at, created_at",
+                "id, due_at",
+                "id, completed_at",
+                "id",
+            ];
+            let actions = [];
+            for (const sel of selCandidates) {
+                const r = await supa
+                    .from("crm_actions")
+                    .select(sel)
+                    .eq("user_id", requester)
+                    .eq("contact_id", id)
+                    .order("created_at", { ascending: false })
+                    .limit(200);
+                if (!r.error) {
+                    actions = r.data ?? [];
+                    break;
+                }
+                const msg = String(r.error?.message ?? "").toLowerCase();
+                // Missing columns -> try next select
+                if (msg.includes("column") && msg.includes("does not exist"))
+                    continue;
+                // Missing table -> treat as no actions
+                if (msg.includes("relation") && msg.includes("does not exist")) {
+                    actions = [];
+                    break;
+                }
+                // Unknown error -> stop trying
+                break;
+            }
+            for (const a of actions) {
+                const completedAt = a?.completed_at ?? null;
+                const dueAt = a?.due_at ?? null;
+                const isCompleted = !!completedAt;
+                if (!isCompleted)
+                    open_actions++;
+                if (!isCompleted && dueAt) {
+                    const dueMs = new Date(String(dueAt)).getTime();
+                    if (Number.isFinite(dueMs) && dueMs < nowMs)
+                        overdue_actions++;
+                }
+            }
+        }
+        catch {
+            // fail-soft
+        }
+        const effectiveLastContactedAt = c?.last_contacted_at ?? activityLastIso ?? null;
+        const health = computeContactHealthV1({
+            last_contacted_at: effectiveLastContactedAt,
+            open_actions,
+            overdue_actions,
+            has_notes,
+            has_recent_call,
+        });
+        return res.json({
+            ok: true,
+            contact: {
+                id: c.id,
+                first_name: c.first_name ?? null,
+                last_name: c.last_name ?? null,
+                email: c.email ?? null,
+                company: c.company ?? null,
+                last_contacted_at: c.last_contacted_at ?? null,
+                created_at: c.created_at ?? null,
+            },
+            account: null,
+            health,
+        });
+    }
+    catch (e) {
+        res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
+// Best-effort contact touch helper (fail-soft)
+// Reusable across notes, actions, etc.
+//
+// Behaviour:
+// - Prefer ownership by `crm_contacts.user_id` (current canonical)
+// - If that column is missing, fall back to `crm_contacts.requester_id`
+// - Never throws; callers may ignore failures
+async function touchContactBestEffort(opts) {
+    const { requester, contactId } = opts;
+    const nowIso = new Date().toISOString();
+    // Helper to detect "missing column" errors from PostgREST
+    const isMissingCol = (msg, col) => (msg.includes(col) && msg.includes("does not exist")) ||
+        (msg.includes(col) && msg.includes("could not find"));
+    const tryUpdate = async (ownerCol) => {
+        // @ts-ignore dynamic column
+        const r = await supa
+            .from("crm_contacts")
+            .update({ last_contacted_at: nowIso })
+            .eq("id", contactId)
+            // @ts-ignore dynamic column
+            .eq(ownerCol, requester)
+            .select("id")
+            .maybeSingle();
+        // Success when a row matched.
+        if (!r.error && r.data)
+            return { ok: true, last_contacted_at: nowIso };
+        // No row matched (owned by someone else or not found)
+        if (!r.error && !r.data)
+            return { ok: false, reason: "not_found_or_not_owned" };
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        // Missing ownership column
+        if (isMissingCol(msg, ownerCol))
+            return { ok: false, reason: "owner_col_missing" };
+        // Missing last_contacted_at column
+        if (isMissingCol(msg, "last_contacted_at"))
+            return { ok: false, reason: "last_contacted_at_missing" };
+        // Missing table
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+            return { ok: false, reason: "crm_contacts_table_missing" };
+        }
+        return { ok: false, reason: "touch_failed", detail: msg };
+    };
+    // 1) Canonical: user_id
+    const r1 = await tryUpdate("user_id");
+    if (r1.ok)
+        return r1;
+    // If user_id column exists (i.e. failure wasn't "owner_col_missing"), don't bother trying requester_id.
+    // This avoids noisy errors like "column crm_contacts.requester_id does not exist" in modern schemas.
+    if (r1.reason !== "owner_col_missing")
+        return r1;
+    // 2) Legacy fallback: requester_id
+    const r2 = await tryUpdate("requester_id");
+    if (r2.ok)
+        return r2;
+    // If requester_id is also missing, just fail-soft.
+    return r2.reason === "owner_col_missing" ? { ok: false, reason: "not_supported" } : r2;
+}
+// POST /v1/crm/contacts/:id/mark-contacted
+// Sets crm_contacts.last_contacted_at to now (schema-tolerant ownership key).
+router.post("/contacts/:id/mark-contacted", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const contactId = String(req.params?.id ?? "").trim();
+        if (!contactId) {
+            return res.status(400).json({ ok: false, error: "contact_id_required" });
+        }
+        // Demo contacts: just return ok (no DB write)
+        if (contactId.startsWith("c_")) {
+            return res.json({
+                ok: true,
+                contact_id: contactId,
+                last_contacted_at: new Date().toISOString(),
+                source: "demo",
+            });
+        }
+        const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+        if (!UUID_RE.test(contactId)) {
+            return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+        }
+        // Use shared touch helper (fail-hard only for truly invalid ids)
+        const touched = await touchContactBestEffort({ requester, contactId });
+        if (touched.ok) {
+            return res.json({
+                ok: true,
+                contact_id: contactId,
+                last_contacted_at: touched.last_contacted_at,
+            });
+        }
+        // If schema doesn't support this, surface a clear error (this endpoint is meant to be a hard signal)
+        if (touched.reason === "last_contacted_at_missing") {
+            return res.status(500).json({ ok: false, error: "crm_contacts_last_contacted_at_missing" });
+        }
+        if (touched.reason === "crm_contacts_table_missing") {
+            return res.status(500).json({ ok: false, error: "crm_contacts_table_missing" });
+        }
+        return res.status(404).json({
+            ok: false,
+            error: "contact_not_found_or_not_owned",
+            detail: touched.detail ?? touched.reason,
+        });
+    }
+    catch (err) {
+        return res.status(500).json({
+            ok: false,
+            error: err.message || "mark_contacted_failed",
+        });
+    }
+});
+/** ----------------------------------------------------------------
+ * Contact Assignments (read-only)
+ * GET /v1/crm/contacts/:id/assignments
+ * - Returns open + completed assignments tied to a contact.
+ * - Safe: read-only; best-effort across schema variants.
+ * ---------------------------------------------------------------- */
+async function fetchContactAssignmentsBestEffort(args) {
+    const { requester, contactId, limit } = args;
+    // We’ve used a few table/shape variants over time. Try both without breaking.
+    const candidateTables = ["assignments", "coach_assignments"]; // fallback order
+    const out = [];
+    const seen = new Set();
+    for (const table of candidateTables) {
+        // 1) Direct column link: contact_id
+        try {
+            const { data, error } = await supa
+                .from(table)
+                .select("*")
+                .eq("user_id", requester)
+                .eq("contact_id", contactId)
+                .order("created_at", { ascending: false })
+                .limit(limit);
+            if (!error && data?.length) {
+                for (const row of data) {
+                    const id = String(row.id ?? "");
+                    if (!id || seen.has(id))
+                        continue;
+                    seen.add(id);
+                    out.push(row);
+                }
+            }
+        }
+        catch {
+            // ignore
+        }
+        // 2) Meta link: meta.contact_id (json)
+        try {
+            const { data, error } = await supa
+                .from(table)
+                .select("*")
+                .eq("user_id", requester)
+                // Postgres JSON path filter (works when meta is jsonb)
+                .filter("meta->>contact_id", "eq", contactId)
+                .order("created_at", { ascending: false })
+                .limit(limit);
+            if (!error && data?.length) {
+                for (const row of data) {
+                    const id = String(row.id ?? "");
+                    if (!id || seen.has(id))
+                        continue;
+                    seen.add(id);
+                    out.push(row);
+                }
+            }
+        }
+        catch {
+            // ignore
+        }
+        // If we already found some rows, no need to hammer more tables.
+        if (out.length)
+            break;
+    }
+    // Normalise to a stable shape for the UI.
+    const now = Date.now();
+    const items = out.map((r) => {
+        const dueAt = r.due_at ?? r.dueAt ?? null;
+        const completedAt = r.completed_at ?? r.completedAt ?? null;
+        const dueMs = dueAt ? new Date(String(dueAt)).getTime() : NaN;
+        const isOverdue = !completedAt && Number.isFinite(dueMs) ? dueMs < now : false;
+        return {
+            id: r.id,
+            type: r.type ?? r.assignment_type ?? null,
+            title: r.title ??
+                r.label ??
+                r.name ??
+                r.task ??
+                null,
+            due_at: dueAt,
+            completed_at: completedAt,
+            created_at: r.created_at ?? r.createdAt ?? null,
+            importance: r.importance ?? null,
+            meta: r.meta ?? null,
+            is_overdue: isOverdue,
+        };
+    });
+    const open = items.filter((x) => !x.completed_at);
+    const completed = items.filter((x) => !!x.completed_at);
+    return { open, completed };
+}
+router.get("/contacts/:id/assignments", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const contactId = String(req.params.id ?? "").trim();
+        if (!contactId)
+            return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+        // Demo contacts: return empty (until we have real CRM data)
+        if (contactId.startsWith("c_")) {
+            return res.json({ ok: true, open: [], completed: [] });
+        }
+        // Real DB path: accept UUID or any non-empty id (meta-linked schemas may not be UUID)
+        const limit = Math.min(Math.max(Number(req.query.limit ?? 50), 1), 200);
+        const { open, completed } = await fetchContactAssignmentsBestEffort({ requester, contactId, limit });
+        return res.json({ ok: true, open, completed });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
+// ----------------------------------------------------------------
+// Contact Actions (crm_actions-backed)
+// GET /v1/crm/contacts/:id/actions
+// - This is what the WEB calls.
+// - Best-effort: uses crm_actions if it exists; otherwise returns empty.
+// ----------------------------------------------------------------
+router.get("/contacts/:id/actions", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const contactId = String(req.params.id ?? "").trim();
+        if (!contactId)
+            return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+        // Demo contacts: no real actions yet
+        if (contactId.startsWith("c_")) {
+            return res.json({ ok: true, open: [], completed: [] });
+        }
+        const limit = Math.min(Math.max(Number(req.query.limit ?? 50), 1), 200);
+        // Prefer crm_actions stream (this is our stable action source of truth)
+        const r = await fetchCrmActionsBestEffort({ requester, contactId, limit });
+        // If crm_actions is missing or fails, fail-open with empties (don’t break contact page)
+        if (!r.ok) {
+            const msg = String(r?.error?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.json({ ok: true, open: [], completed: [] });
+            }
+            // unknown error: still fail-open for UI
+            return res.json({ ok: true, open: [], completed: [] });
+        }
+        return res.json({ ok: true, open: r.open ?? [], completed: r.completed ?? [] });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
+// ----------------------------------------------------------------
+// GET /v1/crm/contacts/:id/activity
+// Unified timeline feed (notes + actions + calls)
+// ----------------------------------------------------------------
+router.get("/contacts/:id/activity", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const contactId = String(req.params.id ?? "").trim();
+        if (!contactId) {
+            return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+        }
+        const limit = Math.min(Math.max(Number(req.query.limit ?? 50), 1), 200);
+        // Demo contacts
+        if (contactId.startsWith("c_")) {
+            return res.json({ ok: true, items: [] });
+        }
+        const items = await fetchContactActivityBestEffort({
+            requester,
+            contactId,
+            limit,
+        });
+        return res.json({ ok: true, items });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
+/* ---------------------------------------------------------
+   CRM ACTIVITIES / TASKS (Day 51)
+   type = "task"
+--------------------------------------------------------- */
+const CreateActivitySchema = z.object({
+    type: z.string().trim().min(1).max(40),
+    title: z.string().trim().min(1).max(200),
+    status: z.string().trim().min(1).max(40).optional().default("open"),
+    due_at: z.string().optional().nullable(),
+    opportunity_id: z.string().uuid().optional().nullable(),
+    contact_id: z.string().uuid().optional().nullable(),
+    account_id: z.string().uuid().optional().nullable(),
+});
+router.post("/activities", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const body = CreateActivitySchema.parse(req.body ?? {});
+        const payload = {
+            user_id: requester,
+            type: body.type,
+            title: body.title,
+            status: body.status ?? "open",
+            due_at: body.due_at ?? null,
+            opportunity_id: body.opportunity_id ?? null,
+            contact_id: body.contact_id ?? null,
+            account_id: body.account_id ?? null,
+        };
+        const r = await supa
+            .from("crm_activities")
+            .insert(payload)
+            .select("id,type,title,status,due_at,opportunity_id,contact_id,account_id,created_at")
+            .maybeSingle();
+        if (r.error) {
+            const msg = String(r.error?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.status(500).json({ ok: false, error: "crm_activities_table_missing" });
+            }
+            return res.status(500).json({ ok: false, error: r.error.message ?? "activity_create_failed" });
+        }
+        return res.json({ ok: true, activity: r.data });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+router.get("/activities", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const type = String(req.query.type ?? "task");
+        const status = String(req.query.status ?? "").trim();
+        let q = supa
+            .from("crm_activities")
+            .select("id,type,title,status,due_at,opportunity_id,contact_id,account_id,created_at")
+            .eq("user_id", requester)
+            .eq("type", type)
+            .order("created_at", { ascending: false })
+            .limit(200);
+        if (status)
+            q = q.eq("status", status);
+        const r = await q;
+        if (r.error) {
+            const msg = String(r.error?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.json({ ok: true, items: [] });
+            }
+            return res.status(500).json({ ok: false, error: r.error.message ?? "activities_fetch_failed" });
+        }
+        return res.json({ ok: true, items: r.data ?? [] });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+const UpdateActivitySchema = z.object({
+    title: z.string().trim().min(1).max(200).optional(),
+    status: z.string().trim().min(1).max(40).optional(),
+    due_at: z.string().optional().nullable(),
+});
+router.patch("/activities/:id", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const id = String(req.params.id ?? "").trim();
+        if (!UUID_RE.test(id)) {
+            return res.status(400).json({ ok: false, error: "invalid_id" });
+        }
+        const body = UpdateActivitySchema.parse(req.body ?? {});
+        const patch = {};
+        if (body.title !== undefined)
+            patch.title = body.title;
+        if (body.status !== undefined)
+            patch.status = body.status;
+        if (body.due_at !== undefined)
+            patch.due_at = body.due_at;
+        const r = await supa
+            .from("crm_activities")
+            .update(patch)
+            .eq("id", id)
+            .eq("user_id", requester)
+            .select("id,type,title,status,due_at")
+            .maybeSingle();
+        if (r.error) {
+            return res.status(500).json({ ok: false, error: r.error.message ?? "activity_update_failed" });
+        }
+        if (!r.data)
+            return res.status(404).json({ ok: false, error: "not_found" });
+        return res.json({ ok: true, activity: r.data });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+router.post("/activities/:id/complete", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const id = String(req.params.id ?? "").trim();
+        if (!UUID_RE.test(id)) {
+            return res.status(400).json({ ok: false, error: "invalid_id" });
+        }
+        const r = await supa
+            .from("crm_activities")
+            .update({ status: "done" })
+            .eq("id", id)
+            .eq("user_id", requester)
+            .select("id,status")
+            .maybeSingle();
+        if (r.error) {
+            return res.status(500).json({ ok: false, error: r.error.message ?? "activity_complete_failed" });
+        }
+        if (!r.data)
+            return res.status(404).json({ ok: false, error: "not_found" });
+        return res.json({ ok: true, activity: r.data });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+// ---------------------------------------------------------
+// DAY 52 — COACHING NUDGES (auto task creation)
+// ---------------------------------------------------------
+async function createCoachingTask(args) {
+    const { userId, weakness, opportunityId, contactId, accountId } = args;
+    let title = "";
+    if (weakness === "weak_close") {
+        title = "Review and strengthen close before next call";
+    }
+    if (weakness === "objection_handling") {
+        title = "Practise objection handling before next follow‑up";
+    }
+    const payload = {
+        user_id: userId,
+        type: "task",
+        title,
+        status: "open",
+        due_at: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString(),
+        opportunity_id: opportunityId ?? null,
+        contact_id: contactId ?? null,
+        account_id: accountId ?? null,
+    };
+    const r = await supa.from("crm_activities").insert(payload);
+    if (r.error) {
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+            return { ok: false, reason: "crm_activities_table_missing" };
+        }
+        return { ok: false, reason: "activity_create_failed" };
+    }
+    return { ok: true };
+}
+const CoachingNudgeSchema = z.object({
+    weakness: z.enum(["weak_close", "objection_handling"]),
+    opportunity_id: z.string().uuid().optional().nullable(),
+    contact_id: z.string().uuid().optional().nullable(),
+    account_id: z.string().uuid().optional().nullable(),
+});
+// POST /v1/crm/coaching/nudges
+// Manual endpoint for creating coaching tasks based on detected weaknesses
+router.post("/coaching/nudges", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const body = CoachingNudgeSchema.parse(req.body ?? {});
+        const r = await createCoachingTask({
+            userId: requester,
+            weakness: body.weakness,
+            opportunityId: body.opportunity_id ?? null,
+            contactId: body.contact_id ?? null,
+            accountId: body.account_id ?? null,
+        });
+        if (!r.ok) {
+            return res.status(500).json({ ok: false, error: r.reason });
+        }
+        return res.json({ ok: true, created: true });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+// ---------------------------------------------------------
+// DAY 52 — REP COACHING HISTORY (manager insight)
+// ---------------------------------------------------------
+// GET /v1/crm/reps/:id/coaching-history
+// Returns lightweight coaching metrics for a rep
+router.get("/reps/:id/coaching-history", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const repId = String(req.params.id ?? "").trim();
+        if (!UUID_RE.test(repId)) {
+            return res.status(400).json({ ok: false, error: "invalid_rep_id" });
+        }
+        // Manager guard (same pattern used in pipeline team scope)
+        const okManager = await isManagerUser(requester);
+        if (!okManager && requester !== repId) {
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        }
+        // -------------------------------------------------
+        // Fetch tasks created for this rep
+        // -------------------------------------------------
+        const tasksRes = await supa
+            .from("crm_activities")
+            .select("id,status,title,created_at")
+            .eq("user_id", repId)
+            .eq("type", "task")
+            .limit(500);
+        const tasks = tasksRes.data ?? [];
+        const coachingTasks = tasks.filter((t) => String(t.title || "").toLowerCase().includes("close") ||
+            String(t.title || "").toLowerCase().includes("objection"));
+        const completedTasks = coachingTasks.filter((t) => t.status === "done");
+        // -------------------------------------------------
+        // Fetch call scoring trend (best-effort)
+        // -------------------------------------------------
+        let avgScore = null;
+        let callCount = 0;
+        try {
+            const scores = await supa
+                .from("call_scores")
+                .select("total_score")
+                .eq("user_id", repId)
+                .limit(200);
+            const rows = scores.data ?? [];
+            if (rows.length) {
+                callCount = rows.length;
+                const sum = rows.reduce((acc, r) => acc + Number(r.total_score || 0), 0);
+                avgScore = Math.round(sum / rows.length);
+            }
+        }
+        catch {
+            // fail-soft if table missing
+        }
+        // -------------------------------------------------
+        // Weakness detection counts
+        // -------------------------------------------------
+        const weakCloseEvents = coachingTasks.filter((t) => String(t.title || "").toLowerCase().includes("close")).length;
+        const objectionEvents = coachingTasks.filter((t) => String(t.title || "").toLowerCase().includes("objection")).length;
+        return res.json({
+            ok: true,
+            rep_id: repId,
+            calls_reviewed: callCount,
+            avg_score: avgScore,
+            coaching_tasks_created: coachingTasks.length,
+            completed_tasks: completedTasks.length,
+            weak_close_events: weakCloseEvents,
+            objection_events: objectionEvents
+        });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+// ---------------------------------------------------------
+// DAY 53 — CRM ANALYTICS
+// Live metrics for dashboards
+// ---------------------------------------------------------
+// GET /v1/crm/analytics/summary?days=30&repId=
+router.get("/analytics/summary", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const orgId = getOrgIdHeader(req);
+        const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
+        const repIdRaw = String(req.query.repId ?? "").trim();
+        const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
+        const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+        let oppsQ = supa
+            .from("crm_opportunities")
+            .select("id,stage,amount,created_at,user_id")
+            .eq("org_id", orgId)
+            .gte("created_at", sinceIso);
+        let activitiesQ = supa
+            .from("crm_activities")
+            .select("id,status,created_at,user_id")
+            .eq("org_id", orgId)
+            .gte("created_at", sinceIso);
+        let callsQ = supa
+            .from("calls")
+            .select("score_overall,created_at,user_id")
+            .eq("org_id", orgId)
+            .gte("created_at", sinceIso);
+        if (repId) {
+            oppsQ = oppsQ.eq("user_id", repId);
+            activitiesQ = activitiesQ.eq("user_id", repId);
+            callsQ = callsQ.eq("user_id", repId);
+        }
+        const opps = await oppsQ;
+        const activities = await activitiesQ;
+        const calls = await callsQ;
+        const oppRows = opps.data ?? [];
+        const actRows = activities.data ?? [];
+        const callRows = calls.data ?? [];
+        const won = oppRows.filter((o) => String(o.stage) === "won").length;
+        const totalOpps = oppRows.length;
+        const conversion = totalOpps ? Math.round((won / totalOpps) * 100) : 0;
+        const avgScore = callRows.length
+            ? Math.round(callRows.reduce((a, b) => a + Number(b.score_overall || 0), 0) / callRows.length)
+            : null;
+        const tasksCompleted = actRows.filter((a) => a.status === "done").length;
+        return res.json({
+            ok: true,
+            scope: repId ? "rep" : "team",
+            rep_id: repId,
+            requester_id: requester,
+            opportunities: totalOpps,
+            won,
+            conversion_rate: conversion,
+            avg_score: avgScore,
+            activities_created: actRows.length,
+            tasks_completed: tasksCompleted,
+        });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "analytics_summary_failed" });
+    }
+});
+// GET /v1/crm/analytics/stage-conversion
+router.get("/analytics/stage-conversion", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const orgId = getOrgIdHeader(req);
+        const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
+        const repIdRaw = String(req.query.repId ?? "").trim();
+        const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
+        const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+        let q = supa
+            .from("crm_opportunities")
+            .select("stage,amount,created_at,user_id")
+            .eq("org_id", orgId)
+            .gte("created_at", sinceIso);
+        if (repId)
+            q = q.eq("user_id", repId);
+        const r = await q;
+        const rows = r.data ?? [];
+        const stages = {};
+        rows.forEach((o) => {
+            const s = String(o.stage ?? "new");
+            stages[s] = (stages[s] ?? 0) + 1;
+        });
+        return res.json({
+            ok: true,
+            scope: repId ? "rep" : "team",
+            rep_id: repId,
+            requester_id: requester,
+            stages,
+        });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "stage_conversion_failed" });
+    }
+});
+// GET /v1/crm/analytics/score-trend
+router.get("/analytics/score-trend", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const orgId = getOrgIdHeader(req);
+        const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
+        const repIdRaw = String(req.query.repId ?? "").trim();
+        const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
+        const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+        let q = supa
+            .from("calls")
+            .select("score_overall,created_at,user_id")
+            .eq("org_id", orgId)
+            .gte("created_at", sinceIso)
+            .order("created_at", { ascending: true });
+        if (repId)
+            q = q.eq("user_id", repId);
+        const r = await q;
+        const rows = r.data ?? [];
+        const buckets = {};
+        rows.forEach((c) => {
+            const d = String(c.created_at).slice(0, 10);
+            if (!buckets[d])
+                buckets[d] = { total: 0, count: 0 };
+            buckets[d].total += Number(c.score_overall || 0);
+            buckets[d].count += 1;
+        });
+        const trend = Object.entries(buckets).map(([date, v]) => ({
+            date,
+            avg_score: Math.round(v.total / v.count),
+        }));
+        return res.json({
+            ok: true,
+            scope: repId ? "rep" : "team",
+            rep_id: repId,
+            requester_id: requester,
+            trend,
+        });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "score_trend_failed" });
+    }
+});
+// GET /v1/crm/analytics/activity-by-rep
+router.get("/analytics/activity-by-rep", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const orgId = getOrgIdHeader(req);
+        const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
+        const repIdRaw = String(req.query.repId ?? "").trim();
+        const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
+        const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+        let q = supa
+            .from("crm_activities")
+            .select("user_id,status,created_at")
+            .eq("org_id", orgId)
+            .gte("created_at", sinceIso);
+        if (repId)
+            q = q.eq("user_id", repId);
+        const r = await q;
+        const rows = r.data ?? [];
+        const reps = {};
+        rows.forEach((a) => {
+            const uid = String(a.user_id);
+            if (!reps[uid])
+                reps[uid] = { created: 0, completed: 0 };
+            reps[uid].created += 1;
+            if (a.status === "done")
+                reps[uid].completed += 1;
+        });
+        const repIds = Object.keys(reps);
+        // Fetch rep names (best-effort) from auth.users
+        let userMap = {};
+        if (repIds.length) {
+            try {
+                const users = await supa
+                    .from("auth.users")
+                    .select("id,email")
+                    .in("id", repIds);
+                (users.data ?? []).forEach((u) => {
+                    userMap[String(u.id)] = u.email;
+                });
+            }
+            catch {
+                // fail-soft if auth.users not accessible
+            }
+        }
+        const result = Object.entries(reps).map(([rep_id, v]) => ({
+            rep_id,
+            rep_name: userMap[rep_id] ?? rep_id,
+            activities_created: v.created,
+            activities_completed: v.completed,
+        }));
+        return res.json({
+            ok: true,
+            scope: repId ? "rep" : "team",
+            rep_id: repId,
+            requester_id: requester,
+            reps: result,
+        });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "activity_by_rep_failed" });
+    }
+});
+/** ----------------------------------------------------------------
+ * Contact AI Brief (heuristic for now)
+ * GET /v1/crm/contacts/:id/ai-brief
+ * - Returns a short, actionable summary for reps based on:
+ *   - contact fields
+ *   - linked calls (if any)
+ *   - latest call summary/flags (if available)
+ *   - latest notes (if any)
+ *
+ * Safe-by-default:
+ * - No external LLM calls required.
+ * - If you later want GPT, add it behind an env flag.
+ * ---------------------------------------------------------------- */
+function fmtDateIso(d) {
+    if (!d)
+        return null;
+    const dt = new Date(d);
+    if (Number.isNaN(dt.getTime()))
+        return null;
+    return dt.toISOString();
+}
+function relativeTimeFromIso(iso) {
+    if (!iso)
+        return "Never";
+    const dt = new Date(iso);
+    const now = new Date();
+    if (Number.isNaN(dt.getTime()))
+        return "Unknown";
+    const diffMs = now.getTime() - dt.getTime();
+    if (diffMs < 0)
+        return "In future";
+    const mins = Math.floor(diffMs / (60 * 1000));
+    if (mins < 60)
+        return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 48)
+        return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    if (days < 14)
+        return `${days}d ago`;
+    const weeks = Math.floor(days / 7);
+    if (weeks < 10)
+        return `${weeks}w ago`;
+    const months = Math.floor(days / 30);
+    return `${months}mo ago`;
+}
+// ------------------- Contact Health Helpers -------------------
+function daysSince(iso) {
+    if (!iso)
+        return null;
+    const dt = new Date(iso);
+    if (Number.isNaN(dt.getTime()))
+        return null;
+    const ms = Date.now() - dt.getTime();
+    return Math.floor(ms / (1000 * 60 * 60 * 24));
+}
+function classifyHealth(args) {
+    const { lastContactedDays, overdueCount, criticalNotesCount, importantNotesCount, lastCallScore } = args;
+    let score = 50;
+    const reasons = [];
+    if (lastContactedDays == null) {
+        score -= 10;
+        reasons.push("Never contacted");
+    }
+    else if (lastContactedDays <= 2) {
+        score += 20;
+        reasons.push("Contacted recently");
+    }
+    else if (lastContactedDays <= 7) {
+        score += 10;
+        reasons.push("Contacted within 7 days");
+    }
+    else if (lastContactedDays <= 14) {
+        score -= 5;
+        reasons.push("No contact in 2 weeks");
+    }
+    else if (lastContactedDays <= 30) {
+        score -= 15;
+        reasons.push("No contact in 30 days");
+    }
+    else {
+        score -= 25;
+        reasons.push("No contact in 30+ days");
+    }
+    if (overdueCount > 0) {
+        score -= Math.min(25, overdueCount * 8);
+        reasons.push(`${overdueCount} overdue assignment${overdueCount === 1 ? "" : "s"}`);
+    }
+    if (criticalNotesCount > 0) {
+        score -= Math.min(20, criticalNotesCount * 10);
+        reasons.push("Critical note(s) present");
+    }
+    else if (importantNotesCount > 0) {
+        score -= Math.min(10, importantNotesCount * 5);
+        reasons.push("Important note(s) present");
+    }
+    if (lastCallScore != null) {
+        if (lastCallScore >= 80) {
+            score += 10;
+            reasons.push("Strong last call score");
+        }
+        else if (lastCallScore >= 60) {
+            score += 3;
+            reasons.push("Decent last call score");
+        }
+        else {
+            score -= 8;
+            reasons.push("Weak last call score");
+        }
+    }
+    score = Math.max(0, Math.min(100, score));
+    let status = "cold";
+    if (overdueCount > 0 || (lastContactedDays != null && lastContactedDays > 14))
+        status = "stale";
+    if ((lastContactedDays != null && lastContactedDays <= 7) && overdueCount === 0)
+        status = "warm";
+    if ((lastContactedDays != null && lastContactedDays <= 2) && overdueCount === 0 && criticalNotesCount === 0)
+        status = "hot";
+    let next_action = "Log a next step (time + outcome) and schedule follow-up.";
+    if (overdueCount > 0)
+        next_action = "Clear overdue assignment(s) before doing anything else.";
+    else if (lastContactedDays == null)
+        next_action = "Send intro + 2 discovery questions + book a time.";
+    else if (lastContactedDays > 14)
+        next_action = "Re-open with a short recap + clear next step + 2 time slots.";
+    else if (criticalNotesCount > 0)
+        next_action = "Review critical notes before contacting.";
+    return { status, score, reasons, next_action };
+}
+function buildHeuristicBrief(args) {
+    const { contact, notes, calls } = args;
+    const name = [contact?.first_name, contact?.last_name].filter(Boolean).join(" ").trim() || "Contact";
+    const company = contact?.company || null;
+    const lastContacted = contact?.last_contacted_at ? relativeTimeFromIso(contact.last_contacted_at) : "Never";
+    const lastCall = calls?.[0] ?? null;
+    const lastCallScore = lastCall?.score ?? null;
+    const lastCallSummary = lastCall?.summary ?? null;
+    const lastCallFlags = lastCall?.flags ?? null;
+    const importantNotes = (notes ?? []).filter((n) => (n?.importance ?? "normal") !== "normal").slice(0, 3);
+    const latestNote = (notes ?? [])[0] ?? null;
+    const talkingPoints = [];
+    if (company)
+        talkingPoints.push(`Mention: ${company}`);
+    if (lastCallScore != null)
+        talkingPoints.push(`Last call score: ${lastCallScore}`);
+    if (lastCallFlags?.length)
+        talkingPoints.push(`Watch-outs: ${lastCallFlags.join(", ")}`);
+    if (importantNotes.length) {
+        talkingPoints.push(`Priority notes: ${importantNotes.map((n) => `${(n.importance ?? "normal").toUpperCase()}: ${String(n.body ?? "").slice(0, 80)}`).join(" | ")}`);
+    }
+    const nextMove = [];
+    if (lastContacted === "Never")
+        nextMove.push("Send a quick intro + value prop");
+    else
+        nextMove.push("Follow up with a clear next step + time slot");
+    if (lastCallSummary)
+        nextMove.push("Open with recap of last call");
+    if (latestNote?.body)
+        nextMove.push("Reference your latest note");
+    return {
+        title: `AI Brief: ${name}`,
+        context: {
+            name,
+            email: contact?.email ?? null,
+            company,
+            last_contacted_at: fmtDateIso(contact?.last_contacted_at ?? null),
+            last_contacted_relative: lastContacted,
+            calls_count: (calls ?? []).length,
+            notes_count: (notes ?? []).length,
+        },
+        summary: lastCallSummary ||
+            (calls?.length ? "We have call history, but no summary yet." : "No calls linked yet — treat as a warm lead and qualify quickly."),
+        talking_points: talkingPoints.length ? talkingPoints : ["Ask 2–3 discovery questions", "Confirm decision-maker + timeline"],
+        next_move: nextMove.slice(0, 3),
+    };
+}
+router.get("/contacts/:id/ai-brief", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const contactId = String(req.params.id ?? "").trim();
+        if (!contactId)
+            return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+        // 1) Resolve contact
+        let contact = null;
+        if (contactId.startsWith("c_")) {
+            const found = DEMO_CONTACTS.find((c) => c.id === contactId);
+            if (!found)
+                return res.status(404).json({ ok: false, error: "not_found" });
+            contact = {
+                id: found.id,
+                first_name: found.first_name ?? null,
+                last_name: found.last_name ?? null,
+                email: found.email ?? null,
+                company: found.company ?? null,
+                last_contacted_at: found.last_contacted_at ?? null,
+            };
+        }
+        else {
+            if (!UUID_RE.test(contactId))
+                return res.status(400).json({ ok: false, error: "invalid_id" });
+            const { data: c, error: cErr } = await supa
+                .from("crm_contacts")
+                .select("id, first_name, last_name, email, company, last_contacted_at")
+                .eq("user_id", requester)
+                .eq("id", contactId)
+                .maybeSingle();
+            // Safe: maybeSingle() returns `data: null` when no rows match.
+            if (cErr)
+                return res.status(500).json({ ok: false, error: cErr.message ?? "contact_query_failed" });
+            if (!c)
+                return res.status(404).json({ ok: false, error: "not_found" });
+            contact = c;
+        }
+        // 2) Pull latest notes
+        const { data: notes, error: nErr } = await supa
+            .from("crm_contact_notes")
+            .select("id, body, created_at, author_id, author_name, importance")
+            .eq("user_id", requester)
+            .eq("contact_id", contactId)
+            .order("created_at", { ascending: false })
+            .limit(20);
+        if (nErr)
+            throw nErr;
+        // 3) Pull linked calls (best-effort)
+        // If you have a join table like `crm_call_links(contact_id, call_id)` we use it.
+        // If not, this returns empty and the brief still works.
+        let calls = [];
+        try {
+            const { data: links, error: lErr } = await supa
+                .from("crm_call_links")
+                .select("call_id")
+                .eq("contact_id", contactId)
+                .limit(25);
+            if (lErr)
+                throw lErr;
+            const callIds = (links ?? []).map((r) => r.call_id).filter(Boolean);
+            if (callIds.length) {
+                // Pull lightweight fields from `calls`. If your schema differs, adjust select list.
+                const { data: callRows, error: cErr } = await supa
+                    .from("calls")
+                    .select("id, created_at, summary, flags, duration_ms")
+                    .eq("user_id", requester)
+                    .in("id", callIds)
+                    .order("created_at", { ascending: false })
+                    .limit(10);
+                if (cErr)
+                    throw cErr;
+                // Pull latest score per call (best-effort)
+                const { data: scoreRows } = await supa
+                    .from("call_scores")
+                    .select("call_id, total_score, created_at")
+                    .eq("user_id", requester)
+                    .in("call_id", callIds)
+                    .order("created_at", { ascending: false })
+                    .limit(50);
+                const scoreByCall = new Map();
+                for (const s of scoreRows ?? []) {
+                    const cid = s.call_id;
+                    if (!scoreByCall.has(cid))
+                        scoreByCall.set(cid, Number(s.total_score));
+                }
+                calls = (callRows ?? []).map((r) => ({
+                    id: r.id,
+                    created_at: r.created_at,
+                    summary: r.summary ?? null,
+                    flags: r.flags ?? null,
+                    duration_ms: r.duration_ms ?? null,
+                    score: scoreByCall.get(r.id) ?? null,
+                }));
+            }
+        }
+        catch {
+            calls = [];
+        }
+        const brief = buildHeuristicBrief({ contact, notes: notes ?? [], calls });
+        return res.json({ ok: true, brief });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
+/* ---------------------------------------------
+   POST /v1/crm/link-call
+   Body (flexible):
+     - callId | call_id (uuid) [required]
+     - contact_id | contactId (uuid) OR email (string) [one required]
+     - account_id | accountId (uuid) [optional]
+     - opportunity_id | opportunityId (uuid) [optional]
+
+   Behaviour (best-effort + schema tolerant):
+     - Verify caller owns the call
+     - Resolve contact (by contact_id if provided, else upsert by email scoped to requester)
+     - Upsert link in crm_call_links (call_id -> contact_id)
+     - Best-effort: update calls(contact_id/account_id/opportunity_id) if columns exist
+     - Best-effort: insert crm_activities row (type=call) if table exists
+---------------------------------------------- */
+const LinkCallSchema = z
+    .object({
+    // NOTE: call ids in this system may be UUIDs OR demo/string ids (e.g. "demo-001").
+    // So we accept any non-empty string here.
+    callId: z.string().trim().min(1).optional(),
+    call_id: z.string().trim().min(1).optional(),
+    contact_id: z.string().uuid().optional(),
+    contactId: z.string().uuid().optional(),
+    email: z
+        .string()
+        .email()
+        .transform((s) => s.toLowerCase().trim())
+        .optional(),
+    account_id: z.string().uuid().optional().nullable(),
+    accountId: z.string().uuid().optional().nullable(),
+    opportunity_id: z.string().uuid().optional().nullable(),
+    opportunityId: z.string().uuid().optional().nullable(),
+})
+    .refine((b) => Boolean(b.callId || b.call_id), { message: "call_id_required" })
+    .refine((b) => Boolean(b.contact_id || b.contactId || b.email), { message: "contact_required" });
+router.post("/link-call", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const body = LinkCallSchema.parse(req.body ?? {});
+        const callId = (body.callId ?? body.call_id);
+        const accountId = (body.accountId ?? body.account_id) ?? null;
+        const opportunityId = (body.opportunityId ?? body.opportunity_id) ?? null;
+        const contactIdFromBody = (body.contactId ?? body.contact_id) ?? null;
+        const email = body.email ?? null;
+        // 1) Verify the call belongs to the requester
+        // NOTE: In local/dev we may have demo call ids like "demo-001" that are not persisted.
+        // Also: some schemas expect calls.id and crm_call_links.call_id to be UUID.
+        // So we treat non-UUID call ids as “virtual/demo” and skip DB linkage writes.
+        const callIdStr = String(callId);
+        const isDemoCallId = /^demo-\d+$/i.test(callIdStr);
+        const isUuidCallId = UUID_RE.test(callIdStr);
+        const isVirtualCallId = isDemoCallId || !isUuidCallId;
+        if (!isVirtualCallId) {
+            const { data: call, error: callErr } = await supa
+                .from("calls")
+                .select("id, user_id")
+                .eq("id", callId)
+                .maybeSingle();
+            if (callErr || !call)
+                return res.status(404).json({ ok: false, error: "call_not_found" });
+            if (String(call.user_id ?? "") !== requester)
+                return res.status(403).json({ ok: false, error: "forbidden" });
+        }
+        // 2) Resolve contact
+        let contactId = null;
+        // 2a) If contact_id provided, validate ownership
+        if (contactIdFromBody) {
+            const { data: c, error: cErr } = await supa
+                .from("crm_contacts")
+                .select("id")
+                .eq("id", contactIdFromBody)
+                .eq("user_id", requester)
+                .maybeSingle();
+            if (cErr)
+                return res.status(500).json({ ok: false, error: cErr.message ?? "contact_lookup_failed" });
+            if (!c)
+                return res.status(404).json({ ok: false, error: "contact_not_found" });
+            contactId = String(c.id);
+        }
+        else {
+            // 2b) Else resolve by email (scoped to requester)
+            if (!email)
+                return res.status(400).json({ ok: false, error: "email_required" });
+            // Prefer selecting by (user_id + email) first
+            const { data: existingScoped, error: exScopedErr } = await supa
+                .from("crm_contacts")
+                .select("id")
+                .eq("user_id", requester)
+                .eq("email", email)
+                .maybeSingle();
+            if (exScopedErr)
+                return res.status(500).json({ ok: false, error: exScopedErr.message ?? "contact_lookup_failed" });
+            if (existingScoped?.id) {
+                contactId = String(existingScoped.id);
+            }
+            else {
+                // Insert new contact owned by requester
+                const insertAttempt = await supa
+                    .from("crm_contacts")
+                    .insert({ user_id: requester, email })
+                    .select("id")
+                    .single();
+                if (!insertAttempt.error && insertAttempt.data) {
+                    contactId = String(insertAttempt.data.id);
+                }
+                else {
+                    // If email is globally unique, select by email and ensure ownership
+                    const { data: existingByEmail, error: exErr } = await supa
+                        .from("crm_contacts")
+                        .select("id, user_id")
+                        .eq("email", email)
+                        .maybeSingle();
+                    if (exErr)
+                        return res.status(500).json({ ok: false, error: exErr.message ?? "contact_lookup_failed" });
+                    if (!existingByEmail) {
+                        return res.status(500).json({ ok: false, error: insertAttempt.error?.message ?? "contact_upsert_failed" });
+                    }
+                    if (String(existingByEmail.user_id ?? "") !== requester) {
+                        return res.status(409).json({ ok: false, error: "email_owned_by_other_user" });
+                    }
+                    contactId = String(existingByEmail.id);
+                }
+            }
+        }
+        if (!contactId)
+            return res.status(500).json({ ok: false, error: "contact_resolve_failed" });
+        // 3) Link the call -> contact (best-effort)
+        // Goals:
+        // - Accept demo/string call ids (e.g. demo-001)
+        // - Never attempt invalid UUID writes
+        // - Do NOT depend on UNIQUE constraints / onConflict
+        //
+        // Behaviour:
+        // - If callId is not a UUID (or is demo), we skip DB linkage writes and just return a stable response.
+        // - If callId is a UUID, we do a simple "replace" write: delete existing links for call_id, then insert.
+        if (isUuidCallId) {
+            try {
+                // crm_call_links may not exist yet
+                // Replace semantics: one call_id should point to one contact_id
+                await supa.from("crm_call_links").delete().eq("call_id", callId);
+                const ins = await supa.from("crm_call_links").insert({ call_id: callId, contact_id: contactId });
+                if (ins.error) {
+                    const msg = String(ins.error?.message ?? "").toLowerCase();
+                    // Missing table is a hard error for link-call
+                    if (msg.includes("relation") && msg.includes("does not exist")) {
+                        return res.status(500).json({ ok: false, error: "crm_call_links_table_missing" });
+                    }
+                    // If the schema expects UUIDs and rejects (shouldn't happen because isUuidCallId), fail-soft and continue.
+                    if (msg.includes("invalid input syntax") && msg.includes("uuid")) {
+                        // no-op
+                    }
+                    else {
+                        return res.status(500).json({ ok: false, error: ins.error?.message ?? "link_call_failed" });
+                    }
+                }
+            }
+            catch (e) {
+                const emsg = String(e?.message ?? "").toLowerCase();
+                if (emsg.includes("relation") && emsg.includes("does not exist")) {
+                    return res.status(500).json({ ok: false, error: "crm_call_links_table_missing" });
+                }
+                // Otherwise fail-soft (link table issues shouldn't block the rest)
+            }
+        }
+        // 3b) Persist demo/virtual call links so GET /v1/crm/link can re-hydrate UI after refresh.
+        // This is best-effort: if the table doesn't exist yet, we fail-soft.
+        if (isVirtualCallId) {
+            try {
+                // Replace semantics: one (user_id, call_id) row
+                await supa
+                    .from("crm_demo_call_links")
+                    .delete()
+                    .eq("user_id", requester)
+                    .eq("call_id", callIdStr);
+                const ins = await supa.from("crm_demo_call_links").insert({
+                    user_id: requester,
+                    call_id: callIdStr,
+                    contact_id: contactId,
+                    account_id: accountId,
+                    opportunity_id: opportunityId,
+                });
+                if (ins.error) {
+                    const msg = String(ins.error?.message ?? "").toLowerCase();
+                    // Table missing -> fail-soft (demo persistence not available)
+                    if (!(msg.includes("relation") && msg.includes("does not exist"))) {
+                        console.error("[crm/link-call] demo link insert failed:", ins.error);
+                    }
+                }
+            }
+            catch (e) {
+                const msg = String(e?.message ?? "").toLowerCase();
+                // Table missing -> fail-soft
+                if (!(msg.includes("relation") && msg.includes("does not exist"))) {
+                    console.error("[crm/link-call] demo link insert exception:", e);
+                }
+            }
+        }
+        // 4) Best-effort: update calls row with linkage columns (schema tolerant)
+        // Virtual/demo call ids are not persisted, so skip updating `calls`.
+        if (!isVirtualCallId) {
+            try {
+                const patchBase = {
+                    contact_id: contactId,
+                    ...(accountId ? { account_id: accountId } : {}),
+                    ...(opportunityId ? { opportunity_id: opportunityId } : {}),
+                };
+                const updateAttempts = [
+                    { ...patchBase },
+                    (() => {
+                        const p = { ...patchBase };
+                        delete p.opportunity_id;
+                        return p;
+                    })(),
+                    (() => {
+                        const p = { ...patchBase };
+                        delete p.account_id;
+                        return p;
+                    })(),
+                    (() => {
+                        const p = { ...patchBase };
+                        delete p.account_id;
+                        delete p.opportunity_id;
+                        return p;
+                    })(),
+                ].filter((p) => Object.keys(p).length > 0);
+                for (const p of updateAttempts) {
+                    const r = await supa
+                        .from("calls")
+                        .update(p)
+                        .eq("id", callId)
+                        .eq("user_id", requester)
+                        .select("id")
+                        .maybeSingle();
+                    if (!r.error)
+                        break;
+                    const msg = String(r.error?.message ?? "").toLowerCase();
+                    const isMissingCol = (msg.includes("column") && msg.includes("does not exist")) ||
+                        msg.includes("could not find") ||
+                        msg.includes("unknown column");
+                    if (isMissingCol)
+                        continue;
+                    break;
+                }
+            }
+            catch {
+                // fail-soft
+            }
+        }
+        // 5) Best-effort: insert an activity row (timeline)
+        // If call_id is not a UUID, many schemas will reject it; skip activity insert.
+        if (!isUuidCallId) {
+            // still continue (we’ll return ok below)
+        }
+        else {
+            try {
+                const activityBase = {
+                    user_id: requester,
+                    type: "call",
+                    contact_id: contactId,
+                    call_id: callId,
+                    ...(accountId ? { account_id: accountId } : {}),
+                    ...(opportunityId ? { opportunity_id: opportunityId } : {}),
+                    meta: { source: "link_call_v1" },
+                };
+                const activityAttempts = [
+                    { ...activityBase },
+                    (() => {
+                        const p = { ...activityBase };
+                        delete p.meta;
+                        return p;
+                    })(),
+                    (() => {
+                        const p = { ...activityBase };
+                        delete p.call_id;
+                        return p;
+                    })(),
+                    (() => {
+                        const p = { ...activityBase };
+                        delete p.account_id;
+                        delete p.opportunity_id;
+                        return p;
+                    })(),
+                    { user_id: requester, type: "call", contact_id: contactId },
+                ];
+                for (const payload of activityAttempts) {
+                    const r = await supa.from("crm_activities").insert(payload);
+                    if (!r.error)
+                        break;
+                    const msg = String(r.error?.message ?? "").toLowerCase();
+                    if (msg.includes("relation") && msg.includes("does not exist"))
+                        break;
+                    const isMissingCol = (msg.includes("column") && msg.includes("does not exist")) ||
+                        msg.includes("could not find") ||
+                        msg.includes("unknown column");
+                    if (isMissingCol)
+                        continue;
+                    break;
+                }
+            }
+            catch {
+                // fail-soft
+            }
+        }
+        // 6) Touch contact (best-effort)
+        try {
+            await touchContactBestEffort({ requester, contactId });
+        }
+        catch {
+            // fail-soft
+        }
+        return res.json({
+            ok: true,
+            link: {
+                call_id: callId,
+                contact_id: contactId,
+                account_id: accountId,
+                opportunity_id: opportunityId,
+                demo_call: isDemoCallId,
+                virtual_call: isVirtualCallId,
+            },
+        });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
+/* ---------------------------------------------
+   POST /v1/crm/unlink
+   Body:
+     - callId (string) [required] (UUID or demo-###)
+     - target: 'contact' | 'account' [required]
+
+   Behaviour:
+     - For UUID calls: verify caller owns the call via `calls` table, then update/delete from `crm_call_links`.
+     - For demo/virtual calls: update/delete from `crm_demo_call_links` (scoped by user_id).
+     - Best-effort schema tolerance: if account_id column missing, fallback to deleting the link row.
+---------------------------------------------- */
+const UnlinkSchema = z.object({
+    callId: z.string().trim().min(1),
+    target: z.enum(["contact", "account"]),
+});
+// POST /v1/crm/unlink
+// Body: { callId | call_id, target?: "contact"|"account"|"opportunity"|"all" }
+// Supports demo/string call IDs by using `crm_demo_call_links` for non-UUID ids.
+router.post("/unlink", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const body = (req.body ?? {});
+        const callId = String(body.callId ?? body.call_id ?? "").trim();
+        const target = String(body.target ?? "all").trim().toLowerCase();
+        if (!callId) {
+            return res.status(400).json({ ok: false, error: "callId_required" });
+        }
+        const callIdStr = String(callId);
+        const isDemoCallId = /^demo-\d+$/i.test(callIdStr);
+        const isUuidCallId = UUID_RE.test(callIdStr);
+        const isVirtualCallId = isDemoCallId || !isUuidCallId;
+        // ----------------------------
+        // A) DEMO/VIRTUAL call ids
+        // ----------------------------
+        if (isVirtualCallId) {
+            try {
+                // IMPORTANT:
+                // GET /v1/crm/link for demo ids hydrates from crm_demo_call_links.
+                // So unlinking the CONTACT must delete the row, otherwise it will “come back”.
+                if (target === "all" || target === "contact") {
+                    const del = await supa
+                        .from("crm_demo_call_links")
+                        .delete()
+                        .eq("user_id", requester)
+                        .eq("call_id", callIdStr);
+                    if (del.error) {
+                        const msg = String(del.error?.message ?? "").toLowerCase();
+                        // Table missing -> fail-soft
+                        if (!(msg.includes("relation") && msg.includes("does not exist"))) {
+                            console.error("[crm/unlink] demo delete failed:", del.error);
+                        }
+                    }
+                    return res.json({ ok: true, call_id: callIdStr, unlinked: target });
+                }
+                // For demo ids, we only support clearing account/opportunity via update.
+                const patch = {};
+                if (target === "account") {
+                    patch.account_id = null;
+                    patch.opportunity_id = null;
+                }
+                else if (target === "opportunity") {
+                    patch.opportunity_id = null;
+                }
+                else {
+                    // unknown target: fail-soft but don't delete the link
+                    patch.opportunity_id = null;
+                }
+                const attempts = [
+                    { ...patch },
+                    (() => {
+                        const p = { ...patch };
+                        delete p.opportunity_id;
+                        return p;
+                    })(),
+                    (() => {
+                        const p = { ...patch };
+                        delete p.account_id;
+                        return p;
+                    })(),
+                ].filter((p) => Object.keys(p).length > 0);
+                for (const p of attempts) {
+                    const r = await supa
+                        .from("crm_demo_call_links")
+                        .update(p)
+                        .eq("user_id", requester)
+                        .eq("call_id", callIdStr);
+                    if (!r.error)
+                        break;
+                    const msg = String(r.error?.message ?? "").toLowerCase();
+                    const isMissingCol = (msg.includes("column") && msg.includes("does not exist")) ||
+                        msg.includes("could not find") ||
+                        msg.includes("unknown column");
+                    if (msg.includes("relation") && msg.includes("does not exist"))
+                        break; // fail-soft
+                    if (isMissingCol)
+                        continue;
+                    break;
+                }
+                return res.json({ ok: true, call_id: callIdStr, unlinked: target });
+            }
+            catch {
+                // fail-soft
+                return res.json({ ok: true, call_id: callIdStr, unlinked: target });
+            }
+        }
+        // 1b) Best-effort: clear linkage columns on crm_call_links (schema tolerant)
+        // This is the source used by GET /v1/crm/link for UUID calls, so if we only
+        // clear `calls.contact_id/account_id` the panel can still re-hydrate stale data.
+        {
+            const patchBase = {};
+            if (target === "contact") {
+                patchBase.contact_id = null;
+                patchBase.opportunity_id = null;
+            }
+            else if (target === "account") {
+                patchBase.account_id = null;
+                patchBase.opportunity_id = null;
+            }
+            else if (target === "opportunity") {
+                patchBase.opportunity_id = null;
+            }
+            else {
+                patchBase.contact_id = null;
+                patchBase.account_id = null;
+                patchBase.opportunity_id = null;
+            }
+            const attempts = [
+                { ...patchBase },
+                (() => {
+                    const p = { ...patchBase };
+                    delete p.opportunity_id;
+                    return p;
+                })(),
+                (() => {
+                    const p = { ...patchBase };
+                    delete p.account_id;
+                    return p;
+                })(),
+                (() => {
+                    const p = { ...patchBase };
+                    delete p.contact_id;
+                    return p;
+                })(),
+            ].filter((p) => Object.keys(p).length > 0);
+            let updatedLinkRow = false;
+            for (const p of attempts) {
+                const r = await supa
+                    .from("crm_call_links")
+                    .update(p)
+                    .eq("call_id", callIdStr)
+                    .select("call_id")
+                    .maybeSingle();
+                if (!r.error) {
+                    updatedLinkRow = true;
+                    break;
+                }
+                const msg = String(r.error?.message ?? "").toLowerCase();
+                const isMissingCol = (msg.includes("column") && msg.includes("does not exist")) ||
+                    msg.includes("could not find") ||
+                    msg.includes("unknown column");
+                if (msg.includes("relation") && msg.includes("does not exist"))
+                    break;
+                if (isMissingCol)
+                    continue;
+                break;
+            }
+            // Fallback: if we couldn't safely update the row, deleting it is better than
+            // allowing stale link data to keep re-hydrating the UI.
+            if (!updatedLinkRow && (target === "contact" || target === "all")) {
+                try {
+                    await supa.from("crm_call_links").delete().eq("call_id", callIdStr);
+                }
+                catch {
+                    // fail-soft
+                }
+            }
+        }
+        // 2) Best-effort: clear linkage columns on calls (schema tolerant)
+        {
+            const patchBase = {};
+            if (target === "contact") {
+                patchBase.contact_id = null;
+                patchBase.opportunity_id = null;
+            }
+            else if (target === "account") {
+                patchBase.account_id = null;
+                patchBase.opportunity_id = null;
+            }
+            else if (target === "opportunity") {
+                patchBase.opportunity_id = null;
+            }
+            else {
+                patchBase.contact_id = null;
+                patchBase.account_id = null;
+                patchBase.opportunity_id = null;
+            }
+            const attempts = [
+                { ...patchBase },
+                (() => {
+                    const p = { ...patchBase };
+                    delete p.opportunity_id;
+                    return p;
+                })(),
+                (() => {
+                    const p = { ...patchBase };
+                    delete p.account_id;
+                    return p;
+                })(),
+                (() => {
+                    const p = { ...patchBase };
+                    delete p.contact_id;
+                    return p;
+                })(),
+            ].filter((p) => Object.keys(p).length > 0);
+            for (const p of attempts) {
+                const r = await supa
+                    .from("calls")
+                    .update(p)
+                    .eq("id", callIdStr)
+                    .eq("user_id", requester)
+                    .select("id")
+                    .maybeSingle();
+                if (!r.error)
+                    break;
+                const msg = String(r.error?.message ?? "").toLowerCase();
+                const isMissingCol = (msg.includes("column") && msg.includes("does not exist")) ||
+                    msg.includes("could not find") ||
+                    msg.includes("unknown column");
+                if (isMissingCol)
+                    continue;
+                break;
+            }
+        }
+        return res.json({ ok: true, call_id: callIdStr, unlinked: target });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+// GET /v1/crm/link?callId=...
+// Returns CRM link info for a call.
+// Notes:
+// - Demo ids like "demo-001" are allowed (returns a stable empty link unless your schema supports text call_ids).
+// - We do NOT depend on crm_call_links.user_id existing.
+// - Related entities (contact/account/opportunity) are always scoped to requester via user_id.
+router.get("/link", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const callId = String(req.query?.callId ?? "").trim();
+        if (!callId) {
+            return res.status(400).json({ ok: false, error: "callId_required" });
+        }
+        const isDemoCallId = /^demo-\d+$/i.test(callId);
+        const isUuidCallId = UUID_RE.test(callId);
+        // If it's not a UUID, the main link table may be UUID-typed.
+        // For demo/virtual calls we persist links in crm_demo_call_links (text call_id).
+        if (!isUuidCallId) {
+            try {
+                const dl = await supa
+                    .from("crm_demo_call_links")
+                    .select("call_id, contact_id, account_id, opportunity_id")
+                    .eq("user_id", requester)
+                    .eq("call_id", callId)
+                    .maybeSingle();
+                if (!dl.error && dl.data) {
+                    const linkRow = {
+                        call_id: dl.data.call_id,
+                        contact_id: dl.data.contact_id,
+                        account_id: dl.data.account_id ?? null,
+                        opportunity_id: dl.data.opportunity_id ?? null,
+                        demo_call: isDemoCallId,
+                        virtual_call: true,
+                    };
+                    let contact = null;
+                    let account = null;
+                    let opportunity = null;
+                    if (linkRow.contact_id) {
+                        const r = await supa
+                            .from("crm_contacts")
+                            .select("id, first_name, last_name, email, company")
+                            .eq("id", linkRow.contact_id)
+                            .eq("user_id", requester)
+                            .maybeSingle();
+                        if (!r.error)
+                            contact = r.data ?? null;
+                    }
+                    if (linkRow.account_id) {
+                        const r = await supa
+                            .from("crm_accounts")
+                            .select("id, name")
+                            .eq("id", linkRow.account_id)
+                            .eq("user_id", requester)
+                            .maybeSingle();
+                        if (!r.error)
+                            account = r.data ?? null;
+                    }
+                    if (linkRow.opportunity_id) {
+                        const r = await supa
+                            .from("crm_opportunities")
+                            .select("id, name, stage")
+                            .eq("id", linkRow.opportunity_id)
+                            .eq("user_id", requester)
+                            .maybeSingle();
+                        if (!r.error)
+                            opportunity = r.data ?? null;
+                    }
+                    return res.json({ ok: true, link: linkRow, contact, account, opportunity });
+                }
+                // If demo table missing, fail-soft and fall through to stable empty response
+                if (dl.error) {
+                    const msg = String(dl.error?.message ?? "").toLowerCase();
+                    if (!(msg.includes("relation") && msg.includes("does not exist"))) {
+                        console.error("[crm/link] demo link fetch failed:", dl.error);
+                    }
+                }
+            }
+            catch {
+                // ignore
+            }
+            return res.json({
+                ok: true,
+                link: isDemoCallId
+                    ? {
+                        call_id: callId,
+                        contact_id: null,
+                        account_id: null,
+                        opportunity_id: null,
+                        demo_call: true,
+                        virtual_call: true,
+                    }
+                    : null,
+                contact: null,
+                account: null,
+                opportunity: null,
+            });
+        }
+        // Find link row (schema-tolerant: do NOT assume user_id/account_id/opportunity_id columns exist)
+        let linkRow = null;
+        try {
+            const r = await supa
+                .from("crm_call_links")
+                .select("*")
+                .eq("call_id", callId)
+                .maybeSingle();
+            if (r.error) {
+                const msg = String(r.error?.message ?? "").toLowerCase();
+                // Missing table => fail-open (stable empty link)
+                if (msg.includes("relation") && msg.includes("does not exist")) {
+                    return res.json({ ok: true, link: null, contact: null, account: null, opportunity: null });
+                }
+                // Any uuid parsing mismatch => treat as not linked
+                if (msg.includes("invalid input") && msg.includes("uuid")) {
+                    return res.json({ ok: true, link: null, contact: null, account: null, opportunity: null });
+                }
+                throw r.error;
+            }
+            linkRow = r.data ?? null;
+        }
+        catch (err) {
+            const msg = String(err?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.json({ ok: true, link: null, contact: null, account: null, opportunity: null });
+            }
+            if (msg.includes("invalid input") && msg.includes("uuid")) {
+                return res.json({ ok: true, link: null, contact: null, account: null, opportunity: null });
+            }
+            throw err;
+        }
+        if (!linkRow) {
+            return res.json({ ok: true, link: null, contact: null, account: null, opportunity: null });
+        }
+        let contact = null;
+        let account = null;
+        let opportunity = null;
+        if (linkRow.contact_id) {
+            const r = await supa
+                .from("crm_contacts")
+                .select("id, first_name, last_name, email, company")
+                .eq("id", linkRow.contact_id)
+                .eq("user_id", requester)
+                .maybeSingle();
+            if (!r.error)
+                contact = r.data ?? null;
+        }
+        // account_id/opportunity_id are optional and may not exist on older link schemas.
+        if (linkRow.account_id) {
+            const r = await supa
+                .from("crm_accounts")
+                .select("id, name")
+                .eq("id", linkRow.account_id)
+                .eq("user_id", requester)
+                .maybeSingle();
+            if (!r.error)
+                account = r.data ?? null;
+        }
+        if (linkRow.opportunity_id) {
+            const r = await supa
+                .from("crm_opportunities")
+                .select("id, name, stage")
+                .eq("id", linkRow.opportunity_id)
+                .eq("user_id", requester)
+                .maybeSingle();
+            if (!r.error)
+                opportunity = r.data ?? null;
+        }
+        return res.json({
+            ok: true,
+            link: linkRow,
+            contact,
+            account,
+            opportunity,
+        });
+    }
+    catch (e) {
+        return res.status(500).json({
+            ok: false,
+            error: e?.message ?? "link_fetch_failed",
+        });
+    }
+});
+/* ---------------------------------------------
+   CONTACT NOTES
+   - Simple rep notes per contact
+---------------------------------------------- */
+const NoteImportanceSchema = z.enum(["normal", "important", "critical"]);
+const CreateNoteSchema = z.object({
+    body: z.string().trim().min(1),
+    // Optional client-provided display name (denormalised). Safe because it’s just text.
+    author_name: z.string().trim().min(1).max(120).optional(),
+    importance: NoteImportanceSchema.optional(),
+});
+/* GET /v1/crm/contacts/:id/notes */
+router.get("/contacts/:id/notes", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const contactId = String(req.params.id ?? "").trim();
+        if (!contactId)
+            return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+        const { data, error } = await supa
+            .from("crm_contact_notes")
+            .select("id, body, created_at, author_id, author_name, importance")
+            .eq("contact_id", contactId)
+            .eq("user_id", requester)
+            .order("created_at", { ascending: false });
+        if (error)
+            throw error;
+        return res.json({ ok: true, notes: data ?? [] });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
+/* POST /v1/crm/contacts/:id/notes
+   Body: { body: string, importance?: 'normal'|'important'|'critical' }
+*/
+router.post("/contacts/:id/notes", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const contactId = String(req.params.id ?? "").trim();
+        if (!contactId)
+            return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+        const parsed = CreateNoteSchema.safeParse(req.body ?? {});
+        if (!parsed.success) {
+            return res.status(400).json({ ok: false, error: "invalid_body" });
+        }
+        const body = parsed.data.body;
+        const importance = parsed.data.importance ?? "normal";
+        // author (server-truth)
+        const authorId = requester;
+        // best-effort rep name lookup (safe if it fails)
+        let authorName = null;
+        try {
+            const { data: rep } = await supa
+                .from("reps")
+                .select("name, full_name, first_name, last_name, email, user_id, id")
+                .or(`user_id.eq.${authorId},id.eq.${authorId}`)
+                .limit(1)
+                .maybeSingle();
+            if (rep) {
+                authorName =
+                    rep.full_name ||
+                        rep.name ||
+                        [rep.first_name, rep.last_name].filter(Boolean).join(" ") ||
+                        rep.email ||
+                        null;
+            }
+        }
+        catch {
+            // ignore lookup errors
+        }
+        // after the rep lookup try/catch
+        authorName = authorName ?? parsed.data.author_name ?? "Rep";
+        const { data, error } = await supa
+            .from("crm_contact_notes")
+            .insert({
+            contact_id: contactId,
+            user_id: requester,
+            body,
+            author_id: authorId,
+            author_name: authorName,
+            importance,
+        })
+            .select("id, body, created_at, author_id, author_name, importance")
+            .single();
+        if (error)
+            throw error;
+        // best-effort: touching contact improves health accuracy; never block note creation
+        try {
+            await touchContactBestEffort({ requester, contactId });
+        }
+        catch {
+            // fail-soft
+        }
+        return res.json({ ok: true, note: data });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    }
+});
+/* ---------------------------------------------
+   CONTACT IMPORT (Bulk Upload v1)
+   POST /v1/crm/contacts/import
+   Body: { rows: [{ email, first_name?, last_name?, company?, phone? }], dry_run?: boolean }
+
+   Notes:
+   - Uses `supa` service-role client.
+   - Best-effort safety: if crm_contacts has UNIQUE(email) globally, we will NOT overwrite a different user’s contact.
+---------------------------------------------- */
+const ImportContactsSchema = z.object({
+    dry_run: z.boolean().optional(),
+    rows: z.array(z.object({
+        email: z.string().email().transform((s) => s.toLowerCase().trim()),
+        first_name: z.string().optional().nullable(),
+        last_name: z.string().optional().nullable(),
+        company: z.string().optional().nullable(),
+    })),
+});
+router.post("/contacts/import", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        // Body: { rows: [{ email, first_name?, last_name?, company? }], dry_run?: boolean }
+        const parsed = ImportContactsSchema.safeParse(req.body ?? {});
+        if (!parsed.success) {
+            return res.status(400).json({ ok: false, error: "invalid_body" });
+        }
+        const { rows, dry_run = false } = parsed.data;
+        // Deduplicate by email (last write wins)
+        const byEmail = new Map();
+        for (const r of rows)
+            byEmail.set(r.email, r);
+        const uniqueRows = [...byEmail.values()];
+        let inserted = 0;
+        let updated = 0;
+        let skipped = 0;
+        const preview = [];
+        const errors = [];
+        for (const r of uniqueRows) {
+            // If table has globally-unique email, ensure we don’t overwrite another user’s record.
+            const { data: existing, error: exErr } = await supa
+                .from("crm_contacts")
+                .select("id, user_id")
+                .eq("email", r.email)
+                .maybeSingle();
+            if (exErr) {
+                skipped++;
+                errors.push({ email: r.email, error: exErr.message });
+                continue;
+            }
+            if (dry_run) {
+                if (!existing)
+                    preview.push({ email: r.email, action: "insert" });
+                else if (existing.user_id === requester)
+                    preview.push({ email: r.email, action: "update" });
+                else
+                    preview.push({ email: r.email, action: "skip_other_user" });
+                continue;
+            }
+            if (!existing) {
+                // Insert brand new row owned by this requester
+                const { error } = await supa.from("crm_contacts").insert({
+                    user_id: requester,
+                    email: r.email,
+                    first_name: r.first_name ?? null,
+                    last_name: r.last_name ?? null,
+                    company: r.company ?? null,
+                });
+                if (error) {
+                    skipped++;
+                    errors.push({ email: r.email, error: error.message });
+                }
+                else {
+                    inserted++;
+                }
+                continue;
+            }
+            // Existing row
+            const existingUserId = existing.user_id ?? null;
+            // If this is a legacy row with NULL user_id, claim it safely for this requester.
+            // (We never overwrite another user's contact.)
+            if (existingUserId === null) {
+                const { error } = await supa
+                    .from("crm_contacts")
+                    .update({
+                    user_id: requester,
+                    first_name: r.first_name ?? null,
+                    last_name: r.last_name ?? null,
+                    company: r.company ?? null,
+                })
+                    .eq("id", existing.id);
+                if (error) {
+                    skipped++;
+                    errors.push({ email: r.email, error: error.message });
+                }
+                else {
+                    updated++;
+                }
+                continue;
+            }
+            // If owned by someone else, skip
+            if (existingUserId !== requester) {
+                skipped++;
+                errors.push({ email: r.email, error: "email_owned_by_other_user" });
+                continue;
+            }
+            // Owned by requester: update fields
+            const { error } = await supa
+                .from("crm_contacts")
+                .update({
+                first_name: r.first_name ?? null,
+                last_name: r.last_name ?? null,
+                company: r.company ?? null,
+            })
+                .eq("id", existing.id)
+                .eq("user_id", requester);
+            if (error) {
+                skipped++;
+                errors.push({ email: r.email, error: error.message });
+            }
+            else {
+                updated++;
+            }
+        }
+        return res.json({
+            ok: true,
+            dry_run,
+            summary: { inserted, updated, skipped },
+            preview: dry_run ? preview : undefined,
+            errors,
+        });
+    }
+    catch (e) {
+        return res.status(500).json({ ok: false, error: e?.message ?? "server_error" });
+    }
+});
+// ------------------- CRM Actions (stable fallback) -------------------
+// Purpose: provide a stable, rep-visible action stream that does NOT depend on the `assignments` schema.
+// If the `crm_actions` table doesn't exist yet, all helpers fail-open.
+// Helper: Safe select for crm_actions (handles missing columns/filters/orders)
+async function selectCrmActionsSafe(args) {
+    const { requester, repId, contactId, status, limit, orderByDue } = args;
+    // Prefer a rich select, but tolerate missing columns.
+    let cols = [
+        "id",
+        "contact_id",
+        "type",
+        "title",
+        "label",
+        "due_at",
+        "created_at",
+        "completed_at",
+        "status",
+        "importance",
+        "source",
+        "meta",
+    ];
+    // Schema-tolerant status filter
+    let statusFilterOn = true;
+    // Build a query factory so we can re-run after stripping columns/filters.
+    const run = async (useRepFilter, selectCols) => {
+        let q = supa.from("crm_actions").select(selectCols.join(", ")).eq("user_id", requester);
+        if (useRepFilter && repId)
+            q = q.eq("rep_id", repId);
+        if (contactId)
+            q = q.eq("contact_id", contactId);
+        // Schema-tolerant status filter
+        if (status && statusFilterOn)
+            q = q.eq("status", status);
+        if (orderByDue) {
+            q = q.order("due_at", { ascending: true });
+        }
+        else {
+            q = q.order("created_at", { ascending: false });
+        }
+        q = q.limit(limit);
+        return await q;
+    };
+    const stripFromMsg = (msg) => {
+        const m1 = msg.match(/column crm_actions\.([a-zA-Z0-9_]+) does not exist/i);
+        if (m1?.[1])
+            return m1[1];
+        const m2 = msg.match(/could not find the '([^']+)' column/i);
+        if (m2?.[1])
+            return m2[1];
+        return null;
+    };
+    // Attempt with rep_id filter first if provided.
+    for (const useRepFilter of [true, false]) {
+        // If no repId, don't bother with rep filter.
+        if (!repId && useRepFilter)
+            continue;
+        let selectCols = [...cols];
+        for (let i = 0; i < 10; i++) {
+            const r = await run(useRepFilter, selectCols);
+            if (!r.error)
+                return { ok: true, data: r.data ?? [], usedRepFilter: useRepFilter, selectCols };
+            const msg = String(r.error?.message ?? "");
+            const lower = msg.toLowerCase();
+            // If status column is missing, disable status filter AND remove it from select list, then retry.
+            // (Otherwise we'll keep failing if the SELECT includes `status`.)
+            if ((lower.includes("crm_actions.status") || (lower.includes("status") && (lower.includes("column") || lower.includes("could not find")))) &&
+                (lower.includes("does not exist") || lower.includes("could not find"))) {
+                statusFilterOn = false;
+                if (selectCols.includes("status"))
+                    selectCols = selectCols.filter((c) => c !== "status");
+                continue;
+            }
+            // Table missing → fail fast.
+            if (lower.includes("relation") && lower.includes("does not exist")) {
+                return { ok: false, error: r.error };
+            }
+            // If the rep_id filter is the problem, fall through to the no-rep-filter pass.
+            if (useRepFilter && (lower.includes("rep_id") && (lower.includes("does not exist") || lower.includes("could not find")))) {
+                break;
+            }
+            // If ORDER BY due_at / created_at is failing, strip that column and retry.
+            if ((lower.includes("due_at") || lower.includes("created_at")) && lower.includes("does not exist")) {
+                const bad = stripFromMsg(msg);
+                if (bad) {
+                    selectCols = selectCols.filter((c) => c !== bad);
+                    // If ordering by the missing col, switch to created_at (or no order if both missing).
+                    // We'll naturally retry; if created_at also missing, we'll eventually strip it too.
+                    continue;
+                }
+            }
+            const badCol = stripFromMsg(msg);
+            if (badCol && selectCols.includes(badCol)) {
+                selectCols = selectCols.filter((c) => c !== badCol);
+                continue;
+            }
+            // Unknown error → stop.
+            return { ok: false, error: r.error };
+        }
+    }
+    return { ok: false, error: new Error("crm_actions_select_failed") };
+}
+async function insertCrmActionBestEffort(args) {
+    const { requester, repId, contactId, type, title, due_at, importance, meta } = args;
+    // Best-effort: if table/columns don't exist, do not block.
+    // We also try to be compatible with older schemas by:
+    // - including rep_id/manager_id when present
+    // - stripping missing columns iteratively (not just once)
+    // - falling back to a minimal payload if constraints bite
+    try {
+        const base = {
+            user_id: requester,
+            rep_id: repId ?? requester,
+            manager_id: requester,
+            contact_id: contactId,
+            type,
+            title,
+            due_at,
+            importance,
+            status: "open",
+            source: "health_auto_assign_v1",
+            meta: meta ?? {},
+        };
+        const candidates = [
+            { ...base },
+            // Some schemas use `label` instead of `title`
+            { ...base, label: title },
+            // Some schemas don't have meta/source/status
+            {
+                user_id: requester,
+                rep_id: repId ?? requester,
+                manager_id: requester,
+                contact_id: contactId,
+                type,
+                title,
+                due_at,
+                importance,
+            },
+            // Ultra-minimal but still satisfies NOT NULL type
+            { user_id: requester, contact_id: contactId, type, title },
+            { user_id: requester, contact_id: contactId, type, label: title },
+        ];
+        let lastErr = null;
+        for (const seed of candidates) {
+            let payload = { ...seed };
+            // Up to 6 retries where we progressively strip missing columns.
+            for (let i = 0; i < 6; i++) {
+                const { error } = await supa.from("crm_actions").insert(payload);
+                if (!error)
+                    return { ok: true };
+                lastErr = error;
+                const msg = String(error?.message ?? "").toLowerCase();
+                // Table missing -> bail immediately
+                if (msg.includes("relation") && msg.includes("does not exist")) {
+                    return { ok: false, error };
+                }
+                // Schema cache missing column: strip it and retry
+                const m = msg.match(/could not find the '([^']+)' column/);
+                const missingCol = m?.[1];
+                if (missingCol && missingCol in payload) {
+                    // If title missing, try label (and vice versa) before dropping
+                    if (missingCol === "title" && payload.label == null)
+                        payload.label = title;
+                    if (missingCol === "label" && payload.title == null)
+                        payload.title = title;
+                    delete payload[missingCol];
+                    continue;
+                }
+                // PostgREST column missing variant
+                if (msg.includes("column") && msg.includes("does not exist")) {
+                    // Strip common optional fields
+                    delete payload.rep_id;
+                    delete payload.manager_id;
+                    delete payload.status;
+                    delete payload.source;
+                    delete payload.meta;
+                    delete payload.importance;
+                    // Keep the essentials
+                    payload.user_id = requester;
+                    payload.contact_id = contactId;
+                    payload.type = type;
+                    payload.title = payload.title ?? title;
+                    continue;
+                }
+                // Not-null constraint errors: populate required fields and/or drop to minimal
+                if (msg.includes("violates not-null constraint")) {
+                    if (msg.includes("rep_id"))
+                        payload.rep_id = requester;
+                    if (msg.includes("manager_id"))
+                        payload.manager_id = requester;
+                    if (msg.includes("contact_id"))
+                        payload.contact_id = contactId;
+                    if (msg.includes("user_id"))
+                        payload.user_id = requester;
+                    if (msg.includes("type"))
+                        payload.type = payload.type ?? type;
+                    // If still failing, drop to minimal essentials (including type)
+                    if (i >= 2) {
+                        payload = { user_id: requester, contact_id: contactId, type, title };
+                    }
+                    continue;
+                }
+                // Any other error: stop retrying this seed payload.
+                break;
+            }
+        }
+        return { ok: false, error: lastErr };
+    }
+    catch (e) {
+        return { ok: false, error: e };
+    }
+}
+async function fetchCrmActionsBestEffort(args) {
+    const { requester, contactId, limit } = args;
+    try {
+        const r = await selectCrmActionsSafe({
+            requester,
+            contactId,
+            status: null,
+            repId: null,
+            limit,
+            orderByDue: false,
+        });
+        if (!r.ok)
+            return { ok: false, open: [], completed: [], error: r.error };
+        const rows = (r.data ?? []).map((row) => {
+            const title = row.title ?? row.label ?? null;
+            const completedAt = row.completed_at ?? null;
+            const status = row.status ?? null;
+            return {
+                id: row.id,
+                type: row.type ?? row.source ?? "crm_action",
+                title,
+                due_at: row.due_at ?? null,
+                completed_at: completedAt,
+                created_at: row.created_at ?? null,
+                importance: row.importance ?? null,
+                meta: row.meta ?? null,
+                status,
+            };
+        });
+        // (fetchContactActivityBestEffort moved to top-level scope)
+        const open = rows.filter((x) => !x.completed_at && String(x.status ?? "open").toLowerCase() !== "done");
+        const completed = rows.filter((x) => !!x.completed_at || String(x.status ?? "").toLowerCase() === "done");
+        return { ok: true, open, completed };
+    }
+    catch (e) {
+        return { ok: false, open: [], completed: [], error: e };
+    }
+}
+// ----------------------------------------------------------------
+// Contact Activity (Timeline Feed)
+// Best-effort merge: notes + crm_actions + calls
+// ----------------------------------------------------------------
+async function fetchContactActivityBestEffort(args) {
+    const { requester, contactId, limit } = args;
+    const items = [];
+    // ---- NOTES ----
+    try {
+        const { data } = await supa
+            .from("crm_contact_notes")
+            .select("id, body, created_at, importance, author_name")
+            .eq("user_id", requester)
+            .eq("contact_id", contactId)
+            .order("created_at", { ascending: false })
+            .limit(limit);
+        for (const n of data ?? []) {
+            items.push({
+                id: `note_${n.id}`,
+                type: "note",
+                created_at: n.created_at,
+                title: n.body?.slice(0, 120) ?? "Note",
+                importance: n.importance ?? "normal",
+                meta: {
+                    author: n.author_name ?? null,
+                },
+            });
+        }
+    }
+    catch {
+        // fail-soft
+    }
+    // ---- ACTIONS ----
+    try {
+        const r = await fetchCrmActionsBestEffort({ requester, contactId, limit });
+        if (r.ok) {
+            const all = [...(r.open ?? []), ...(r.completed ?? [])];
+            for (const a of all) {
+                items.push({
+                    id: `action_${a.id}`,
+                    type: "action",
+                    created_at: a.created_at ?? a.due_at ?? null,
+                    title: a.title ?? "CRM Action",
+                    importance: a.importance ?? null,
+                    meta: {
+                        completed: !!a.completed_at,
+                        due_at: a.due_at ?? null,
+                    },
+                });
+            }
+        }
+    }
+    catch {
+        // fail-soft
+    }
+    // ---- CALLS ----
+    try {
+        const { data: links } = await supa
+            .from("crm_call_links")
+            .select("call_id")
+            .eq("contact_id", contactId)
+            .limit(limit);
+        const callIds = (links ?? []).map((l) => l.call_id).filter(Boolean);
+        if (callIds.length) {
+            const { data: calls } = await supa
+                .from("calls")
+                .select("id, created_at, summary, duration_ms")
+                .eq("user_id", requester)
+                .in("id", callIds)
+                .order("created_at", { ascending: false })
+                .limit(limit);
+            for (const c of calls ?? []) {
+                items.push({
+                    id: `call_${c.id}`,
+                    type: "call",
+                    created_at: c.created_at,
+                    title: c.summary ?? "Sales Call",
+                    importance: null,
+                    meta: {
+                        duration_ms: c.duration_ms ?? null,
+                    },
+                });
+            }
+        }
+    }
+    catch {
+        // fail-soft
+    }
+    // ---- SORT newest first ----
+    items.sort((a, b) => {
+        const ta = new Date(a.created_at ?? 0).getTime();
+        const tb = new Date(b.created_at ?? 0).getTime();
+        return tb - ta;
+    });
+    return items.slice(0, limit);
+}
+// GET /v1/crm/actions/today
+// Rep home: stable actions list (does NOT depend on crm_actions.rep_id existing)
+router.get("/actions/today", async (req, res) => {
+    {
+        try {
+            const requester = getUserIdHeader(req);
+            const repIdRaw = String(req.query.repId ?? "").trim();
+            const repId = repIdRaw || requester;
+            const limit = Math.min(Math.max(Number(req.query.limit ?? 10), 1), 25);
+            const r = await selectCrmActionsSafe({
+                requester,
+                repId,
+                status: "open",
+                limit,
+                orderByDue: true,
+            });
+            if (!r.ok) {
+                const err = r.error;
+                const msg = String(err?.message ?? err ?? "actions_today_failed");
+                console.error("[crm/actions/today]", msg);
+                return res.status(500).json({ ok: false, error: msg });
+            }
+            return res.json({
+                ok: true,
+                items: r.data ?? [],
+                source: r.usedRepFilter ? "crm_actions_rep_id" : "crm_actions_user_only",
+                select_cols: r.selectCols,
+            });
+        }
+        catch (err) {
+            // getUserIdHeader throws when x-user-id is absent or malformed — surface as 401 not 500.
+            if (err?.message === "Missing or invalid x-user-id") {
+                return res.status(401).json({ ok: false, error: "missing_user" });
+            }
+            console.error("[crm/actions/today]", err);
+            return res.status(500).json({ ok: false, error: err.message || "actions_today_failed" });
+        }
+    }
+});
+// GET /v1/crm/actions
+// Stable actions list for manager/rep filtering screens.
+// Supports best-effort repId + status filtering without requiring crm_actions.status to exist.
+router.get("/actions", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const repIdRaw = String(req.query.repId ?? req.query.rep_id ?? "").trim();
+        const repId = repIdRaw || null;
+        const statusRaw = String(req.query.status ?? "").trim().toLowerCase();
+        const status = statusRaw || null; // open | completed | overdue | (null)
+        const limit = Math.min(Math.max(Number(req.query.limit ?? 200), 1), 500);
+        // Pull a broad set (best-effort, schema tolerant) then filter in-process.
+        const r = await selectCrmActionsSafe({
+            requester,
+            repId,
+            contactId: null,
+            status: null,
+            limit,
+            orderByDue: true,
+        });
+        if (!r.ok) {
+            const err = r.error;
+            const msg = String(err?.message ?? err ?? "actions_list_failed");
+            const lower = msg.toLowerCase();
+            // Missing table => return empty list (fail-open for UI)
+            if (lower.includes("relation") && lower.includes("does not exist")) {
+                return res.json({ ok: true, actions: [], source: "missing_table" });
+            }
+            console.error("[crm/actions]", msg);
+            return res.status(500).json({ ok: false, error: msg });
+        }
+        const now = Date.now();
+        const shaped = (r.data ?? []).map((row) => {
+            const title = row.title ?? row.label ?? null;
+            const completedAt = row.completed_at ?? null;
+            const dueAt = row.due_at ?? null;
+            const dueMs = dueAt ? new Date(String(dueAt)).getTime() : NaN;
+            const isOverdue = !completedAt && Number.isFinite(dueMs) ? dueMs < now : false;
+            return {
+                id: row.id,
+                contact_id: row.contact_id ?? null,
+                rep_id: row.rep_id ?? null,
+                type: row.type ?? row.source ?? "crm_action",
+                title,
+                due_at: dueAt,
+                created_at: row.created_at ?? null,
+                completed_at: completedAt,
+                importance: row.importance ?? null,
+                status: row.status ?? null,
+                meta: row.meta ?? null,
+                is_overdue: isOverdue,
+            };
+        });
+        const filtered = (() => {
+            if (status === "completed")
+                return shaped.filter((x) => !!x.completed_at);
+            if (status === "overdue")
+                return shaped.filter((x) => x.is_overdue === true);
+            if (status === "open")
+                return shaped.filter((x) => !x.completed_at);
+            return shaped;
+        })();
+        return res.json({
+            ok: true,
+            actions: filtered,
+            source: r.usedRepFilter ? "crm_actions_rep_id" : "crm_actions_user_only",
+            select_cols: r.selectCols,
+        });
+    }
+    catch (err) {
+        console.error("[crm/actions]", err);
+        return res.status(500).json({ ok: false, error: err.message || "actions_list_failed" });
+    }
+});
+// POST /v1/crm/actions
+// Create a CRM action (manager/rep use). Schema-tolerant insert.
+// Body: { contact_id, type?, title?, due_at?, importance?, meta?, rep_id? }
+router.post("/actions", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const body = (req.body ?? {});
+        const contactIdRaw = String(body.contact_id ?? body.contactId ?? "").trim();
+        if (!contactIdRaw) {
+            return res.status(400).json({ ok: false, error: "contact_id_required" });
+        }
+        const type = String(body.type ?? "follow_up").trim() || "follow_up";
+        const title = String(body.title ?? "Follow up").trim() || "Follow up";
+        const dueAt = body.due_at ?? body.dueAt ?? null;
+        const importance = String(body.importance ?? "normal").trim() || "normal";
+        const meta = body.meta ?? { source: "manager_contacts_table" };
+        // Optional: allow passing rep_id (future manager flows). Default to requester.
+        const repId = String(body.rep_id ?? body.repId ?? requester).trim() || requester;
+        // We’ll try a “full” insert first, then retry if optional columns don’t exist.
+        // IMPORTANT:
+        // - user_id is ALWAYS the owner (requester)
+        // - rep_id is the assignee (may equal requester)
+        const basePayload = {
+            user_id: requester, // OWNER (always requester)
+            rep_id: repId, // ASSIGNEE
+            contact_id: contactIdRaw,
+            type,
+            title,
+            due_at: dueAt,
+            importance,
+            meta,
+            status: "open",
+            source: "manager_inline_create_v1",
+        };
+        const tryInsert = async (payload) => {
+            return await supa.from("crm_actions").insert(payload).select("*").single();
+        };
+        // Retry ladder for schema tolerance (missing columns)
+        const attempts = [
+            // Full payload
+            { ...basePayload },
+            // Strip optional columns progressively
+            (() => {
+                const p = { ...basePayload };
+                delete p.status;
+                return p;
+            })(),
+            (() => {
+                const p = { ...basePayload };
+                delete p.importance;
+                return p;
+            })(),
+            (() => {
+                const p = { ...basePayload };
+                delete p.meta;
+                return p;
+            })(),
+            (() => {
+                const p = { ...basePayload };
+                delete p.source;
+                return p;
+            })(),
+            (() => {
+                const p = { ...basePayload };
+                delete p.due_at;
+                return p;
+            })(),
+            // Minimal but still correctly owned
+            {
+                user_id: requester, // NEVER repId (owner must stay requester)
+                rep_id: repId,
+                contact_id: contactIdRaw,
+                type,
+                title,
+            },
+            // Absolute minimum fallback
+            {
+                user_id: requester,
+                contact_id: contactIdRaw,
+                type,
+                title,
+            },
+        ];
+        let lastErr = null;
+        for (const payload of attempts) {
+            const r = await tryInsert(payload);
+            if (!r.error) {
+                // best-effort: creating an action indicates contact engagement
+                try {
+                    await touchContactBestEffort({ requester, contactId: contactIdRaw });
+                }
+                catch {
+                    // fail-soft
+                }
+                return res.json({ ok: true, action: r.data });
+            }
+            lastErr = r.error;
+            const msg = String(r.error?.message ?? "").toLowerCase();
+            // Missing table should be loud (not silent), because manager ops depend on it
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                console.error("[crm/actions/create] missing_table", r.error);
+                return res.status(500).json({ ok: false, error: "crm_actions_table_missing" });
+            }
+            // If it’s a missing column error, continue trying next payload
+            if (msg.includes("column") && msg.includes("does not exist")) {
+                continue;
+            }
+            // Otherwise stop retrying
+            break;
+        }
+        return res.status(500).json({
+            ok: false,
+            error: lastErr?.message ?? "action_create_failed",
+        });
+    }
+    catch (err) {
+        return res.status(500).json({
+            ok: false,
+            error: err.message || "action_create_failed",
+        });
+    }
+});
+/* ---------------------------------------------
+   OPPORTUNITIES (Pipeline / Kanban v1)
+   - Minimal endpoints to power Day 50
+---------------------------------------------- */
+const StageSchema = z.object({
+    stage: z.string().trim().min(1),
+});
+// Best-effort select helper (schema tolerant) for crm_opportunities
+async function selectCrmOpportunitiesSafe(args) {
+    const { requester, stage, limit } = args;
+    const candidateSelects = [
+        "id, name, stage, amount, close_date, account_id, contact_id, created_at, updated_at",
+        "id, name, stage, amount, close_date, account_id, contact_id, created_at",
+        "id, name, stage, amount, close_date, account_id, contact_id",
+        "id, name, stage, account_id, contact_id",
+        "id, name, stage",
+        "id, stage",
+        "id",
+    ];
+    for (const sel of candidateSelects) {
+        const q = supa
+            .from("crm_opportunities")
+            .select(sel)
+            .eq("user_id", requester)
+            .order("created_at", { ascending: false })
+            .limit(limit);
+        const r = stage ? await q.eq("stage", stage) : await q;
+        if (!r.error) {
+            return { ok: true, rows: r.data ?? [], select: sel };
+        }
+        const msg = String(r.error?.message ?? "").toLowerCase();
+        // Table missing: hard fail (pipeline depends on this table)
+        if (msg.includes("relation") && msg.includes("does not exist")) {
+            return { ok: false, error: r.error };
+        }
+        // Missing column: try the next select candidate
+        if (msg.includes("column") && msg.includes("does not exist")) {
+            continue;
+        }
+        // Unknown error: stop
+        return { ok: false, error: r.error };
+    }
+    return { ok: false, error: new Error("crm_opportunities_select_failed") };
+}
+/* ---------------------------------------------
+   POST /v1/crm/opportunities
+   Body:
+     - name | title (string) [required]
+     - stage (string) [optional, default "new"]
+     - amount | value (number) [optional]
+     - currency (string) [optional]
+     - account_name | accountName (string) [optional]
+     - contact_email | contactEmail | email (string) [optional]
+
+   Behaviour (MVP):
+     - Inserts into crm_opportunities (schema tolerant)
+     - Scoped to requester (user_id=requester)
+---------------------------------------------- */
+const CreateOpportunitySchema = z.object({
+    name: z.string().trim().min(1).optional(),
+    title: z.string().trim().min(1).optional(),
+    stage: z.string().trim().min(1).optional(),
+    amount: z.number().finite().nonnegative().optional().nullable(),
+    value: z.number().finite().nonnegative().optional().nullable(),
+    currency: z.string().trim().min(1).max(12).optional().nullable(),
+    account_name: z.string().trim().min(1).max(180).optional().nullable(),
+    accountName: z.string().trim().min(1).max(180).optional().nullable(),
+    contact_email: z.string().email().transform((s) => s.toLowerCase().trim()).optional().nullable(),
+    contactEmail: z.string().email().transform((s) => s.toLowerCase().trim()).optional().nullable(),
+    email: z.string().email().transform((s) => s.toLowerCase().trim()).optional().nullable(),
+});
+router.post("/opportunities", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const body = CreateOpportunitySchema.parse(req.body ?? {});
+        const name = String(body.name ?? body.title ?? "").trim();
+        if (!name)
+            return res.status(400).json({ ok: false, error: "name_required" });
+        const stage = String(body.stage ?? "new").trim() || "new";
+        const accountName = String(body.account_name ?? body.accountName ?? "").trim() || null;
+        const contactEmail = (body.contact_email ?? body.contactEmail ?? body.email) ?? null;
+        const amount = (body.amount ?? body.value ?? null);
+        const currency = String(body.currency ?? "").trim() || null;
+        // --------------------------------------------
+        // AUTO-CREATE / LINK CONTACT + ACCOUNT (optional)
+        // --------------------------------------------
+        let contactId = null;
+        let accountId = null;
+        // 1) Resolve or create contact by email
+        if (contactEmail) {
+            const existingContact = await supa
+                .from("crm_contacts")
+                .select("id, user_id")
+                .eq("user_id", requester)
+                .eq("email", contactEmail)
+                .maybeSingle();
+            if (existingContact.error) {
+                const msg = String(existingContact.error?.message ?? "").toLowerCase();
+                if (msg.includes("relation") && msg.includes("does not exist")) {
+                    return res.status(500).json({ ok: false, error: "crm_contacts_table_missing" });
+                }
+                return res.status(500).json({ ok: false, error: "contact_lookup_failed" });
+            }
+            if (existingContact.data) {
+                contactId = String(existingContact.data.id);
+            }
+            else {
+                const ins = await supa
+                    .from("crm_contacts")
+                    .insert({
+                    user_id: requester,
+                    email: contactEmail,
+                })
+                    .select("id")
+                    .maybeSingle();
+                if (ins.error) {
+                    return res.status(500).json({
+                        ok: false,
+                        error: ins.error?.message ?? "contact_create_failed",
+                    });
+                }
+                contactId = String(ins.data.id);
+            }
+        }
+        // 2) Resolve or create account by name
+        if (accountName) {
+            const existingAccount = await supa
+                .from("crm_accounts")
+                .select("id, user_id")
+                .eq("user_id", requester)
+                .eq("name", accountName)
+                .maybeSingle();
+            if (existingAccount.error) {
+                const msg = String(existingAccount.error?.message ?? "").toLowerCase();
+                if (msg.includes("relation") && msg.includes("does not exist")) {
+                    return res.status(500).json({ ok: false, error: "crm_accounts_table_missing" });
+                }
+                return res.status(500).json({ ok: false, error: "account_lookup_failed" });
+            }
+            if (existingAccount.data) {
+                accountId = String(existingAccount.data.id);
+            }
+            else {
+                const ins = await supa
+                    .from("crm_accounts")
+                    .insert({
+                    user_id: requester,
+                    name: accountName,
+                })
+                    .select("id")
+                    .maybeSingle();
+                if (ins.error) {
+                    return res.status(500).json({
+                        ok: false,
+                        error: ins.error?.message ?? "account_create_failed",
+                    });
+                }
+                accountId = String(ins.data.id);
+            }
+        }
+        // Insert (schema tolerant: try richer payload then fall back if cols missing)
+        const payloadBase = {
+            user_id: requester,
+            name,
+            title: name,
+            stage,
+            ...(amount !== null ? { amount, value: amount } : {}),
+            ...(currency ? { currency } : {}),
+            ...(accountId ? { account_id: accountId } : {}),
+            ...(contactId ? { contact_id: contactId } : {}),
+            ...(accountName ? { account_name: accountName } : {}),
+            ...(contactEmail ? { contact_email: contactEmail } : {}),
+        };
+        const attempts = [
+            { ...payloadBase },
+            (() => {
+                const p = { ...payloadBase };
+                delete p.value;
+                return p;
+            })(),
+            (() => {
+                const p = { ...payloadBase };
+                delete p.amount;
+                delete p.value;
+                return p;
+            })(),
+            (() => {
+                const p = { ...payloadBase };
+                delete p.account_name;
+                return p;
+            })(),
+            (() => {
+                const p = { ...payloadBase };
+                delete p.contact_email;
+                return p;
+            })(),
+            { user_id: requester, name, title: name, stage },
+        ];
+        let created = null;
+        let lastErr = null;
+        for (const p of attempts) {
+            const ins = await supa.from("crm_opportunities").insert(p).select("*").maybeSingle();
+            if (!ins.error) {
+                created = ins.data;
+                break;
+            }
+            lastErr = ins.error;
+            const msg = String(ins.error?.message ?? "").toLowerCase();
+            // loud if table missing
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+            }
+            const isMissingCol = (msg.includes("column") && msg.includes("does not exist")) ||
+                msg.includes("could not find") ||
+                msg.includes("unknown column");
+            if (isMissingCol)
+                continue;
+            // otherwise stop retrying and return error
+            break;
+        }
+        if (!created) {
+            return res.status(500).json({
+                ok: false,
+                error: lastErr?.message ?? "opportunity_create_failed",
+            });
+        }
+        return res.json({ ok: true, opportunity: created });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+// GET /v1/crm/opportunities/pipeline
+// Returns opportunities grouped by stage (kanban-ready)
+router.get("/opportunities/pipeline", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const limit = Math.min(Math.max(Number(req.query?.limit ?? 500), 1), 2000);
+        const stage = String(req.query?.stage ?? "").trim() || null;
+        const r = await selectCrmOpportunitiesSafe({ requester, stage, limit });
+        if (!r.ok) {
+            const msg = String(r.error?.message ?? r.error ?? "pipeline_fetch_failed");
+            return res.status(500).json({ ok: false, error: msg });
+        }
+        const rows = (r.rows ?? []).map((o) => ({
+            id: o.id,
+            name: o.name ?? null,
+            stage: o.stage ?? null,
+            amount: o.amount ?? null,
+            close_date: o.close_date ?? null,
+            account_id: o.account_id ?? null,
+            contact_id: o.contact_id ?? null,
+            created_at: o.created_at ?? null,
+            updated_at: o.updated_at ?? null,
+        }));
+        const byStage = {};
+        for (const o of rows) {
+            const s = String(o.stage ?? "Unstaged").trim() || "Unstaged";
+            (byStage[s] ||= []).push(o);
+        }
+        // Deterministic column order (alpha), but keep common stages first if present
+        const preferred = ["Lead", "Qualified", "Proposal", "Negotiation", "Won", "Lost"];
+        const stageSet = new Set(Object.keys(byStage));
+        const orderedStages = [
+            ...preferred.filter((s) => stageSet.has(s)),
+            ...[...stageSet].filter((s) => !preferred.includes(s)).sort((a, b) => a.localeCompare(b)),
+        ];
+        return res.json({
+            ok: true,
+            stages: orderedStages,
+            by_stage: byStage,
+            opportunities: rows,
+            meta: { select: r.select, limit, stage },
+        });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+// GET /v1/crm/opportunities/stages
+// Returns distinct stage values for the requester.
+router.get("/opportunities/stages", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        // Best-effort: select just stage; tolerate schemas without created_at
+        const r = await supa
+            .from("crm_opportunities")
+            .select("stage")
+            .eq("user_id", requester)
+            .limit(2000);
+        if (r.error) {
+            const msg = String(r.error?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+            }
+            // fail-open with defaults
+            return res.json({
+                ok: true,
+                stages: ["Lead", "Qualified", "Proposal", "Negotiation", "Won", "Lost"],
+                source: "defaults",
+            });
+        }
+        const stages = Array.from(new Set((r.data ?? [])
+            .map((x) => String(x?.stage ?? "").trim())
+            .filter(Boolean))).sort((a, b) => a.localeCompare(b));
+        const out = stages.length
+            ? stages
+            : ["Lead", "Qualified", "Proposal", "Negotiation", "Won", "Lost"];
+        return res.json({ ok: true, stages: out, source: stages.length ? "db" : "defaults" });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+// PATCH /v1/crm/opportunities/:id/stage
+// Body: { stage: string }
+router.patch("/opportunities/:id/stage", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const id = String(req.params?.id ?? "").trim();
+        if (!id)
+            return res.status(400).json({ ok: false, error: "opportunity_id_required" });
+        const body = StageSchema.parse(req.body ?? {});
+        // Best-effort: update stage (and updated_at if present)
+        const candidates = [
+            { stage: body.stage, updated_at: new Date().toISOString() },
+            { stage: body.stage },
+        ];
+        let lastErr = null;
+        for (const payload of candidates) {
+            const r = await supa
+                .from("crm_opportunities")
+                .update(payload)
+                .eq("id", id)
+                .eq("user_id", requester)
+                .select("id, name, stage")
+                .maybeSingle();
+            if (!r.error) {
+                if (!r.data)
+                    return res.status(404).json({ ok: false, error: "not_found" });
+                return res.json({ ok: true, opportunity: r.data });
+            }
+            lastErr = r.error;
+            const msg = String(r.error?.message ?? "").toLowerCase();
+            // Missing column updated_at -> try next payload
+            if (msg.includes("column") && msg.includes("updated_at") && msg.includes("does not exist")) {
+                continue;
+            }
+            // Missing table
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+            }
+            break;
+        }
+        return res.status(500).json({ ok: false, error: lastErr?.message ?? "stage_update_failed" });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+/* ---------------------------------------------
+   GET /v1/crm/opportunities/:id
+   Query:
+     - scope=mine|team (default mine)
+
+   Behaviour:
+     - mine (default): requester can fetch only their own opportunities
+     - team: manager-only, can fetch an opp owned by a rep in the same org
+
+   Returns minimal fields for the Opportunity Drawer.
+---------------------------------------------- */
+router.get("/opportunities/:id", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const id = String(req.params?.id ?? "").trim();
+        if (!id || !UUID_RE.test(id))
+            return res.status(400).json({ ok: false, error: "invalid_id" });
+        const scopeRaw = String(req.query?.scope ?? "mine").trim().toLowerCase();
+        const scope = scopeRaw === "team" ? "team" : "mine";
+        const selectCols = "id,user_id,org_id,name,title,stage,amount,value,currency,close_date,account_id,contact_id,account_name,contact_email,created_at,updated_at";
+        if (scope === "mine") {
+            const { data, error } = await supa
+                .from("crm_opportunities")
+                .select(selectCols)
+                .eq("id", id)
+                .eq("user_id", requester)
+                .maybeSingle();
+            if (error)
+                throw error;
+            if (!data)
+                return res.status(404).json({ ok: false, error: "not_found" });
+            return res.json({
+                ok: true,
+                opportunity: {
+                    id: data.id,
+                    name: data.name ?? data.title ?? null,
+                    stage: data.stage ?? null,
+                    amount: data.amount ?? data.value ?? null,
+                    currency: data.currency ?? null,
+                    close_date: data.close_date ?? null,
+                    account_id: data.account_id ?? null,
+                    contact_id: data.contact_id ?? null,
+                    account_name: data.account_name ?? null,
+                    contact_email: data.contact_email ?? null,
+                    created_at: data.created_at ?? null,
+                    updated_at: data.updated_at ?? null,
+                },
+            });
+        }
+        // team scope => manager-only + org guard
+        const mgr = await requireManagerOrg(req);
+        const orgId = String(mgr?.orgId ?? "").trim();
+        const { data, error } = await supa.from("crm_opportunities").select(selectCols).eq("id", id).maybeSingle();
+        if (error)
+            throw error;
+        if (!data)
+            return res.status(404).json({ ok: false, error: "not_found" });
+        const oppOrgId = String(data.org_id ?? "").trim();
+        const ownerId = String(data.user_id ?? "").trim();
+        // Validate owner is in org. Prefer explicit opp.org_id; otherwise validate via reps table.
+        if (orgId) {
+            if (oppOrgId) {
+                if (oppOrgId !== orgId)
+                    return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+            }
+            else if (ownerId) {
+                const { data: repRow, error: repErr } = await supa.from("reps").select("id,org_id").eq("id", ownerId).maybeSingle();
+                if (repErr)
+                    throw repErr;
+                const repOrg = String(repRow?.org_id ?? "").trim();
+                if (!repOrg || repOrg !== orgId)
+                    return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+            }
+        }
+        return res.json({
+            ok: true,
+            opportunity: {
+                id: data.id,
+                name: data.name ?? data.title ?? null,
+                stage: data.stage ?? null,
+                amount: data.amount ?? data.value ?? null,
+                currency: data.currency ?? null,
+                close_date: data.close_date ?? null,
+                account_id: data.account_id ?? null,
+                contact_id: data.contact_id ?? null,
+                account_name: data.account_name ?? null,
+                contact_email: data.contact_email ?? null,
+                created_at: data.created_at ?? null,
+                updated_at: data.updated_at ?? null,
+            },
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "");
+        if (msg === "forbidden_org_scope")
+            return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+        if (msg === "forbidden_not_manager")
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        return res.status(500).json({ ok: false, error: e?.message ?? "opportunity_fetch_failed" });
+    }
+});
+/* ---------------------------------------------
+   PATCH /v1/crm/opportunities/:id
+   Query:
+     - scope=mine|team (default mine)
+
+   Allows editing v1:
+     - name, stage, amount, currency, close_date
+---------------------------------------------- */
+const PatchOpportunitySchema = z.object({
+    name: z.string().trim().min(1).max(200).optional(),
+    stage: z.string().trim().min(1).max(80).optional(),
+    amount: z.number().finite().nonnegative().optional(),
+    currency: z.string().trim().min(1).max(8).optional(),
+    close_date: z.string().trim().min(1).nullable().optional(),
+});
+router.patch("/opportunities/:id", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const id = String(req.params?.id ?? "").trim();
+        if (!id || !UUID_RE.test(id))
+            return res.status(400).json({ ok: false, error: "invalid_id" });
+        const scopeRaw = String(req.query?.scope ?? "mine").trim().toLowerCase();
+        const scope = scopeRaw === "team" ? "team" : "mine";
+        const body = PatchOpportunitySchema.parse(req.body ?? {});
+        const patch = {};
+        if (typeof body.name === "string") {
+            patch.name = body.name;
+            patch.title = body.name; // keep compat
+        }
+        if (typeof body.stage === "string")
+            patch.stage = body.stage;
+        if (typeof body.amount === "number") {
+            patch.amount = body.amount;
+            patch.value = body.amount;
+        }
+        if (typeof body.currency === "string")
+            patch.currency = body.currency;
+        if (body.close_date === null)
+            patch.close_date = null;
+        if (typeof body.close_date === "string")
+            patch.close_date = body.close_date;
+        if (Object.keys(patch).length === 0) {
+            return res.status(400).json({ ok: false, error: "no_changes" });
+        }
+        const selectCols = "id,user_id,org_id,name,title,stage,amount,value,currency,close_date,account_id,contact_id,account_name,contact_email,created_at,updated_at";
+        if (scope === "mine") {
+            const { data, error } = await supa
+                .from("crm_opportunities")
+                .update(patch)
+                .eq("id", id)
+                .eq("user_id", requester)
+                .select(selectCols)
+                .maybeSingle();
+            if (error)
+                throw error;
+            if (!data)
+                return res.status(404).json({ ok: false, error: "not_found" });
+            return res.json({
+                ok: true,
+                opportunity: {
+                    id: data.id,
+                    name: data.name ?? data.title ?? null,
+                    stage: data.stage ?? null,
+                    amount: data.amount ?? data.value ?? null,
+                    currency: data.currency ?? null,
+                    close_date: data.close_date ?? null,
+                    account_id: data.account_id ?? null,
+                    contact_id: data.contact_id ?? null,
+                    account_name: data.account_name ?? null,
+                    contact_email: data.contact_email ?? null,
+                    created_at: data.created_at ?? null,
+                    updated_at: data.updated_at ?? null,
+                },
+            });
+        }
+        // team scope => manager-only + org guard
+        const mgr = await requireManagerOrg(req);
+        const orgId = String(mgr?.orgId ?? "").trim();
+        // validate opp belongs to org
+        const { data: existing, error: exErr } = await supa.from("crm_opportunities").select("id,user_id,org_id").eq("id", id).maybeSingle();
+        if (exErr)
+            throw exErr;
+        if (!existing)
+            return res.status(404).json({ ok: false, error: "not_found" });
+        const oppOrgId = String(existing.org_id ?? "").trim();
+        const ownerId = String(existing.user_id ?? "").trim();
+        if (orgId) {
+            if (oppOrgId) {
+                if (oppOrgId !== orgId)
+                    return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+            }
+            else if (ownerId) {
+                const { data: repRow, error: repErr } = await supa.from("reps").select("id,org_id").eq("id", ownerId).maybeSingle();
+                if (repErr)
+                    throw repErr;
+                const repOrg = String(repRow?.org_id ?? "").trim();
+                if (!repOrg || repOrg !== orgId)
+                    return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+            }
+        }
+        const { data, error } = await supa.from("crm_opportunities").update(patch).eq("id", id).select(selectCols).maybeSingle();
+        if (error)
+            throw error;
+        return res.json({
+            ok: true,
+            opportunity: {
+                id: data?.id ?? id,
+                name: data?.name ?? data?.title ?? null,
+                stage: data?.stage ?? null,
+                amount: data?.amount ?? data?.value ?? null,
+                currency: data?.currency ?? null,
+                close_date: data?.close_date ?? null,
+                account_id: data?.account_id ?? null,
+                contact_id: data?.contact_id ?? null,
+                account_name: data?.account_name ?? null,
+                contact_email: data?.contact_email ?? null,
+                created_at: data?.created_at ?? null,
+                updated_at: data?.updated_at ?? null,
+            },
+        });
+    }
+    catch (e) {
+        const msg = String(e?.message ?? "");
+        if (msg === "forbidden_org_scope")
+            return res.status(403).json({ ok: false, error: "forbidden_org_scope" });
+        if (msg === "forbidden_not_manager")
+            return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+/* ---------------------------------------------
+   LIGHTWEIGHT CREATE ENDPOINTS (v1)
+
+   POST /v1/crm/contacts
+   Body: { email: string, first_name?: string, last_name?: string, company?: string }
+   - Creates or finds a contact scoped to requester by email.
+
+   POST /v1/crm/accounts
+   Body: { name: string }
+   - Creates or finds an account scoped to requester by name.
+
+   Notes:
+   - Minimal for MVP quick-create flows.
+   - Clear errors when tables missing.
+---------------------------------------------- */
+const CreateContactSchema = z.object({
+    email: z.string().email().transform((s) => s.toLowerCase().trim()),
+    first_name: z.string().trim().min(1).max(120).optional(),
+    last_name: z.string().trim().min(1).max(120).optional(),
+    company: z.string().trim().min(1).max(200).optional(),
+});
+router.post("/contacts", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const body = CreateContactSchema.parse(req.body ?? {});
+        // 1) Find existing by (user_id + email)
+        const ex = await supa
+            .from("crm_contacts")
+            .select("id, first_name, last_name, email, company, created_at")
+            .eq("user_id", requester)
+            .eq("email", body.email)
+            .limit(1)
+            .maybeSingle();
+        if (ex.error) {
+            const msg = String(ex.error?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.status(500).json({ ok: false, error: "crm_contacts_table_missing" });
+            }
+            return res.status(500).json({ ok: false, error: ex.error?.message ?? "contact_lookup_failed" });
+        }
+        if (ex.data) {
+            return res.json({ ok: true, contact: ex.data, created: false });
+        }
+        // 2) Insert new contact
+        const payload = {
+            user_id: requester,
+            email: body.email,
+            ...(body.first_name ? { first_name: body.first_name } : {}),
+            ...(body.last_name ? { last_name: body.last_name } : {}),
+            ...(body.company ? { company: body.company } : {}),
+        };
+        const ins = await supa
+            .from("crm_contacts")
+            .insert(payload)
+            .select("id, first_name, last_name, email, company, created_at")
+            .maybeSingle();
+        if (ins.error) {
+            const msg = String(ins.error?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.status(500).json({ ok: false, error: "crm_contacts_table_missing" });
+            }
+            return res.status(500).json({ ok: false, error: ins.error?.message ?? "contact_create_failed" });
+        }
+        return res.json({ ok: true, contact: ins.data, created: true });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+const CreateAccountSchema = z.object({
+    name: z.string().trim().min(1).max(200),
+});
+router.post("/accounts", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const body = CreateAccountSchema.parse(req.body ?? {});
+        const nameNorm = body.name.trim();
+        // 1) Find existing by (user_id + name)
+        const ex = await supa
+            .from("crm_accounts")
+            .select("id, name, created_at")
+            .eq("user_id", requester)
+            .eq("name", nameNorm)
+            .limit(1)
+            .maybeSingle();
+        if (ex.error) {
+            const msg = String(ex.error?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.status(500).json({ ok: false, error: "crm_accounts_table_missing" });
+            }
+            return res.status(500).json({ ok: false, error: ex.error?.message ?? "account_lookup_failed" });
+        }
+        if (ex.data) {
+            return res.json({ ok: true, account: ex.data, created: false });
+        }
+        // 2) Insert new account
+        const ins = await supa
+            .from("crm_accounts")
+            .insert({ user_id: requester, name: nameNorm })
+            .select("id, name, created_at")
+            .maybeSingle();
+        if (ins.error) {
+            const msg = String(ins.error?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.status(500).json({ ok: false, error: "crm_accounts_table_missing" });
+            }
+            return res.status(500).json({ ok: false, error: ins.error?.message ?? "account_create_failed" });
+        }
+        return res.json({ ok: true, account: ins.data, created: true });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+/* ---------------------------------------------
+   QUICK CREATE (v1)
+   - Contact / Account
+   - Re-usable from anywhere (call page, pipeline, etc.)
+---------------------------------------------- */
+const CreateContactSchemaV2 = z.object({
+    email: z.string().email().transform((s) => s.toLowerCase().trim()),
+    first_name: z.string().trim().min(1).max(120).optional().nullable(),
+    last_name: z.string().trim().min(1).max(120).optional().nullable(),
+    company: z.string().trim().min(1).max(160).optional().nullable(),
+});
+// POST /v1/crm/contacts/create
+router.post("/contacts/create", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const body = CreateContactSchemaV2.parse(req.body ?? {});
+        const email = body.email;
+        // 1) Try scoped lookup (user_id + email)
+        const scoped = await supa
+            .from("crm_contacts")
+            .select("id, user_id, email, first_name, last_name, company")
+            .eq("user_id", requester)
+            .eq("email", email)
+            .maybeSingle();
+        if (!scoped.error && scoped.data) {
+            return res.json({ ok: true, contact: scoped.data, created: false });
+        }
+        // 2) Insert new
+        const ins = await supa
+            .from("crm_contacts")
+            .insert({
+            user_id: requester,
+            email,
+            first_name: body.first_name ?? null,
+            last_name: body.last_name ?? null,
+            company: body.company ?? null,
+        })
+            .select("id, user_id, email, first_name, last_name, company")
+            .single();
+        if (!ins.error && ins.data) {
+            return res.json({ ok: true, contact: ins.data, created: true });
+        }
+        // 3) Fallback: email may be globally unique — fetch by email and validate ownership
+        const ex = await supa
+            .from("crm_contacts")
+            .select("id, user_id, email, first_name, last_name, company")
+            .eq("email", email)
+            .maybeSingle();
+        if (ex.error) {
+            return res.status(500).json({ ok: false, error: ex.error?.message ?? "contact_lookup_failed" });
+        }
+        if (!ex.data) {
+            return res.status(500).json({ ok: false, error: ins.error?.message ?? "contact_create_failed" });
+        }
+        if (String(ex.data.user_id ?? "") !== requester) {
+            return res.status(409).json({ ok: false, error: "email_owned_by_other_user" });
+        }
+        return res.json({ ok: true, contact: ex.data, created: false });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+const CreateAccountSchemaV2 = z.object({
+    name: z.string().trim().min(1).max(160),
+    domain: z.string().trim().min(1).max(160).optional().nullable(),
+});
+// POST /v1/crm/accounts/create
+router.post("/accounts/create", async (req, res) => {
+    try {
+        const requester = getUserIdHeader(req);
+        const body = CreateAccountSchemaV2.parse(req.body ?? {});
+        // Best-effort: if you later add unique (user_id, domain) or (user_id, name), we can upsert.
+        // For now: create + return.
+        const ins = await supa
+            .from("crm_accounts")
+            .insert({
+            user_id: requester,
+            name: body.name,
+            domain: body.domain ?? null,
+        })
+            .select("id, name, domain")
+            .single();
+        if (ins.error) {
+            const msg = String(ins.error?.message ?? "").toLowerCase();
+            if (msg.includes("relation") && msg.includes("does not exist")) {
+                return res.status(500).json({ ok: false, error: "crm_accounts_table_missing" });
+            }
+            return res.status(500).json({ ok: false, error: ins.error?.message ?? "account_create_failed" });
+        }
+        return res.json({ ok: true, account: ins.data, created: true });
+    }
+    catch (e) {
+        return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+    }
+});
+export default router;

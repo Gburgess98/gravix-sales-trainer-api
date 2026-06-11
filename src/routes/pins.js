@@ -4,6 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 const router = Router();
 const supa = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const isUuid = (v) => UUID_RE.test(String(v || ""));
 function uidFromHeader(req) {
     const uid = req.header("x-user-id");
     if (!uid || !UUID_RE.test(uid))
@@ -23,7 +24,11 @@ router.get("/", async (req, res) => {
     try {
         const requester = uidFromHeader(req);
         const callId = String(req.query.callId || "");
-        if (!UUID_RE.test(callId)) {
+        // Demo placeholder calls shouldn't error — return empty pins (UI fail-soft)
+        if (callId.startsWith("demo-")) {
+            return res.json({ ok: true, pins: [] });
+        }
+        if (!isUuid(callId)) {
             return res.status(400).json({ ok: false, error: "invalid callId" });
         }
         // Verify the call belongs to requester

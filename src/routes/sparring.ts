@@ -10,6 +10,15 @@ import {
   buildPersonaBehaviourSummary,
   DifficultyLevel,
 } from "../personas";
+// TIER 2A Day 101 — Sparring Brain: pure state manager + provider router
+import {
+  createInitialSparringState,
+  updateSparringState,
+  coerceState,
+  generateBuyerReply,
+  withStateDirectives,
+  type SparringState,
+} from "../sparring";
 
 // Create a service-role Supabase client (write access)
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -495,6 +504,34 @@ function getInitialEmotionalState(personaId: string, difficulty: string): Emotio
   }
 }
 
+// Day 101 fix: this pure helper was nested inside getNextStackedObjection but
+// called from applyEmotionalDelta, so every turn threw "evaluateRepWeakness is
+// not defined" (pre-existing since Day 79.5). Hoisted to module scope unchanged.
+function evaluateRepWeakness(text: string) {
+  const t = (text || "").toLowerCase();
+
+  let weakness = {
+    vague: false,
+    no_question: false,
+    weak_close: false,
+    low_confidence: false,
+  };
+
+  if (t.length < 20) weakness.vague = true;
+
+  if (!t.includes("?")) weakness.no_question = true;
+
+  if (!/\b(next step|book|schedule|move forward|go ahead)\b/i.test(t)) {
+    weakness.weak_close = true;
+  }
+
+  if (/\b(maybe|kind of|sort of|might|possibly)\b/i.test(t)) {
+    weakness.low_confidence = true;
+  }
+
+  return weakness;
+}
+
 function applyEmotionalDelta(
   prev: EmotionalState,
   opts: {
@@ -729,31 +766,6 @@ function getNextStackedObjection(opts: {
       "Maybe."
     ]
   };
-
-  function evaluateRepWeakness(text: string) {
-    const t = (text || "").toLowerCase();
-
-    let weakness = {
-      vague: false,
-      no_question: false,
-      weak_close: false,
-      low_confidence: false,
-    };
-
-    if (t.length < 20) weakness.vague = true;
-
-    if (!t.includes("?")) weakness.no_question = true;
-
-    if (!/\b(next step|book|schedule|move forward|go ahead)\b/i.test(t)) {
-      weakness.weak_close = true;
-    }
-
-    if (/\b(maybe|kind of|sort of|might|possibly)\b/i.test(t)) {
-      weakness.low_confidence = true;
-    }
-
-    return weakness;
-  }
 
   const basePool = pool[personaId] || pool["price_sensitive"];
 
@@ -2635,6 +2647,13 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
         // Failure Replay Engine
         failed_moments: [],
         replay_enabled: true,
+
+        // TIER 2A Day 101 — initial conversation state (Sparring Brain)
+        state: createInitialSparringState({
+          personaId: personaId || "price_sensitive",
+          difficulty: adaptiveDifficulty.effective || difficulty || "normal",
+          flagSection: (assignment as any)?.meta?.flag_section || null,
+        }),
       },
     };
 
@@ -2834,6 +2853,24 @@ router.post(
         emotionalState: updatedEmotion,
       });
 
+      // TIER 2A Day 101 — Sparring Brain state update (pure, pre-reply).
+      // Heuristic score of the rep turn alone feeds pressure/performance;
+      // the buyer-aware micro-score below remains the persisted score.
+      const brainMicro = scoreRepTurnHeuristic(text, "");
+      const prevBrainState = coerceState(previousMeta.state, {
+        personaId,
+        difficulty: difficultyVal,
+        flagSection: previousMeta.flag_section || null,
+        initialTrust: prevEmotion?.trust ?? null,
+      });
+      const brainState: SparringState = updateSparringState(prevBrainState, {
+        repText: text,
+        turnScore: brainMicro?.turn_score ?? null,
+        emotional: updatedEmotion,
+        newObjectionText: newObjection || null,
+        endedThisTurn: hangupDecision.endNow,
+      });
+
       // 4) Decide whether the buyer should "hang up" before calling OpenAI
       let aiText = "";
       let endedThisTurn = false;
@@ -2918,24 +2955,20 @@ INSTRUCTIONS:
 - Be harder in those areas
 `;
 
-          const completion = await openai.chat.completions.create({
-            model: process.env.OPENAI_SPARRING_MODEL || "gpt-4o-mini",
-            messages: [
-              {
-                role: "system",
-                content: enrichedSystemPrompt,
-              },
-              ...history,
-            ],
-            temperature: 0.7,
-            max_tokens: 220,
+          // TIER 2A Day 101 — provider router (SPARRING_PROVIDER env; default
+          // "openai" preserves the previous inline behaviour exactly). State
+          // directives are appended to the persona prompt; the router falls
+          // back to the deterministic stub and never throws.
+          const reply = await generateBuyerReply({
+            systemPrompt: withStateDirectives(enrichedSystemPrompt, brainState),
+            history,
+            state: brainState,
+            personaId,
+            difficulty: difficultyVal,
           });
-
-          aiText =
-            completion.choices[0]?.message?.content?.trim() ||
-            "I'm not convinced yet. Can you explain why this is worth the price?";
+          aiText = reply.text;
         } catch (llmErr: any) {
-          console.error("[sparring/turns] OpenAI error", llmErr);
+          console.error("[sparring/turns] buyer reply error", llmErr);
           aiText =
             "I'm still not sure about this. The price feels high compared to what I'm getting.";
         }
@@ -3089,7 +3122,10 @@ INSTRUCTIONS:
             disengaged:
               updatedEmotion.boredom > 75,
           },
-          objection_stack: updatedStack
+          objection_stack: updatedStack,
+
+          // TIER 2A Day 101 — latest Sparring Brain state
+          state: brainState,
 
         };
 
@@ -3113,6 +3149,8 @@ INSTRUCTIONS:
         ok: true,
         turns: insertedTurns ?? [],
         ai: aiText,
+        // TIER 2A Day 101 — expose conversation state (additive)
+        state: brainState,
       });
     } catch (err: any) {
       console.error(
@@ -3123,6 +3161,18 @@ INSTRUCTIONS:
         .status(400)
         .json({ ok: false, error: err?.message || 'bad_request' });
     }
+  }
+);
+
+// TIER 2A Day 101 — alias: POST /v1/sparring/sessions/:id/messages
+// Same behaviour as /turns (the Tier 2A canonical name). Express re-dispatch
+// keeps a single handler without restructuring the existing registration.
+router.post(
+  '/sessions/:id/messages',
+  express.json(),
+  (req: Request, res: Response, next) => {
+    req.url = `/sessions/${req.params.id}/turns`;
+    (router as any).handle(req, res, next);
   }
 );
 
