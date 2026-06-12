@@ -761,4 +761,124 @@ router.get("/review-queue", async (req: Request, res: Response) => {
   }
 });
 
+// ── GET /v1/manager/sparring-sessions ────────────────────────────────────────
+// TIER 2A Day 105: completed sparring sessions for the manager's scope.
+// sparring_sessions has no tenant columns yet (Day 100 data plan), so scoping
+// goes through the rep's users-row hierarchy: fetch in-window sessions, resolve
+// each rep's office/company, and apply the same office/company-manager rules
+// as applyHierarchyFilters before returning anything.
+
+router.get("/sparring-sessions", async (req: Request, res: Response) => {
+  try {
+    if (!supa) throw new Error("server_missing_supabase_env");
+
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+
+    const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? "30"), 10) || 30));
+    const since = isoDaysAgo(days);
+    const rawLimit = parseInt(String(req.query.limit ?? "10"), 10);
+    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 10, 1), 50);
+
+    const userContext = await getUserContext(supa, userId);
+
+    const { data: sessionRows, error: sessErr } = await supa
+      .from("sparring_sessions")
+      .select("id, rep_id, persona_id, difficulty, total_score, summary, created_at, meta")
+      .gte("created_at", since)
+      .order("created_at", { ascending: false })
+      .limit(500);
+    if (sessErr) throw sessErr;
+
+    // Completed = ended/completed_at in meta, or a persisted summary/score.
+    const completed = (sessionRows ?? []).filter((s: any) => {
+      const m = s?.meta && typeof s.meta === "object" ? s.meta : {};
+      return Boolean(m.ended || m.completed_at || s.summary || typeof s.total_score === "number");
+    });
+
+    // Resolve rep hierarchy for tenant scoping (users row per rep).
+    const repIds = Array.from(
+      new Set(completed.map((s: any) => String(s.rep_id || "")).filter(Boolean))
+    );
+    const repHierarchy = new Map<string, { office_id: string | null; company_id: string | null }>();
+    if (repIds.length > 0) {
+      const { data: userRows } = await supa
+        .from("users")
+        .select("id, office_id, company_id")
+        .in("id", repIds);
+      for (const u of userRows ?? []) {
+        repHierarchy.set(String((u as any).id), {
+          office_id: (u as any).office_id || null,
+          company_id: (u as any).company_id || null,
+        });
+      }
+    }
+
+    const inScope = completed.filter((s: any) => {
+      if (!userContext) return true; // same semantics as applyHierarchyFilters
+      const h = repHierarchy.get(String(s.rep_id || ""));
+      if (isOfficeManager(userContext)) return !!h && h.office_id === userContext.office_id;
+      if (isCompanyManager(userContext)) return !!h && h.company_id === userContext.company_id;
+      return true;
+    });
+
+    // Rep names (best-effort)
+    const repNames = new Map<string, string>();
+    if (repIds.length > 0) {
+      const { data: repRows } = await supa.from("reps").select("id, name").in("id", repIds);
+      for (const r of repRows ?? []) {
+        const name = String((r as any).name || "").trim();
+        if (name) repNames.set(String((r as any).id), name);
+      }
+    }
+
+    const normaliseDifficultyLabel = (raw: any): string => {
+      const d = String(raw || "").toLowerCase();
+      if (d === "easy" || d === "hard" || d === "nightmare") return d;
+      if (d === "normal" || d === "standard") return "standard";
+      return "unknown";
+    };
+
+    const items = inScope
+      .map((s: any) => {
+        const m = s?.meta && typeof s.meta === "object" ? s.meta : {};
+        const ss = m.session_summary && typeof m.session_summary === "object" ? m.session_summary : null;
+        const assignmentId = String(m.assignment_id || "").trim() || null;
+        const completedAt = m.completed_at || null;
+
+        return {
+          sessionId: String(s.id),
+          repId: s.rep_id ? String(s.rep_id) : null,
+          repName: (s.rep_id && repNames.get(String(s.rep_id))) || "Unknown rep",
+          assignmentId,
+          persona: s.persona_id ? String(s.persona_id) : null,
+          difficulty: normaliseDifficultyLabel(s.difficulty || m.difficulty),
+          overall:
+            typeof ss?.overall === "number"
+              ? ss.overall
+              : typeof s.total_score === "number"
+                ? s.total_score
+                : 0,
+          weakestDimension: ss?.weakestDimension || "unknown",
+          strongestDimension: ss?.strongestDimension || "unknown",
+          recommendedDrill: ss?.recommendedDrill || null,
+          summaryText: ss?.summaryText || String(s.summary || "") || "No summary available.",
+          nextBestAction: ss?.nextBestAction || "",
+          completedAt,
+          turnCount: typeof ss?.turnCount === "number" ? ss.turnCount : 0,
+          source: (assignmentId ? "assignment" : "manual") as "assignment" | "manual" | "unknown",
+          _sortKey: String(completedAt || s.created_at || ""),
+        };
+      })
+      .sort((a, b) => b._sortKey.localeCompare(a._sortKey))
+      .slice(0, limit)
+      .map(({ _sortKey, ...item }) => item);
+
+    return res.json({ ok: true, windowDays: days, items, count: items.length });
+  } catch (e: any) {
+    console.error("[manager.sparring-sessions] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "sparring_sessions_failed" });
+  }
+});
+
 export default router;

@@ -3845,6 +3845,9 @@ router.get('/sessions/:id', async (req: Request, res: Response) => {
       persona_id: personaId,
       difficulty: (data as any).difficulty || (data as any)?.meta?.difficulty || "normal",
       total,
+      // Day 105: expose the persisted column under its real name too (additive;
+      // Day 104 writes total_score on completion but it was omitted here)
+      total_score: total,
       xp_awarded: xp,
       created_at: (data as any).created_at,
       duration_ms: durationMs,
