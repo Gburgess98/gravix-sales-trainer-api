@@ -62,6 +62,8 @@
     "validate:identity-architecture": "tsx scripts/validate-identity-architecture.ts",
     "validate-tier-2a-day-101": "bash scripts/validate-tier-2a-day-101.sh",
     "validate-tier-2a-day-102": "bash scripts/validate-tier-2a-day-102.sh",
+    "validate-tier-2a-day-103": "bash scripts/validate-tier-2a-day-103.sh",
+    "validate:sparring-scoring": "tsx scripts/validate-sparring-scoring.ts",
     "validate:sparring-state": "tsx scripts/validate-sparring-state.ts"
   }
 }

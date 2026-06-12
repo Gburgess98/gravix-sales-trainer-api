@@ -17,6 +17,20 @@ export {
 } from "./state";
 
 export {
+  type TurnFlag,
+  type StructuredTurnScore,
+  type TurnScoreInput,
+  scoreSparringTurn,
+  scoreClarity,
+  scoreConfidence,
+  scoreObjectionHandling,
+  scoreProgression,
+  detectTurnFlags,
+  buildTurnFeedback,
+  mergeTurnScoreIntoState,
+} from "./scoring";
+
+export {
   type SparringProviderName,
   type BuyerReplyInput,
   type BuyerReplyResult,

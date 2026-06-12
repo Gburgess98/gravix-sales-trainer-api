@@ -17,7 +17,10 @@ import {
   coerceState,
   generateBuyerReply,
   withStateDirectives,
+  scoreSparringTurn,
+  mergeTurnScoreIntoState,
   type SparringState,
+  type StructuredTurnScore,
 } from "../sparring";
 
 // Create a service-role Supabase client (write access)
@@ -3002,6 +3005,10 @@ INSTRUCTIONS:
       // accumulates its additions here and the final block writes ONCE.
       const pendingMetaPatch: Record<string, any> = {};
 
+      // Day 103 — structured turn score feeds back into repPerformance.
+      let structuredScore: StructuredTurnScore | null = null;
+      let finalBrainState: SparringState = brainState;
+
       // -----------------------------
       // Micro-score the REP turn (best-effort)
       // -----------------------------
@@ -3083,6 +3090,40 @@ INSTRUCTIONS:
         console.warn("[sparring/turns] micro-score persist failed", e?.message || e);
       }
 
+      // -----------------------------
+      // Day 103 — structured turn score (deterministic, no LLM)
+      // -----------------------------
+      try {
+        structuredScore = scoreSparringTurn({
+          repMessage: text,
+          buyerMessage: aiText,
+          currentState: brainState,
+          previousState: prevBrainState,
+          difficulty: difficultyVal,
+          personaId,
+        });
+
+        // Feed the structured dimensions back into repPerformance
+        finalBrainState = mergeTurnScoreIntoState(brainState, structuredScore);
+
+        const repTurnId =
+          (insertedTurns ?? []).find((t: any) => t.role === "user")?.id || null;
+        const existingTurnScores = Array.isArray(previousMeta.turn_scores)
+          ? previousMeta.turn_scores
+          : [];
+        pendingMetaPatch.turn_scores = [
+          ...existingTurnScores,
+          {
+            turnId: repTurnId,
+            repMessage: String(text).slice(0, 500),
+            score: structuredScore,
+            createdAt: new Date().toISOString(),
+          },
+        ].slice(-100);
+      } catch (e: any) {
+        console.warn("[sparring/turns] structured score failed", e?.message || e);
+      }
+
       // Persist updated emotional state (and hang-up info if relevant) on the session meta (best-effort)
       // Day 102: this is now the SINGLE meta write for the turn — it merges the
       // micro-score additions (pendingMetaPatch) so nothing is dropped.
@@ -3126,7 +3167,8 @@ INSTRUCTIONS:
           objection_stack: updatedStack,
 
           // TIER 2A Day 101 — latest Sparring Brain state
-          state: brainState,
+          // (Day 103: includes repPerformance updated from the structured score)
+          state: finalBrainState,
 
         };
 
@@ -3151,7 +3193,9 @@ INSTRUCTIONS:
         turns: insertedTurns ?? [],
         ai: aiText,
         // TIER 2A Day 101 — expose conversation state (additive)
-        state: brainState,
+        state: finalBrainState,
+        // TIER 2A Day 103 — structured turn score (additive)
+        turnScore: structuredScore,
       });
     } catch (err: any) {
       console.error(
