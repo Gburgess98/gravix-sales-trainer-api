@@ -19,6 +19,7 @@ import {
   withStateDirectives,
   scoreSparringTurn,
   mergeTurnScoreIntoState,
+  buildSparringSessionSummary,
   type SparringState,
   type StructuredTurnScore,
 } from "../sparring";
@@ -3218,6 +3219,118 @@ router.post(
   (req: Request, res: Response, next) => {
     req.url = `/sessions/${req.params.id}/turns`;
     (router as any).handle(req, res, next);
+  }
+);
+
+// -----------------------------------------
+// TIER 2A Day 104 — POST /v1/sparring/sessions/:id/complete
+// -----------------------------------------
+// Aggregates the structured turn scores into a coaching summary, persists it
+// (summary column = human text, meta.session_summary = full structure), marks
+// the session ended, and completes any linked sparring assignment via the
+// same completeAssignmentsForTarget path the legacy /score route uses.
+// Note: sparring_sessions has no status/completed_at columns — completion is
+// recorded in meta (ended/end_reason/completed_at) per the Day 100 data plan.
+router.post(
+  "/sessions/:id/complete",
+  express.json(),
+  async (req: Request, res: Response) => {
+    res.setHeader("Cache-Control", "no-store");
+
+    try {
+      const id = String(req.params.id || "").trim();
+      if (!isUuid(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
+
+      let repId: string | null = null;
+      try {
+        repId = getUserIdHeader(req);
+      } catch {
+        const bodyRep = (req.body as any)?.repId;
+        if (typeof bodyRep === "string" && bodyRep.trim().length) repId = bodyRep.trim();
+      }
+
+      const { data: session, error: sessErr } = await supa
+        .from("sparring_sessions")
+        .select("id, rep_id, persona_id, difficulty, meta, summary, total_score")
+        .eq("id", id)
+        .single();
+
+      if (sessErr || !session) {
+        return res.status(404).json({ ok: false, error: "not_found" });
+      }
+      if (repId && session.rep_id && session.rep_id !== repId) {
+        return res.status(403).json({ ok: false, error: "forbidden" });
+      }
+
+      const meta =
+        (session as any)?.meta && typeof (session as any).meta === "object"
+          ? ((session as any).meta as Record<string, any>)
+          : {};
+
+      const summary = buildSparringSessionSummary({
+        turnScores: Array.isArray(meta.turn_scores) ? meta.turn_scores : [],
+        failedMoments: Array.isArray(meta.failed_moments) ? meta.failed_moments : [],
+      });
+
+      const nowIso = new Date().toISOString();
+      const mergedMeta: Record<string, any> = {
+        ...meta,
+        session_summary: summary,
+        ended: true,
+        end_reason: meta.end_reason || "completed",
+        completed_at: meta.completed_at || nowIso,
+      };
+
+      const { error: updErr } = await supa
+        .from("sparring_sessions")
+        .update({
+          summary: summary.summaryText,
+          total_score: summary.turnCount > 0 ? summary.overall : (session as any).total_score ?? null,
+          meta: mergedMeta,
+        } as any)
+        .eq("id", id);
+
+      if (updErr) {
+        console.error("[sparring/complete] persist failed", updErr);
+        return res.status(500).json({ ok: false, error: updErr.message });
+      }
+
+      // Assignment auto-completion (same guarded path as the legacy /score route)
+      let assignmentCompleted: boolean | null = null;
+      try {
+        const repIdForAssign = String(session.rep_id || "").trim();
+        const rawAssignmentId = String(meta.assignment_id || "").trim();
+        const safeAssignmentId = isUuid(rawAssignmentId) ? rawAssignmentId : "";
+
+        if (repIdForAssign && repIdForAssign.length > 10) {
+          const xpAwarded =
+            summary.overall >= 80 ? 35 : summary.overall >= 60 ? 25 : 15;
+
+          const result = await completeAssignmentsForTarget({
+            repId: repIdForAssign,
+            assignmentId: safeAssignmentId || null,
+            type: "sparring",
+            targetId: String(session.persona_id || "") || null,
+            completedVia: "sparring",
+            xpAwarded,
+          } as any);
+
+          const completedCount =
+            typeof (result as any)?.completedCount === "number"
+              ? (result as any).completedCount
+              : 0;
+          assignmentCompleted = completedCount > 0;
+        }
+      } catch (e: any) {
+        console.warn("[sparring/complete] assignment completion failed", e?.message || e);
+        assignmentCompleted = null;
+      }
+
+      return res.json({ ok: true, summary, assignmentCompleted });
+    } catch (err: any) {
+      console.error("POST /v1/sparring/sessions/:id/complete error", err);
+      return res.status(400).json({ ok: false, error: err?.message || "bad_request" });
+    }
   }
 );
 

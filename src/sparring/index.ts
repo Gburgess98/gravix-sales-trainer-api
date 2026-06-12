@@ -31,6 +31,19 @@ export {
 } from "./scoring";
 
 export {
+  type SparringSessionSummary,
+  type StoredTurnScore,
+  type WeakMomentEntry,
+  type SparringDrillType,
+  buildSparringSessionSummary,
+  aggregateTurnScores,
+  selectWeakMoments,
+  recommendSparringDrill,
+  buildSummaryText,
+  buildNextBestAction,
+} from "./summary";
+
+export {
   type SparringProviderName,
   type BuyerReplyInput,
   type BuyerReplyResult,

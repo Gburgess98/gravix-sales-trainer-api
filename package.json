@@ -64,6 +64,8 @@
     "validate-tier-2a-day-102": "bash scripts/validate-tier-2a-day-102.sh",
     "validate-tier-2a-day-103": "bash scripts/validate-tier-2a-day-103.sh",
     "validate:sparring-scoring": "tsx scripts/validate-sparring-scoring.ts",
+    "validate-tier-2a-day-104": "bash scripts/validate-tier-2a-day-104.sh",
+    "validate:sparring-summary": "tsx scripts/validate-sparring-summary.ts",
     "validate:sparring-state": "tsx scripts/validate-sparring-state.ts"
   }
 }
