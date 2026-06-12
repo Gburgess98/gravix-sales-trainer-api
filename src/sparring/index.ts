@@ -43,6 +43,8 @@ export {
   buildNextBestAction,
 } from "./summary";
 
+export { sparringHardeningColumns, resetSparringSchemaProbe } from "./schema";
+
 export {
   type SparringProviderName,
   type BuyerReplyInput,

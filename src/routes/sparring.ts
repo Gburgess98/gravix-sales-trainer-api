@@ -20,6 +20,7 @@ import {
   scoreSparringTurn,
   mergeTurnScoreIntoState,
   buildSparringSessionSummary,
+  sparringHardeningColumns,
   type SparringState,
   type StructuredTurnScore,
 } from "../sparring";
@@ -2661,6 +2662,23 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
       },
     };
 
+    // Day 106 — populate first-class columns when the hardening migration has
+    // been applied (fail-soft: meta carries everything either way).
+    try {
+      const cols = await sparringHardeningColumns(supa);
+      if (cols.sessions) {
+        payload.assignment_id =
+          typeof assignmentId === "string" && isUuid(assignmentId) ? assignmentId : null;
+        payload.org_id = orgId || null;
+        payload.company_id = requesterUser?.company_id || null;
+        payload.office_id = requesterUser?.office_id || null;
+        payload.status = "active";
+        payload.state = payload.meta.state;
+      }
+    } catch (e: any) {
+      console.warn("[sparring/sessions POST] column probe failed", e?.message || e);
+    }
+
     const { data, error } = await supa
       .from('sparring_sessions')
       .insert(payload)
@@ -3121,6 +3139,22 @@ INSTRUCTIONS:
             createdAt: new Date().toISOString(),
           },
         ].slice(-100);
+
+        // Day 106 — first-class per-turn columns (fail-soft until migration runs)
+        try {
+          const cols = await sparringHardeningColumns(supa);
+          if (cols.turns && repTurnId) {
+            await supa
+              .from("sparring_turns")
+              .update({
+                turn_score: structuredScore,
+                state_snapshot: finalBrainState,
+              } as any)
+              .eq("id", repTurnId);
+          }
+        } catch (e: any) {
+          console.warn("[sparring/turns] turn column write failed", e?.message || e);
+        }
       } catch (e: any) {
         console.warn("[sparring/turns] structured score failed", e?.message || e);
       }
@@ -3178,9 +3212,16 @@ INSTRUCTIONS:
           mergedMeta.end_reason = endReason || "timeout";
         }
 
+        // Day 106 — include the state column when the migration has run
+        const sessionUpdate: Record<string, any> = { meta: mergedMeta };
+        try {
+          const cols = await sparringHardeningColumns(supa);
+          if (cols.sessions) sessionUpdate.state = finalBrainState;
+        } catch { /* fail-soft */ }
+
         await supa
           .from("sparring_sessions")
-          .update({ meta: mergedMeta })
+          .update(sessionUpdate)
           .eq("id", id);
       } catch (e: any) {
         console.warn(
@@ -3281,13 +3322,39 @@ router.post(
         completed_at: meta.completed_at || nowIso,
       };
 
+      const completeUpdate: Record<string, any> = {
+        summary: summary.summaryText,
+        total_score: summary.turnCount > 0 ? summary.overall : (session as any).total_score ?? null,
+        meta: mergedMeta,
+      };
+
+      // Day 106 — first-class lifecycle/tenant columns (fail-soft until migration runs)
+      try {
+        const cols = await sparringHardeningColumns(supa);
+        if (cols.sessions) {
+          completeUpdate.status = "completed";
+          completeUpdate.completed_at = mergedMeta.completed_at;
+          completeUpdate.state = meta.state ?? null;
+          const rawAssignment = String(meta.assignment_id || "").trim();
+          if (isUuid(rawAssignment)) completeUpdate.assignment_id = rawAssignment;
+
+          const { data: repUser } = await supa
+            .from("users")
+            .select("company_id, office_id")
+            .eq("id", session.rep_id)
+            .maybeSingle();
+          if (repUser) {
+            completeUpdate.company_id = (repUser as any).company_id || null;
+            completeUpdate.office_id = (repUser as any).office_id || null;
+          }
+        }
+      } catch (e: any) {
+        console.warn("[sparring/complete] column probe failed", e?.message || e);
+      }
+
       const { error: updErr } = await supa
         .from("sparring_sessions")
-        .update({
-          summary: summary.summaryText,
-          total_score: summary.turnCount > 0 ? summary.overall : (session as any).total_score ?? null,
-          meta: mergedMeta,
-        } as any)
+        .update(completeUpdate as any)
         .eq("id", id);
 
       if (updErr) {

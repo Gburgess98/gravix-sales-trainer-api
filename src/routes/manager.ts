@@ -13,6 +13,7 @@
 import { Router, type Request, type Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { requireManager } from "../middleware/requireManager";
+import { sparringHardeningColumns } from "../sparring";
 import {
   isCompanyManager,
   isOfficeManager,
@@ -782,16 +783,25 @@ router.get("/sparring-sessions", async (req: Request, res: Response) => {
 
     const userContext = await getUserContext(supa, userId);
 
+    // Day 106 — prefer the first-class columns when the hardening migration
+    // has been applied; fall back to the Day 105 meta-based path otherwise.
+    const cols = await sparringHardeningColumns(supa).catch(() => ({ sessions: false, turns: false }));
+    const selectFields = cols.sessions
+      ? "id, rep_id, persona_id, difficulty, total_score, summary, created_at, meta, status, completed_at, assignment_id, company_id, office_id"
+      : "id, rep_id, persona_id, difficulty, total_score, summary, created_at, meta";
+
     const { data: sessionRows, error: sessErr } = await supa
       .from("sparring_sessions")
-      .select("id, rep_id, persona_id, difficulty, total_score, summary, created_at, meta")
+      .select(selectFields)
       .gte("created_at", since)
       .order("created_at", { ascending: false })
       .limit(500);
     if (sessErr) throw sessErr;
 
-    // Completed = ended/completed_at in meta, or a persisted summary/score.
+    // Completed = status column (post-migration) or ended/completed_at in
+    // meta / persisted summary/score (pre-migration and pre-backfill rows).
     const completed = (sessionRows ?? []).filter((s: any) => {
+      if (s?.status === "completed" || s?.completed_at) return true;
       const m = s?.meta && typeof s.meta === "object" ? s.meta : {};
       return Boolean(m.ended || m.completed_at || s.summary || typeof s.total_score === "number");
     });
@@ -816,9 +826,11 @@ router.get("/sparring-sessions", async (req: Request, res: Response) => {
 
     const inScope = completed.filter((s: any) => {
       if (!userContext) return true; // same semantics as applyHierarchyFilters
-      const h = repHierarchy.get(String(s.rep_id || ""));
-      if (isOfficeManager(userContext)) return !!h && h.office_id === userContext.office_id;
-      if (isCompanyManager(userContext)) return !!h && h.company_id === userContext.company_id;
+      // Column-first (Day 106 backfilled/new rows), rep hierarchy fallback (Day 105)
+      const officeId = s.office_id || repHierarchy.get(String(s.rep_id || ""))?.office_id || null;
+      const companyId = s.company_id || repHierarchy.get(String(s.rep_id || ""))?.company_id || null;
+      if (isOfficeManager(userContext)) return officeId === userContext.office_id;
+      if (isCompanyManager(userContext)) return companyId === userContext.company_id;
       return true;
     });
 
@@ -843,8 +855,11 @@ router.get("/sparring-sessions", async (req: Request, res: Response) => {
       .map((s: any) => {
         const m = s?.meta && typeof s.meta === "object" ? s.meta : {};
         const ss = m.session_summary && typeof m.session_summary === "object" ? m.session_summary : null;
-        const assignmentId = String(m.assignment_id || "").trim() || null;
-        const completedAt = m.completed_at || null;
+        const assignmentId =
+          (s.assignment_id ? String(s.assignment_id) : "") ||
+          String(m.assignment_id || "").trim() ||
+          null;
+        const completedAt = s.completed_at || m.completed_at || null;
 
         return {
           sessionId: String(s.id),

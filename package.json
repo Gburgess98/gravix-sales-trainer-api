@@ -42,6 +42,7 @@
     "seed:demo": "tsx scripts/seed-demo-org.ts",
     "db:backfill": "tsx scripts/backfill-reps-company.ts",
     "db:backfill-calls": "tsx scripts/backfill-calls-hierarchy.ts",
+    "db:backfill-sparring": "tsx scripts/backfill-sparring-data-model.ts",
     "validate:isolation": "tsx scripts/validate-isolation.ts",
     "validate:partner": "tsx scripts/validate-partner.ts",
     "validate:permissions": "tsx scripts/validate-permissions.ts",
@@ -67,6 +68,7 @@
     "validate-tier-2a-day-104": "bash scripts/validate-tier-2a-day-104.sh",
     "validate:sparring-summary": "tsx scripts/validate-sparring-summary.ts",
     "validate-tier-2a-day-105": "bash scripts/validate-tier-2a-day-105.sh",
+    "validate-tier-2a-day-106": "bash scripts/validate-tier-2a-day-106.sh",
     "validate:sparring-state": "tsx scripts/validate-sparring-state.ts"
   }
 }
