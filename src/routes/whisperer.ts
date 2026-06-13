@@ -287,6 +287,56 @@ async function loadWhispererSession(id: string): Promise<{
   return { session: data ?? null, persisted };
 }
 
+// POST /v1/whisperer/deepgram-token — mint a short-lived client token (Day 112)
+// Uses Deepgram's Grant Token API so the browser never holds the permanent key.
+// Requires a normal authenticated user (not a manager).
+router.post("/deepgram-token", express.json(), async (req, res) => {
+  try {
+    const userId = getWhispererUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+
+    const key = String(process.env.DEEPGRAM_API_KEY || "").trim();
+    if (!key) {
+      return res.status(503).json({ ok: false, error: "deepgram_not_configured" });
+    }
+
+    const ttl = 30; // seconds — Deepgram grant tokens are short-lived by design
+    const resp = await fetch("https://api.deepgram.com/v1/auth/grant", {
+      method: "POST",
+      headers: { Authorization: `Token ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({ ttl_seconds: ttl }),
+    });
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      console.warn("[whisperer/deepgram-token] grant failed", resp.status, body.slice(0, 200));
+      // Controlled error — never fall back to the permanent key
+      return res.status(502).json({
+        ok: false,
+        error: "deepgram_token_unsupported",
+        status: resp.status,
+      });
+    }
+
+    const data = (await resp.json().catch(() => ({}))) as any;
+    const token = String(data?.access_token || "").trim();
+    if (!token) {
+      return res.status(502).json({ ok: false, error: "deepgram_token_unsupported" });
+    }
+
+    return res.json({
+      ok: true,
+      token,
+      expiresInSeconds: Number(data?.expires_in) || ttl,
+      model: "nova-3",
+      language: "en",
+    });
+  } catch (e: any) {
+    console.error("[whisperer/deepgram-token] error", e?.message || e);
+    return res.status(500).json({ ok: false, error: "deepgram_token_failed" });
+  }
+});
+
 // POST /v1/whisperer/sessions — start a live session
 router.post("/sessions", express.json(), async (req, res) => {
   try {
@@ -474,7 +524,12 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
     return res.json({
       ok: true,
       persistence: persisted,
-      segment: { text, speaker, receivedAt: receivedAt.toISOString() },
+      segment: {
+        text,
+        speaker,
+        receivedAt: receivedAt.toISOString(),
+        processedAt: new Date().toISOString(),
+      },
       triggers: triggerRows.map((r) => ({
         id: r.id,
         type: r.type,
