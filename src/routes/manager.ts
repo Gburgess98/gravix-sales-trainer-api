@@ -14,6 +14,7 @@ import { Router, type Request, type Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { requireManager } from "../middleware/requireManager";
 import { sparringHardeningColumns } from "../sparring";
+import { whispererTablesAvailable } from "../whisperer";
 import {
   isCompanyManager,
   isOfficeManager,
@@ -893,6 +894,155 @@ router.get("/sparring-sessions", async (req: Request, res: Response) => {
   } catch (e: any) {
     console.error("[manager.sparring-sessions] error", e);
     return res.status(500).json({ ok: false, error: e?.message || "sparring_sessions_failed" });
+  }
+});
+
+// ── GET /v1/manager/whisperer-sessions ───────────────────────────────────────
+// TIER 2B Day 114: Live Whisperer activity for the manager's scope.
+// whisperer_sessions carries tenant columns from day one (Day 111), so scoping
+// uses direct DB filters via applyHierarchyFilters — no rep-hierarchy join.
+
+router.get("/whisperer-sessions", async (req: Request, res: Response) => {
+  try {
+    if (!supa) throw new Error("server_missing_supabase_env");
+
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+
+    const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? "30"), 10) || 30));
+    const since = isoDaysAgo(days);
+    const rawLimit = parseInt(String(req.query.limit ?? "10"), 10);
+    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 10, 1), 50);
+
+    const emptySummary = {
+      sessionCount: 0,
+      triggerCount: 0,
+      topTriggerTypes: [] as Array<{ type: string; count: number }>,
+      avgLatencyMs: null as number | null,
+      activeSessions: 0,
+      endedSessions: 0,
+    };
+
+    // Fail-soft if the migration hasn't been applied in this environment
+    const available = await whispererTablesAvailable(supa).catch(() => false);
+    if (!available) {
+      return res.json({
+        ok: true,
+        persistence: false,
+        windowDays: days,
+        items: [],
+        summary: emptySummary,
+        count: 0,
+      });
+    }
+
+    const userContext = await getUserContext(supa, userId);
+
+    let sessionQuery = supa
+      .from("whisperer_sessions")
+      .select("id, rep_id, user_id, status, started_at, ended_at, latency_p50_ms, latency_p95_ms, meta, office_id, company_id")
+      .gte("started_at", since)
+      .order("started_at", { ascending: false })
+      .limit(limit);
+    sessionQuery = applyHierarchyFilters(sessionQuery, userContext);
+
+    const { data: sessionRows, error: sessErr } = await sessionQuery;
+    if (sessErr) throw sessErr;
+    const sessions = sessionRows ?? [];
+
+    if (sessions.length === 0) {
+      return res.json({ ok: true, persistence: true, windowDays: days, items: [], summary: emptySummary, count: 0 });
+    }
+
+    const sessionIds = sessions.map((s: any) => String(s.id));
+
+    // Triggers for these sessions (one query, grouped in code)
+    const { data: triggerRows } = await supa
+      .from("whisperer_triggers")
+      .select("session_id, type, phrase, confidence, suggestion, latency_ms, detected_at")
+      .in("session_id", sessionIds)
+      .order("detected_at", { ascending: true })
+      .limit(5000);
+    const triggers = triggerRows ?? [];
+
+    // Rep names (best-effort)
+    const repIds = Array.from(new Set(sessions.map((s: any) => String(s.rep_id || s.user_id || "")).filter(Boolean)));
+    const repNames = new Map<string, string>();
+    if (repIds.length > 0) {
+      const { data: repRows } = await supa.from("reps").select("id, name").in("id", repIds);
+      for (const r of repRows ?? []) {
+        const name = String((r as any).name || "").trim();
+        if (name) repNames.set(String((r as any).id), name);
+      }
+    }
+
+    const avg = (xs: number[]) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null);
+    const p95 = (xs: number[]) => {
+      if (!xs.length) return null;
+      const sorted = [...xs].sort((a, b) => a - b);
+      return sorted[Math.min(sorted.length - 1, Math.floor(0.95 * sorted.length))];
+    };
+    const topTypes = (rows: any[], n: number) => {
+      const counts = new Map<string, number>();
+      for (const t of rows) counts.set(String(t.type), (counts.get(String(t.type)) || 0) + 1);
+      return Array.from(counts.entries())
+        .map(([type, count]) => ({ type, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, n);
+    };
+
+    const bySession = new Map<string, any[]>();
+    for (const t of triggers) {
+      const sid = String(t.session_id);
+      if (!bySession.has(sid)) bySession.set(sid, []);
+      bySession.get(sid)!.push(t);
+    }
+
+    const items = sessions.map((s: any) => {
+      const sid = String(s.id);
+      const sessionTriggers = bySession.get(sid) ?? [];
+      const latencies = sessionTriggers.map((t) => Number(t.latency_ms)).filter(Number.isFinite);
+      const latest = sessionTriggers[sessionTriggers.length - 1] || null;
+      const repId = s.rep_id ? String(s.rep_id) : s.user_id ? String(s.user_id) : null;
+
+      return {
+        sessionId: sid,
+        repId,
+        repName: (repId && repNames.get(repId)) || "Unknown rep",
+        status: (s.status === "active" || s.status === "ended") ? s.status : "unknown",
+        startedAt: s.started_at,
+        endedAt: s.ended_at ?? null,
+        triggerCount: sessionTriggers.length,
+        topTriggerTypes: topTypes(sessionTriggers, 3),
+        avgLatencyMs: typeof s.latency_p50_ms === "number" ? s.latency_p50_ms : avg(latencies),
+        p95LatencyMs: typeof s.latency_p95_ms === "number" ? s.latency_p95_ms : p95(latencies),
+        latestSuggestion: latest
+          ? {
+              type: String(latest.type),
+              title: latest.suggestion?.title || "Suggestion",
+              urgency: latest.suggestion?.urgency || "low",
+              phrase: latest.phrase ?? null,
+              createdAt: latest.detected_at,
+            }
+          : null,
+        source: (s.meta?.source as string) || "unknown",
+      };
+    });
+
+    const allLatencies = triggers.map((t: any) => Number(t.latency_ms)).filter(Number.isFinite);
+    const summary = {
+      sessionCount: sessions.length,
+      triggerCount: triggers.length,
+      topTriggerTypes: topTypes(triggers, 5),
+      avgLatencyMs: avg(allLatencies),
+      activeSessions: sessions.filter((s: any) => s.status === "active").length,
+      endedSessions: sessions.filter((s: any) => s.status === "ended").length,
+    };
+
+    return res.json({ ok: true, persistence: true, windowDays: days, items, summary, count: items.length });
+  } catch (e: any) {
+    console.error("[manager.whisperer-sessions] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "whisperer_sessions_failed" });
   }
 });
 

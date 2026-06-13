@@ -372,7 +372,8 @@ router.post("/sessions", express.json(), async (req, res) => {
       ended_at: null,
       latency_p50_ms: null,
       latency_p95_ms: null,
-      meta: { source: "simulator" },
+      // Day 114: source distinguishes live-listener vs manual-simulator sessions
+      meta: { source: ["live", "manual", "simulator"].includes(String((req.body as any)?.source)) ? (req.body as any).source : "manual" },
       created_at: nowIso,
       updated_at: nowIso,
     };
