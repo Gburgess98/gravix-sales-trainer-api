@@ -14,6 +14,31 @@ function check(label: string, ok: boolean) {
 
 const detect = (text: string, extra: Partial<Parameters<typeof detectWhispererTriggers>[0]> = {}) =>
   detectWhispererTriggers({ sessionId: "s1", text, speaker: "prospect", ...extra });
+const topType = (text: string) => detect(text)[0]?.type;
+
+// ── Day 117: semantic (meaning-based) detection — NOT exact phrases ──
+check("'the price is too high' → price", topType("the price is too high") === "price");
+check("'that's a bit steep' → price", topType("that's a bit steep") === "price");
+check("'we can't afford that' → price", topType("we can't afford that") === "price");
+check("'that's outside our budget' → price", topType("that's outside our budget") === "price");
+check("'we don't have budget' → price", topType("we don't have budget for this") === "price");
+check("'hard to justify the cost' → price", topType("it's hard to justify the cost") === "price");
+check("'that's more than expected' → price", topType("that's more than we expected") === "price");
+check("'we need something cheaper' → price", topType("we need something cheaper") === "price");
+check("'costs are tight right now' → price", topType("costs are tight right now") === "price");
+check("'we're not ready yet' → timing", topType("we're not ready yet") === "timing");
+check("'circle back next month' → timing", topType("let's circle back next month") === "timing");
+check("'I need to ask my boss' → authority", topType("I need to ask my boss") === "authority");
+check("'my wife needs to decide' → authority", topType("my wife needs to decide on this") === "authority");
+check("'do you have reviews' → trust", topType("do you have reviews") === "trust");
+check("'how do I know this works' → trust", topType("how do I know this works") === "trust");
+check("'we already use someone' → competitor", topType("we already use someone for that") === "competitor");
+check("'we have a provider' → competitor", topType("we have a provider already") === "competitor");
+check("'send over the details' → send_info", topType("can you send over the details") === "send_info");
+check("'email me something' → send_info", topType("just email me something") === "send_info");
+check("price phrase from rep → no trigger", detect("the price is too high", { speaker: "rep" }).length === 0);
+check("neutral 'high quality product' → no price trigger", !detect("this is a high quality product").some((t) => t.type === "price"));
+check("unrelated text → no trigger", detect("good morning, lovely weather today").length === 0);
 
 // ── Type detection ──
 check("'too expensive' → price", detect("this is too expensive")[0]?.type === "price");
@@ -24,9 +49,10 @@ check("'sounds like a scam' → trust", detect("this sounds like a scam")[0]?.ty
 check("'already have a provider' → competitor", detect("we already have a provider")[0]?.type === "competitor");
 check("neutral text → no triggers", detect("good morning, how are you").length === 0);
 
-// ── Confidence tiers ──
+// ── Confidence tiers (semantic) ──
 check("exact phrase → confidence 90", detect("too expensive")[0]?.confidence === 90);
-check("loose keyword → confidence 70", detect("that's quite pricey")[0]?.confidence === 70);
+check("strong semantic combo → 80–89", (() => { const c = detect("that's quite pricey")[0]?.confidence ?? 0; return c >= 80 && c < 90; })());
+check("semantic matches clear threshold (>=70)", detect("the price is too high")[0]?.confidence >= 70);
 
 // ── Speaker rule ──
 check("rep speech never triggers", detect("too expensive", { speaker: "rep" }).length === 0);

@@ -7,6 +7,15 @@ export {
   type RecentTrigger,
   detectWhispererTriggers,
   suggestionFor,
+  normaliseTranscriptText,
+  scoreTriggerIntent,
+  detectPriceIntent,
+  detectTimingIntent,
+  detectAuthorityIntent,
+  detectTrustIntent,
+  detectCompetitorIntent,
+  detectSendInfoIntent,
+  TRIGGER_THRESHOLD,
 } from "./triggers";
 
 export { whispererTablesAvailable, resetWhispererSchemaProbe } from "./schema";
