@@ -148,6 +148,7 @@ async function getManagerForRep(supa: any, repId: string) {
 }
 
 import { getOrgCallVisibility } from "../lib/adminConfig";
+import { whispererTablesAvailable } from "../whisperer";
 
 async function canAccessCall(
   requester: string,
@@ -1684,6 +1685,76 @@ router.get("/:id/scores", async (req, res) => {
     res.json({ ok: true, items: data ?? [] });
   } catch (e: any) {
     console.error("[GET /:id/scores] error", e);
+    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+  }
+});
+
+/* -------------------------------------------
+   GET /v1/calls/:id/whisperer-triggers
+   TIER 2B Day 115 — replay Whisperer trigger moments on the call page.
+   Same call-access check as /:id/scores; fail-soft if tables are missing.
+   (ORDERED BEFORE /:id to avoid route capture)
+-------------------------------------------- */
+router.get("/:id/whisperer-triggers", async (req, res) => {
+  try {
+    const id = String(req.params.id);
+    if (!UUID_RE.test(id)) return res.status(400).json({ ok: false, error: "invalid id" });
+
+    const requester = getUserIdHeader(req);
+
+    const { data: call, error: callErr } = await supa
+      .from("calls")
+      .select("id,user_id,org_id")
+      .eq("id", id)
+      .single();
+    if (callErr || !call) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const allowed = await canAccessCall(requester, call.user_id, call.org_id ?? null);
+    if (!allowed) return res.status(403).json({ ok: false, error: "forbidden" });
+
+    const available = await whispererTablesAvailable(supa).catch(() => false);
+    if (!available) {
+      return res.json({ ok: true, callId: id, persistence: false, items: [], count: 0 });
+    }
+
+    // Sessions linked to this call, then their triggers (one query each).
+    const { data: sessionRows } = await supa
+      .from("whisperer_sessions")
+      .select("id, meta")
+      .eq("call_id", id)
+      .limit(50);
+    const sessions = sessionRows ?? [];
+    if (sessions.length === 0) {
+      return res.json({ ok: true, callId: id, persistence: true, items: [], count: 0 });
+    }
+
+    const sourceBySession = new Map<string, string>();
+    for (const s of sessions) sourceBySession.set(String(s.id), String((s as any).meta?.source || "unknown"));
+    const sessionIds = sessions.map((s: any) => String(s.id));
+
+    const { data: triggerRows } = await supa
+      .from("whisperer_triggers")
+      .select("id, session_id, type, phrase, segment_text, confidence, suggestion, latency_ms, detected_at")
+      .in("session_id", sessionIds)
+      .order("detected_at", { ascending: true })
+      .limit(100);
+
+    const items = (triggerRows ?? []).map((t: any) => ({
+      triggerId: String(t.id),
+      sessionId: String(t.session_id),
+      type: String(t.type),
+      phrase: t.phrase ?? null,
+      segmentText: t.segment_text ?? "",
+      confidence: typeof t.confidence === "number" ? t.confidence : null,
+      suggestion: t.suggestion || null,
+      latencyMs: typeof t.latency_ms === "number" ? t.latency_ms : null,
+      detectedAt: t.detected_at,
+      source: sourceBySession.get(String(t.session_id)) || "unknown",
+    }));
+
+    return res.json({ ok: true, callId: id, persistence: true, items, count: items.length });
+  } catch (e: any) {
+    console.error("[GET /:id/whisperer-triggers] error", e);
     res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
   }
 });
