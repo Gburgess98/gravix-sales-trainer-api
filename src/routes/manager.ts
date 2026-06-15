@@ -920,8 +920,18 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
       topTriggerTypes: [] as Array<{ type: string; count: number }>,
       avgLatencyMs: null as number | null,
       activeSessions: 0,
+      staleSessions: 0,
       endedSessions: 0,
     };
+
+    // Day 118: an "active" session older than 30 min was never ended cleanly.
+    // We classify it as stale in the response (no DB mutation here).
+    const STALE_AFTER_MS = 30 * 60 * 1000;
+    const nowMs = Date.now();
+    const isStaleSession = (s: any): boolean =>
+      s.status === "active" &&
+      Number.isFinite(new Date(s.started_at).getTime()) &&
+      nowMs - new Date(s.started_at).getTime() > STALE_AFTER_MS;
 
     // Fail-soft if the migration hasn't been applied in this environment
     const available = await whispererTablesAvailable(supa).catch(() => false);
@@ -1009,7 +1019,8 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
         sessionId: sid,
         repId,
         repName: (repId && repNames.get(repId)) || "Unknown rep",
-        status: (s.status === "active" || s.status === "ended") ? s.status : "unknown",
+        status: isStaleSession(s) ? "stale" : (s.status === "active" || s.status === "ended") ? s.status : "unknown",
+        isStale: isStaleSession(s),
         startedAt: s.started_at,
         endedAt: s.ended_at ?? null,
         triggerCount: sessionTriggers.length,
@@ -1035,7 +1046,8 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
       triggerCount: triggers.length,
       topTriggerTypes: topTypes(triggers, 5),
       avgLatencyMs: avg(allLatencies),
-      activeSessions: sessions.filter((s: any) => s.status === "active").length,
+      activeSessions: sessions.filter((s: any) => s.status === "active" && !isStaleSession(s)).length,
+      staleSessions: sessions.filter((s: any) => isStaleSession(s)).length,
       endedSessions: sessions.filter((s: any) => s.status === "ended").length,
     };
 

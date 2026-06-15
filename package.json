@@ -43,6 +43,7 @@
     "db:backfill": "tsx scripts/backfill-reps-company.ts",
     "db:backfill-calls": "tsx scripts/backfill-calls-hierarchy.ts",
     "db:backfill-sparring": "tsx scripts/backfill-sparring-data-model.ts",
+    "db:cleanup-whisperer-stale": "tsx scripts/cleanup-stale-whisperer-sessions.ts",
     "validate:isolation": "tsx scripts/validate-isolation.ts",
     "validate:partner": "tsx scripts/validate-partner.ts",
     "validate:permissions": "tsx scripts/validate-permissions.ts",
