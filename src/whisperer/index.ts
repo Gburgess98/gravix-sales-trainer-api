@@ -19,3 +19,11 @@ export {
 } from "./triggers";
 
 export { whispererTablesAvailable, resetWhispererSchemaProbe } from "./schema";
+
+export {
+  type CustomTriggerRow,
+  type CustomTriggerRule,
+  normaliseCustomTrigger,
+  detectCustomWhispererTriggers,
+  mergeBuiltInAndCustomTriggers,
+} from "./customTriggers";

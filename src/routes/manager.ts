@@ -1058,4 +1058,198 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
   }
 });
 
+// ── Custom Whisperer trigger library (Tier 2B Day 119) ───────────────────────
+// Manager CRUD, tenant-scoped. requireManager gates the whole router. New rules
+// are stamped with the manager's org/company/office; managers only act within
+// their scope. Fail-soft when the table hasn't been migrated.
+
+const WTL_FIELDS =
+  "id, org_id, company_id, office_id, created_by, name, description, type, match_phrases, match_keywords, suggestion_title, suggestion_response, urgency, emoji, enabled, priority, created_at, updated_at";
+
+function whispererLibraryTableMissing(error: any): boolean {
+  const msg = String(error?.message || "").toLowerCase();
+  return msg.includes("whisperer_trigger_library") &&
+    (msg.includes("does not exist") || msg.includes("could not find") || msg.includes("schema cache"));
+}
+
+function normaliseLibraryItem(row: any) {
+  return {
+    id: String(row.id),
+    name: row.name,
+    description: row.description ?? null,
+    type: row.type,
+    matchPhrases: row.match_phrases ?? [],
+    matchKeywords: row.match_keywords ?? [],
+    suggestionTitle: row.suggestion_title,
+    suggestionResponse: row.suggestion_response,
+    urgency: row.urgency,
+    emoji: row.emoji ?? null,
+    enabled: row.enabled,
+    priority: row.priority,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+// Body → DB column patch with validation. Returns {error} or {patch}.
+function validateLibraryBody(body: any, partial: boolean): { error?: string; patch?: Record<string, any> } {
+  const patch: Record<string, any> = {};
+  const has = (k: string) => body[k] !== undefined;
+
+  if (!partial || has("name")) {
+    const name = String(body.name || "").trim();
+    if (!name) return { error: "name_required" };
+    patch.name = name;
+  }
+  if (!partial || has("suggestionTitle")) {
+    const t = String(body.suggestionTitle || "").trim();
+    if (!t) return { error: "suggestion_title_required" };
+    patch.suggestion_title = t;
+  }
+  if (!partial || has("suggestionResponse")) {
+    const r = String(body.suggestionResponse || "").trim();
+    if (!r) return { error: "suggestion_response_required" };
+    patch.suggestion_response = r;
+  }
+  if (has("description")) patch.description = body.description ? String(body.description).slice(0, 1000) : null;
+  if (has("type")) patch.type = String(body.type || "custom").trim() || "custom";
+  if (has("matchPhrases")) patch.match_phrases = Array.isArray(body.matchPhrases) ? body.matchPhrases.map((p: any) => String(p).trim()).filter(Boolean) : [];
+  if (has("matchKeywords")) patch.match_keywords = Array.isArray(body.matchKeywords) ? body.matchKeywords.map((k: any) => String(k).trim()).filter(Boolean) : [];
+  if (has("urgency")) {
+    const u = String(body.urgency || "").toLowerCase();
+    patch.urgency = (u === "low" || u === "high") ? u : "medium";
+  }
+  if (has("emoji")) patch.emoji = body.emoji ? String(body.emoji).slice(0, 8) : null;
+  if (has("enabled")) patch.enabled = Boolean(body.enabled);
+  if (has("priority")) patch.priority = Math.max(0, Math.min(100, parseInt(String(body.priority), 10) || 50));
+
+  // On create, at least one phrase or keyword must be present.
+  if (!partial) {
+    const phrases = patch.match_phrases ?? [];
+    const keywords = patch.match_keywords ?? [];
+    if (phrases.length === 0 && keywords.length === 0) return { error: "match_phrase_or_keyword_required" };
+  }
+  return { patch };
+}
+
+// Scope filter shared by GET/PATCH/DELETE: a manager sees rules in their office
+// or company (mirrors applyHierarchyFilters semantics for this table).
+function applyLibraryScope(query: any, ctx: any) {
+  if (!ctx) return query;
+  if (isOfficeManager(ctx)) return query.eq("office_id", ctx.office_id);
+  if (isCompanyManager(ctx)) return query.eq("company_id", ctx.company_id);
+  return query;
+}
+
+// GET /v1/manager/whisperer-trigger-library
+router.get("/whisperer-trigger-library", async (req: Request, res: Response) => {
+  try {
+    if (!supa) throw new Error("server_missing_supabase_env");
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+
+    const ctx = await getUserContext(supa, userId);
+    let q = supa.from("whisperer_trigger_library").select(WTL_FIELDS).order("priority", { ascending: false }).limit(200);
+    q = applyLibraryScope(q, ctx);
+
+    const { data, error } = await q;
+    if (error) {
+      if (whispererLibraryTableMissing(error)) return res.json({ ok: true, persistence: false, items: [] });
+      throw error;
+    }
+    return res.json({ ok: true, persistence: true, items: (data ?? []).map(normaliseLibraryItem) });
+  } catch (e: any) {
+    console.error("[manager.whisperer-trigger-library GET] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "library_list_failed" });
+  }
+});
+
+// POST /v1/manager/whisperer-trigger-library
+router.post("/whisperer-trigger-library", async (req: Request, res: Response) => {
+  try {
+    if (!supa) throw new Error("server_missing_supabase_env");
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+
+    const { error: vErr, patch } = validateLibraryBody(req.body ?? {}, false);
+    if (vErr) return res.status(400).json({ ok: false, error: vErr });
+
+    const ctx = await getUserContext(supa, userId);
+    const row = {
+      ...patch,
+      org_id: null,
+      company_id: ctx?.company_id ?? null,
+      office_id: ctx?.office_id ?? null,
+      created_by: userId,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data, error } = await supa.from("whisperer_trigger_library").insert(row).select(WTL_FIELDS).single();
+    if (error) {
+      if (whispererLibraryTableMissing(error)) {
+        return res.status(503).json({ ok: false, error: "migration_required", hint: "Run sql/20260615_whisperer_trigger_library.sql" });
+      }
+      throw error;
+    }
+    return res.json({ ok: true, item: normaliseLibraryItem(data) });
+  } catch (e: any) {
+    console.error("[manager.whisperer-trigger-library POST] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "library_create_failed" });
+  }
+});
+
+// PATCH /v1/manager/whisperer-trigger-library/:id
+router.patch("/whisperer-trigger-library/:id", async (req: Request, res: Response) => {
+  try {
+    if (!supa) throw new Error("server_missing_supabase_env");
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+    const id = String(req.params.id || "").trim();
+
+    const { error: vErr, patch } = validateLibraryBody(req.body ?? {}, true);
+    if (vErr) return res.status(400).json({ ok: false, error: vErr });
+    if (!patch || Object.keys(patch).length === 0) return res.status(400).json({ ok: false, error: "no_fields" });
+
+    const ctx = await getUserContext(supa, userId);
+    // Scope guard: only update if the row is in the manager's scope
+    let sel = supa.from("whisperer_trigger_library").select("id").eq("id", id);
+    sel = applyLibraryScope(sel, ctx);
+    const { data: existing, error: selErr } = await sel.maybeSingle();
+    if (selErr && !whispererLibraryTableMissing(selErr)) throw selErr;
+    if (!existing) return res.status(404).json({ ok: false, error: "not_found_or_out_of_scope" });
+
+    patch.updated_at = new Date().toISOString();
+    const { data, error } = await supa.from("whisperer_trigger_library").update(patch).eq("id", id).select(WTL_FIELDS).single();
+    if (error) throw error;
+    return res.json({ ok: true, item: normaliseLibraryItem(data) });
+  } catch (e: any) {
+    console.error("[manager.whisperer-trigger-library PATCH] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "library_update_failed" });
+  }
+});
+
+// DELETE /v1/manager/whisperer-trigger-library/:id
+router.delete("/whisperer-trigger-library/:id", async (req: Request, res: Response) => {
+  try {
+    if (!supa) throw new Error("server_missing_supabase_env");
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+    const id = String(req.params.id || "").trim();
+
+    const ctx = await getUserContext(supa, userId);
+    let sel = supa.from("whisperer_trigger_library").select("id").eq("id", id);
+    sel = applyLibraryScope(sel, ctx);
+    const { data: existing, error: selErr } = await sel.maybeSingle();
+    if (selErr && !whispererLibraryTableMissing(selErr)) throw selErr;
+    if (!existing) return res.status(404).json({ ok: false, error: "not_found_or_out_of_scope" });
+
+    const { error } = await supa.from("whisperer_trigger_library").delete().eq("id", id);
+    if (error) throw error;
+    return res.json({ ok: true, deleted: id });
+  } catch (e: any) {
+    console.error("[manager.whisperer-trigger-library DELETE] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "library_delete_failed" });
+  }
+});
+
 export default router;

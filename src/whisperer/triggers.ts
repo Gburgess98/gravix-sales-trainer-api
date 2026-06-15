@@ -27,6 +27,8 @@ export type WhispererTrigger = {
   phrase: string;
   confidence: number; // 0–100
   suggestion: WhispererSuggestion;
+  // Day 119: present on custom-library matches (customTriggerId, priority, custom)
+  meta?: Record<string, unknown>;
 };
 
 export type RecentTrigger = {

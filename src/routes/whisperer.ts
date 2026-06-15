@@ -5,8 +5,12 @@ import { v4 as uuidv4 } from "uuid";
 // TIER 2B Day 111 — Live Whisperer stub loop
 import {
   detectWhispererTriggers,
+  detectCustomWhispererTriggers,
+  mergeBuiltInAndCustomTriggers,
+  normaliseCustomTrigger,
   whispererTablesAvailable,
   type RecentTrigger,
+  type CustomTriggerRule,
 } from "../whisperer";
 import { logAuditEvent } from "../lib/audit";
 
@@ -287,6 +291,39 @@ async function loadWhispererSession(id: string): Promise<{
   return { session: data ?? null, persisted };
 }
 
+// Day 119: load enabled custom trigger rules for a session's tenant scope.
+// Preference: office rules first, then company, then org. Fail-soft → [].
+async function loadCustomTriggerRules(session: Record<string, any>): Promise<CustomTriggerRule[]> {
+  try {
+    const ors: string[] = [];
+    if (session.office_id) ors.push(`office_id.eq.${session.office_id}`);
+    if (session.company_id) ors.push(`company_id.eq.${session.company_id}`);
+    if (session.org_id) ors.push(`org_id.eq.${session.org_id}`);
+    if (ors.length === 0) return [];
+
+    const { data, error } = await supa
+      .from("whisperer_trigger_library")
+      .select("*")
+      .eq("enabled", true)
+      .or(ors.join(","))
+      .order("priority", { ascending: false })
+      .limit(200);
+
+    if (error) {
+      const msg = String(error.message || "").toLowerCase();
+      if (msg.includes("whisperer_trigger_library")) return []; // table not migrated yet
+      throw error;
+    }
+
+    return (data ?? [])
+      .map((row: any) => normaliseCustomTrigger(row))
+      .filter((r): r is CustomTriggerRule => r !== null);
+  } catch (e: any) {
+    console.warn("[whisperer] loadCustomTriggerRules failed", e?.message || e);
+    return [];
+  }
+}
+
 // POST /v1/whisperer/deepgram-token — mint a short-lived client token (Day 112)
 // Uses Deepgram's Grant Token API so the browser never holds the permanent key.
 // Requires a normal authenticated user (not a manager).
@@ -483,13 +520,30 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
       }));
     }
 
-    const detected = detectWhispererTriggers({
+    const builtIns = detectWhispererTriggers({
       sessionId: id,
       text,
       speaker,
       now: receivedAt,
       recentTriggers,
     });
+
+    // Day 119: custom manager-defined triggers for this session's scope.
+    // Fail-soft — a library error must never break the live path.
+    let customMatches: typeof builtIns = [];
+    try {
+      const rules = await loadCustomTriggerRules(session);
+      if (rules.length > 0) {
+        customMatches = detectCustomWhispererTriggers(
+          { text, speaker, now: receivedAt, recentTriggers },
+          rules
+        );
+      }
+    } catch (e: any) {
+      console.warn("[whisperer/segments] custom trigger load failed", e?.message || e);
+    }
+
+    const detected = mergeBuiltInAndCustomTriggers(builtIns, customMatches);
 
     // Latency: spoken/typed moment → trigger ready (client clock when given)
     const clientSentAtRaw = String((req.body as any)?.clientSentAt || "").trim();
@@ -508,7 +562,7 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
       suggestion: t.suggestion,
       latency_ms: latencyMs,
       detected_at: receivedAt.toISOString(),
-      meta: { speaker },
+      meta: { speaker, ...(t.meta?.custom ? { customTriggerId: t.meta.customTriggerId, custom: true } : {}) },
       created_at: receivedAt.toISOString(),
     }));
 

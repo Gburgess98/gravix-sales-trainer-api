@@ -83,5 +83,45 @@ const a = detect("this is too expensive");
 const b = detect("this is too expensive");
 check("repeated input gives identical output", JSON.stringify(a) === JSON.stringify(b));
 
+// ── Day 119: custom trigger library matching (DB-independent) ──
+import {
+  normaliseCustomTrigger,
+  detectCustomWhispererTriggers,
+  mergeBuiltInAndCustomTriggers,
+} from "../src/whisperer/customTriggers";
+
+const acmeRule = normaliseCustomTrigger({
+  id: "rule-acme",
+  type: "competitor",
+  name: "Competitor: Acme",
+  match_phrases: ["we use acme"],
+  match_keywords: ["acme"],
+  suggestion_title: "Position against Acme",
+  suggestion_response: "Acknowledge Acme, then ask what they wish was better.",
+  urgency: "high",
+  emoji: "💥",
+  enabled: true,
+  priority: 80,
+});
+check("normaliseCustomTrigger builds a usable rule", acmeRule !== null && acmeRule!.id === "rule-acme");
+check("disabled rule normalises to null", normaliseCustomTrigger({ id: "x", enabled: false, suggestion_title: "a", suggestion_response: "b", match_keywords: ["k"] }) === null);
+check("rule with no phrases/keywords → null", normaliseCustomTrigger({ id: "x", suggestion_title: "a", suggestion_response: "b" }) === null);
+
+const rules = acmeRule ? [acmeRule] : [];
+const customPhrase = detectCustomWhispererTriggers({ text: "we use acme for this", speaker: "prospect" }, rules);
+check("custom phrase hit → confidence 90", customPhrase[0]?.confidence === 90 && customPhrase[0]?.type === "competitor");
+const customKw = detectCustomWhispererTriggers({ text: "yeah we have acme already", speaker: "prospect" }, rules);
+check("custom single keyword → confidence 75", customKw[0]?.confidence === 75);
+check("custom carries customTriggerId in meta", (customKw[0] as any)?.meta?.customTriggerId === "rule-acme");
+check("custom suggestion title comes from rule", customPhrase[0]?.suggestion.title === "Position against Acme");
+check("rep speech suppresses custom triggers", detectCustomWhispererTriggers({ text: "we use acme", speaker: "rep" }, rules).length === 0);
+check("custom dedupe within 30s", detectCustomWhispererTriggers({ text: "we use acme", speaker: "prospect", now: new Date(), recentTriggers: [{ type: "competitor", detectedAt: new Date().toISOString() }] }, rules).length === 0);
+
+const merged = mergeBuiltInAndCustomTriggers(
+  [{ type: "price", phrase: "p", confidence: 86, suggestion: { title: "t", response: "r", urgency: "high", emoji: null } }],
+  customPhrase
+);
+check("merge sorts highest confidence first (custom 90 > built-in 86)", merged[0]?.confidence === 90);
+
 console.log(failures === 0 ? "\nWhisperer trigger validation PASSED" : `\nWhisperer trigger validation FAILED (${failures})`);
 process.exit(failures === 0 ? 0 : 1);
