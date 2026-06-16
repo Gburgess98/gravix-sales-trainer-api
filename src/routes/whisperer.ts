@@ -593,6 +593,8 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
         suggestion: r.suggestion,
         detectedAt: r.detected_at,
         latencyMs: r.latency_ms,
+        // Day 121: echo custom-origin id (built-ins → null)
+        customTriggerId: (r.meta as any)?.customTriggerId ?? null,
       })),
       latencyMs,
     });
