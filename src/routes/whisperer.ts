@@ -614,9 +614,20 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
 
     const text = String((req.body as any)?.text || "").trim();
     if (!text) return res.status(400).json({ ok: false, error: "text_required" });
-    const speaker = ["rep", "prospect", "unknown"].includes(String((req.body as any)?.speaker))
-      ? ((req.body as any).speaker as "rep" | "prospect" | "unknown")
+
+    // Day 126: accept the manual logical speakers AND provisional Deepgram
+    // diarisation labels ("speaker_0", "speaker_1", …). The label is stored
+    // verbatim, but the trigger engine only understands rep/prospect/unknown:
+    //   • rep            → suppressed (rep's own words never fire objections)
+    //   • diarised label → treated as prospect-like so triggers still fire
+    //     (we cannot know which diarised speaker is the rep without calibration)
+    const rawSpeaker = String((req.body as any)?.speaker || "").trim().toLowerCase();
+    const isDiarised = /^speaker_\d+$/.test(rawSpeaker);
+    const speakerLabel = ["rep", "prospect", "unknown"].includes(rawSpeaker) || isDiarised
+      ? rawSpeaker
       : "prospect";
+    const detectionSpeaker: "rep" | "prospect" | "unknown" =
+      speakerLabel === "rep" ? "rep" : speakerLabel === "unknown" ? "unknown" : "prospect";
 
     const receivedAt = new Date();
 
@@ -644,7 +655,7 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
     const builtIns = detectWhispererTriggers({
       sessionId: id,
       text,
-      speaker,
+      speaker: detectionSpeaker,
       now: receivedAt,
       recentTriggers,
     });
@@ -656,7 +667,7 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
       const rules = await loadCustomTriggerRules(session);
       if (rules.length > 0) {
         customMatches = detectCustomWhispererTriggers(
-          { text, speaker, now: receivedAt, recentTriggers },
+          { text, speaker: detectionSpeaker, now: receivedAt, recentTriggers },
           rules
         );
       }
@@ -683,7 +694,8 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
       suggestion: t.suggestion,
       latency_ms: latencyMs,
       detected_at: receivedAt.toISOString(),
-      meta: { speaker, ...(t.meta?.custom ? { customTriggerId: t.meta.customTriggerId, custom: true } : {}) },
+      // Day 126: store the original (possibly diarised) speaker label verbatim.
+      meta: { speaker: speakerLabel, ...(t.meta?.custom ? { customTriggerId: t.meta.customTriggerId, custom: true } : {}) },
       created_at: receivedAt.toISOString(),
     }));
 
@@ -702,7 +714,7 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
       persistence: persisted,
       segment: {
         text,
-        speaker,
+        speaker: speakerLabel,
         receivedAt: receivedAt.toISOString(),
         processedAt: new Date().toISOString(),
       },
