@@ -1090,6 +1090,7 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
       Boolean(t?.meta?.customTriggerId || t?.meta?.custom_trigger_id || t?.meta?.custom);
 
     const byType = new Map<string, Tally>();
+    const customByType = new Map<string, Tally>(); // Day 125: custom-only, for health flags
     const custom = newTally();
     const builtIn = newTally();
     for (const t of triggers) {
@@ -1097,7 +1098,13 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
       const type = String((t as any).type || "unknown");
       if (!byType.has(type)) byType.set(type, newTally());
       addToTally(byType.get(type)!, outcome);
-      addToTally(isCustomTrigger(t) ? custom : builtIn, outcome);
+      if (isCustomTrigger(t)) {
+        if (!customByType.has(type)) customByType.set(type, newTally());
+        addToTally(customByType.get(type)!, outcome);
+        addToTally(custom, outcome);
+      } else {
+        addToTally(builtIn, outcome);
+      }
     }
     const usefulnessByType = Array.from(byType.entries())
       .map(([type, t]) => ({ type, shown: t.shown, used: t.used, ignored: t.ignored, notRelevant: t.notRelevant, unrated: t.unrated, usedRate: tallyUsedRate(t) }))
@@ -1106,6 +1113,28 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
       custom: { ...custom, usedRate: tallyUsedRate(custom) },
       builtIn: { ...builtIn, usedRate: tallyUsedRate(builtIn) },
     };
+
+    // Day 125: flag custom triggers that look noisy so managers know what to edit.
+    // MVP thresholds — low used rate with enough rated volume, or repeatedly
+    // marked not relevant. unrated is excluded from usedRate.
+    const needsEditing = Array.from(customByType.entries())
+      .map(([type, t]) => {
+        const rated = t.used + t.ignored + t.notRelevant;
+        const rate = tallyUsedRate(t);
+        const lowUsed = t.shown >= 5 && rated >= 3 && rate !== null && rate < 30;
+        const oftenNotRelevant = t.shown >= 5 && t.notRelevant >= 3;
+        if (!lowUsed && !oftenNotRelevant) return null;
+        return {
+          type,
+          shown: t.shown, used: t.used, ignored: t.ignored, notRelevant: t.notRelevant, unrated: t.unrated,
+          usedRate: rate,
+          reason: oftenNotRelevant ? "Often marked not relevant" : "Low used rate",
+          severity: "warning" as const,
+        };
+      })
+      .filter((r): r is NonNullable<typeof r> => r !== null)
+      .sort((a, b) => b.notRelevant - a.notRelevant || (a.usedRate ?? 101) - (b.usedRate ?? 101) || b.shown - a.shown);
+    const customTriggerHealth = { needsEditing };
 
     const summary = {
       sessionCount: sessions.length,
@@ -1119,6 +1148,7 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
       usedRate,
       usefulnessByType,
       customVsBuiltIn,
+      customTriggerHealth,
     };
 
     return res.json({ ok: true, persistence: true, windowDays: days, items, summary, count: items.length });
