@@ -967,7 +967,8 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
     const sessionIds = sessions.map((s: any) => String(s.id));
 
     // Triggers for these sessions (one query, grouped in code)
-    const baseTrigCols = "session_id, type, phrase, confidence, suggestion, latency_ms, detected_at";
+    // Day 124: meta carries customTriggerId for custom-vs-built-in breakdown.
+    const baseTrigCols = "session_id, type, phrase, confidence, suggestion, latency_ms, detected_at, meta";
     // Day 122: include suggestion_outcome; fail-soft if column not migrated yet.
     const trigWide = await supa
       .from("whisperer_triggers")
@@ -1068,6 +1069,44 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
     const ratedTotal = outcomeCounts.used + outcomeCounts.ignored + outcomeCounts.notRelevant;
     const usedRate = ratedTotal > 0 ? Math.round((outcomeCounts.used / ratedTotal) * 100) : null;
 
+    // Day 124: usefulness breakdown by trigger type + custom-vs-built-in.
+    // A tally accumulates outcome counts and derives shown + usedRate.
+    type Tally = { shown: number; used: number; ignored: number; notRelevant: number; unrated: number };
+    const newTally = (): Tally => ({ shown: 0, used: 0, ignored: 0, notRelevant: 0, unrated: 0 });
+    const addToTally = (t: Tally, outcome: string) => {
+      t.shown += 1;
+      switch (outcome) {
+        case "used": t.used += 1; break;
+        case "ignored": t.ignored += 1; break;
+        case "not_relevant": t.notRelevant += 1; break;
+        default: t.unrated += 1; break;
+      }
+    };
+    const tallyUsedRate = (t: Tally): number | null => {
+      const rated = t.used + t.ignored + t.notRelevant;
+      return rated > 0 ? Math.round((t.used / rated) * 100) : null;
+    };
+    const isCustomTrigger = (t: any): boolean =>
+      Boolean(t?.meta?.customTriggerId || t?.meta?.custom_trigger_id || t?.meta?.custom);
+
+    const byType = new Map<string, Tally>();
+    const custom = newTally();
+    const builtIn = newTally();
+    for (const t of triggers) {
+      const outcome = String((t as any).suggestion_outcome || "");
+      const type = String((t as any).type || "unknown");
+      if (!byType.has(type)) byType.set(type, newTally());
+      addToTally(byType.get(type)!, outcome);
+      addToTally(isCustomTrigger(t) ? custom : builtIn, outcome);
+    }
+    const usefulnessByType = Array.from(byType.entries())
+      .map(([type, t]) => ({ type, shown: t.shown, used: t.used, ignored: t.ignored, notRelevant: t.notRelevant, unrated: t.unrated, usedRate: tallyUsedRate(t) }))
+      .sort((a, b) => b.shown - a.shown || a.type.localeCompare(b.type));
+    const customVsBuiltIn = {
+      custom: { ...custom, usedRate: tallyUsedRate(custom) },
+      builtIn: { ...builtIn, usedRate: tallyUsedRate(builtIn) },
+    };
+
     const summary = {
       sessionCount: sessions.length,
       triggerCount: triggers.length,
@@ -1078,6 +1117,8 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
       endedSessions: sessions.filter((s: any) => s.status === "ended").length,
       suggestionOutcomes: outcomeCounts,
       usedRate,
+      usefulnessByType,
+      customVsBuiltIn,
     };
 
     return res.json({ ok: true, persistence: true, windowDays: days, items, summary, count: items.length });
