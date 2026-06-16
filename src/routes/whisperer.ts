@@ -629,6 +629,14 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
     const detectionSpeaker: "rep" | "prospect" | "unknown" =
       speakerLabel === "rep" ? "rep" : speakerLabel === "unknown" ? "unknown" : "prospect";
 
+    // Day 127: when the web maps a calibrated speaker (e.g. speaker_0 → "rep"),
+    // it still sends the original diarised label for traceability. Optional and
+    // never required — stored in trigger meta only when it's a valid label.
+    const diarizedRaw = String(
+      (req.body as any)?.diarizedSpeaker || (req.body as any)?.originalSpeaker || ""
+    ).trim().toLowerCase();
+    const diarizedSpeaker = /^speaker_\d+$/.test(diarizedRaw) ? diarizedRaw : null;
+
     const receivedAt = new Date();
 
     // De-dup context: recent triggers from the last 60s
@@ -695,7 +703,12 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
       latency_ms: latencyMs,
       detected_at: receivedAt.toISOString(),
       // Day 126: store the original (possibly diarised) speaker label verbatim.
-      meta: { speaker: speakerLabel, ...(t.meta?.custom ? { customTriggerId: t.meta.customTriggerId, custom: true } : {}) },
+      // Day 127: when calibrated, also keep the diarised origin for traceability.
+      meta: {
+        speaker: speakerLabel,
+        ...(diarizedSpeaker ? { diarizedSpeaker } : {}),
+        ...(t.meta?.custom ? { customTriggerId: t.meta.customTriggerId, custom: true } : {}),
+      },
       created_at: receivedAt.toISOString(),
     }));
 
