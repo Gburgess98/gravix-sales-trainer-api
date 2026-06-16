@@ -291,6 +291,35 @@ async function loadWhispererSession(id: string): Promise<{
   return { session: data ?? null, persisted };
 }
 
+// Day 122: detect a missing suggestion_outcome column (migration not applied
+// in this environment). Mirrors the trigger-library table-missing probe.
+function whispererOutcomeColumnMissing(error: any): boolean {
+  const msg = String(error?.message || "").toLowerCase();
+  return msg.includes("suggestion_outcome") &&
+    (msg.includes("does not exist") || msg.includes("could not find") || msg.includes("schema cache") || msg.includes("column"));
+}
+
+// Day 122: a session's outcome can be marked by its owner or by a manager whose
+// hierarchy covers the session's office/company. Mirrors manager.ts scoping
+// (users.role + is_admin), so the reps.tier gate is not needed here.
+async function canMarkSessionOutcome(userId: string, session: Record<string, any>): Promise<boolean> {
+  if (!userId) return false;
+  if (String(session.user_id) === userId || String(session.rep_id) === userId) return true;
+  const { data } = await supa
+    .from("users")
+    .select("role, office_id, company_id, is_admin")
+    .eq("id", userId)
+    .maybeSingle();
+  if (!data) return false;
+  if (data.is_admin) return true;
+  const role = String((data as any).role || "");
+  if (role === "office_manager" && (data as any).office_id && (data as any).office_id === session.office_id) return true;
+  if (role === "company_manager" && (data as any).company_id && (data as any).company_id === session.company_id) return true;
+  return false;
+}
+
+const SUGGESTION_OUTCOMES = new Set(["used", "ignored", "not_relevant"]);
+
 // Day 119: load enabled custom trigger rules for a session's tenant scope.
 // Preference: office rules first, then company, then org. Fail-soft → [].
 async function loadCustomTriggerRules(session: Record<string, any>): Promise<CustomTriggerRule[]> {
@@ -457,13 +486,25 @@ router.get("/sessions/:id", async (req, res) => {
 
     let triggers: Record<string, any>[] = [];
     if (persisted) {
-      const { data } = await supa
+      const baseCols = "id, segment_text, type, phrase, confidence, suggestion, latency_ms, detected_at";
+      // Day 122: include outcome; fail-soft to base columns if not migrated yet.
+      const wide = await supa
         .from("whisperer_triggers")
-        .select("id, segment_text, type, phrase, confidence, suggestion, latency_ms, detected_at")
+        .select(`${baseCols}, suggestion_outcome, suggestion_outcome_at`)
         .eq("session_id", id)
         .order("created_at", { ascending: true })
         .limit(200);
-      triggers = data ?? [];
+      let rows: any[] | null = wide.data;
+      if (wide.error && whispererOutcomeColumnMissing(wide.error)) {
+        const narrow = await supa
+          .from("whisperer_triggers")
+          .select(baseCols)
+          .eq("session_id", id)
+          .order("created_at", { ascending: true })
+          .limit(200);
+        rows = narrow.data;
+      }
+      triggers = rows ?? [];
     } else {
       triggers = memSessions.get(id)?.triggers ?? [];
     }
@@ -472,6 +513,86 @@ router.get("/sessions/:id", async (req, res) => {
   } catch (e: any) {
     console.error("[whisperer/sessions GET] error", e);
     return res.status(400).json({ ok: false, error: e?.message || "bad_request" });
+  }
+});
+
+// PATCH /v1/whisperer/triggers/:id/outcome — Day 122 suggestion quality scoring.
+// Owner or in-hierarchy manager marks a suggestion used / ignored / not_relevant.
+router.patch("/triggers/:id/outcome", express.json(), async (req, res) => {
+  try {
+    const userId = getWhispererUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+
+    const triggerId = String(req.params.id || "").trim();
+    if (!triggerId) return res.status(400).json({ ok: false, error: "invalid_trigger_id" });
+
+    const outcome = String((req.body as any)?.outcome || "").trim();
+    if (!SUGGESTION_OUTCOMES.has(outcome)) {
+      return res.status(400).json({ ok: false, error: "invalid_outcome" });
+    }
+    const feedbackRaw = (req.body as any)?.feedback;
+    const feedback = typeof feedbackRaw === "string" ? feedbackRaw.trim().slice(0, 1000) : undefined;
+
+    const persisted = await whispererTablesAvailable(supa).catch(() => false);
+    if (!persisted) {
+      return res.status(503).json({ ok: false, error: "migration_required", hint: "Run sql/20260612_whisperer_stub_loop.sql" });
+    }
+
+    // Find the trigger, then its session for the scope check.
+    const { data: trig, error: tErr } = await supa
+      .from("whisperer_triggers")
+      .select("id, session_id")
+      .eq("id", triggerId)
+      .maybeSingle();
+    if (tErr) throw tErr;
+    if (!trig) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const { session } = await loadWhispererSession(String(trig.session_id));
+    if (!session) return res.status(404).json({ ok: false, error: "not_found" });
+
+    const allowed = await canMarkSessionOutcome(userId, session);
+    if (!allowed) return res.status(403).json({ ok: false, error: "forbidden" });
+
+    const patch: Record<string, any> = {
+      suggestion_outcome: outcome,
+      suggestion_outcome_at: new Date().toISOString(),
+      suggestion_outcome_by: userId,
+    };
+    if (feedback !== undefined) patch.suggestion_feedback = feedback;
+
+    const { data: updated, error: uErr } = await supa
+      .from("whisperer_triggers")
+      .update(patch)
+      .eq("id", triggerId)
+      .select("id, suggestion_outcome, suggestion_outcome_at, suggestion_outcome_by")
+      .single();
+    if (uErr) {
+      if (whispererOutcomeColumnMissing(uErr)) {
+        return res.status(503).json({ ok: false, error: "migration_required", hint: "Run sql/20260616_whisperer_suggestion_outcome.sql" });
+      }
+      throw uErr;
+    }
+
+    void logAuditEvent({
+      actorUserId: userId,
+      action: "whisperer.suggestion_outcome",
+      entityType: "whisperer_trigger",
+      entityId: triggerId,
+      metadata: { outcome, session_id: String(trig.session_id) },
+    });
+
+    return res.json({
+      ok: true,
+      trigger: {
+        id: String(updated.id),
+        suggestionOutcome: (updated as any).suggestion_outcome ?? null,
+        suggestionOutcomeAt: (updated as any).suggestion_outcome_at ?? null,
+        suggestionOutcomeBy: (updated as any).suggestion_outcome_by ?? null,
+      },
+    });
+  } catch (e: any) {
+    console.error("[whisperer/triggers outcome PATCH] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "outcome_update_failed" });
   }
 });
 
@@ -595,6 +716,8 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
         latencyMs: r.latency_ms,
         // Day 121: echo custom-origin id (built-ins → null)
         customTriggerId: (r.meta as any)?.customTriggerId ?? null,
+        // Day 122: freshly detected suggestions are always unrated
+        suggestionOutcome: null,
       })),
       latencyMs,
     });

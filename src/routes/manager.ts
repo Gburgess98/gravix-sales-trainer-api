@@ -967,13 +967,24 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
     const sessionIds = sessions.map((s: any) => String(s.id));
 
     // Triggers for these sessions (one query, grouped in code)
-    const { data: triggerRows } = await supa
+    const baseTrigCols = "session_id, type, phrase, confidence, suggestion, latency_ms, detected_at";
+    // Day 122: include suggestion_outcome; fail-soft if column not migrated yet.
+    const trigWide = await supa
       .from("whisperer_triggers")
-      .select("session_id, type, phrase, confidence, suggestion, latency_ms, detected_at")
+      .select(`${baseTrigCols}, suggestion_outcome`)
       .in("session_id", sessionIds)
       .order("detected_at", { ascending: true })
       .limit(5000);
-    const triggers = triggerRows ?? [];
+    let triggers: any[] = trigWide.data ?? [];
+    if (trigWide.error && /suggestion_outcome/i.test(String(trigWide.error.message || ""))) {
+      const trigNarrow = await supa
+        .from("whisperer_triggers")
+        .select(baseTrigCols)
+        .in("session_id", sessionIds)
+        .order("detected_at", { ascending: true })
+        .limit(5000);
+      triggers = trigNarrow.data ?? [];
+    }
 
     // Rep names (best-effort)
     const repIds = Array.from(new Set(sessions.map((s: any) => String(s.rep_id || s.user_id || "")).filter(Boolean)));
@@ -1034,6 +1045,8 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
               urgency: latest.suggestion?.urgency || "low",
               phrase: latest.phrase ?? null,
               createdAt: latest.detected_at,
+              // Day 122: usefulness signal (null = unrated)
+              suggestionOutcome: (latest as any).suggestion_outcome ?? null,
             }
           : null,
         source: (s.meta?.source as string) || "unknown",
@@ -1041,6 +1054,20 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
     });
 
     const allLatencies = triggers.map((t: any) => Number(t.latency_ms)).filter(Number.isFinite);
+
+    // Day 122: suggestion quality signal across this window's triggers.
+    const outcomeCounts = { used: 0, ignored: 0, notRelevant: 0, unrated: 0 };
+    for (const t of triggers) {
+      switch (String((t as any).suggestion_outcome || "")) {
+        case "used": outcomeCounts.used += 1; break;
+        case "ignored": outcomeCounts.ignored += 1; break;
+        case "not_relevant": outcomeCounts.notRelevant += 1; break;
+        default: outcomeCounts.unrated += 1; break;
+      }
+    }
+    const ratedTotal = outcomeCounts.used + outcomeCounts.ignored + outcomeCounts.notRelevant;
+    const usedRate = ratedTotal > 0 ? Math.round((outcomeCounts.used / ratedTotal) * 100) : null;
+
     const summary = {
       sessionCount: sessions.length,
       triggerCount: triggers.length,
@@ -1049,6 +1076,8 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
       activeSessions: sessions.filter((s: any) => s.status === "active" && !isStaleSession(s)).length,
       staleSessions: sessions.filter((s: any) => isStaleSession(s)).length,
       endedSessions: sessions.filter((s: any) => s.status === "ended").length,
+      suggestionOutcomes: outcomeCounts,
+      usedRate,
     };
 
     return res.json({ ok: true, persistence: true, windowDays: days, items, summary, count: items.length });

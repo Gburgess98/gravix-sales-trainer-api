@@ -1732,12 +1732,24 @@ router.get("/:id/whisperer-triggers", async (req, res) => {
     for (const s of sessions) sourceBySession.set(String(s.id), String((s as any).meta?.source || "unknown"));
     const sessionIds = sessions.map((s: any) => String(s.id));
 
-    const { data: triggerRows } = await supa
+    const baseTrigCols = "id, session_id, type, phrase, segment_text, confidence, suggestion, latency_ms, detected_at";
+    // Day 122: include suggestion outcome; fail-soft if column not migrated yet.
+    const trigWide = await supa
       .from("whisperer_triggers")
-      .select("id, session_id, type, phrase, segment_text, confidence, suggestion, latency_ms, detected_at")
+      .select(`${baseTrigCols}, suggestion_outcome, suggestion_outcome_at, suggestion_outcome_by`)
       .in("session_id", sessionIds)
       .order("detected_at", { ascending: true })
       .limit(100);
+    let triggerRows: any[] | null = trigWide.data;
+    if (trigWide.error && /suggestion_outcome/i.test(String(trigWide.error.message || ""))) {
+      const trigNarrow = await supa
+        .from("whisperer_triggers")
+        .select(baseTrigCols)
+        .in("session_id", sessionIds)
+        .order("detected_at", { ascending: true })
+        .limit(100);
+      triggerRows = trigNarrow.data;
+    }
 
     const items = (triggerRows ?? []).map((t: any) => ({
       triggerId: String(t.id),
@@ -1750,6 +1762,10 @@ router.get("/:id/whisperer-triggers", async (req, res) => {
       latencyMs: typeof t.latency_ms === "number" ? t.latency_ms : null,
       detectedAt: t.detected_at,
       source: sourceBySession.get(String(t.session_id)) || "unknown",
+      // Day 122: suggestion quality outcome (null = unrated)
+      suggestionOutcome: t.suggestion_outcome ?? null,
+      suggestionOutcomeAt: t.suggestion_outcome_at ?? null,
+      suggestionOutcomeBy: t.suggestion_outcome_by ?? null,
     }));
 
     return res.json({ ok: true, callId: id, persistence: true, items, count: items.length });
