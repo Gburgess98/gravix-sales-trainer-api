@@ -14,7 +14,7 @@ import { Router, type Request, type Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { requireManager } from "../middleware/requireManager";
 import { sparringHardeningColumns } from "../sparring";
-import { whispererTablesAvailable } from "../whisperer";
+import { whispererTablesAvailable, discoverTriggerCandidates, type DiscoveryItem } from "../whisperer";
 import {
   isCompanyManager,
   isOfficeManager,
@@ -1155,6 +1155,95 @@ router.get("/whisperer-sessions", async (req: Request, res: Response) => {
   } catch (e: any) {
     console.error("[manager.whisperer-sessions] error", e);
     return res.status(500).json({ ok: false, error: e?.message || "whisperer_sessions_failed" });
+  }
+});
+
+// ── GET /v1/manager/whisperer-trigger-candidates ─────────────────────────────
+// TIER 2B Day 130: AI Trigger Discovery — READ-ONLY. Mines stored trigger
+// segment text across the manager's scope and surfaces recurring sales moments
+// as *candidates* only. No DB writes, no activation, no LLM. Managers approve
+// anything into the custom trigger library by hand (existing POST endpoint).
+router.get("/whisperer-trigger-candidates", async (req: Request, res: Response) => {
+  try {
+    if (!supa) throw new Error("server_missing_supabase_env");
+
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+
+    const days = Math.max(1, Math.min(90, parseInt(String(req.query.days ?? "30"), 10) || 30));
+    const rawLimit = parseInt(String(req.query.limit ?? "10"), 10);
+    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 10, 1), 50);
+    const since = isoDaysAgo(days);
+
+    const notEnough = (sourceMoments: number) => ({
+      candidateCount: 0,
+      sourceWindowDays: days,
+      sourceMoments,
+      note: "Not enough Whisperer data yet.",
+    });
+
+    const available = await whispererTablesAvailable(supa).catch(() => false);
+    if (!available) {
+      return res.json({ ok: true, persistence: false, items: [], count: 0, summary: notEnough(0) });
+    }
+
+    const userContext = await getUserContext(supa, userId);
+
+    // Ended sessions in scope/window — discovery is offline, so only ended ones.
+    let sessionQuery = supa
+      .from("whisperer_sessions")
+      .select("id")
+      .eq("status", "ended")
+      .gte("started_at", since)
+      .order("started_at", { ascending: false })
+      .limit(500);
+    sessionQuery = applyHierarchyFilters(sessionQuery, userContext);
+
+    const { data: sessionRows, error: sessErr } = await sessionQuery;
+    if (sessErr) throw sessErr;
+    const sessionIds = (sessionRows ?? []).map((s: any) => String(s.id));
+    if (sessionIds.length === 0) {
+      return res.json({ ok: true, persistence: true, items: [], count: 0, summary: notEnough(0) });
+    }
+
+    // Stored trigger segment text is the only transcript source today (Day 130).
+    const { data: trigRows, error: trigErr } = await supa
+      .from("whisperer_triggers")
+      .select("segment_text, session_id, detected_at")
+      .in("session_id", sessionIds)
+      .order("detected_at", { ascending: false })
+      .limit(5000);
+    if (trigErr) throw trigErr;
+
+    const items: DiscoveryItem[] = (trigRows ?? [])
+      .map((r: any) => ({
+        text: String(r.segment_text || ""),
+        sessionId: r.session_id ? String(r.session_id) : null,
+        detectedAt: r.detected_at ? String(r.detected_at) : null,
+      }))
+      .filter((it: DiscoveryItem) => it.text.trim().length > 0);
+
+    const candidates = discoverTriggerCandidates({ items, minSeenCount: 2, limit });
+
+    if (candidates.length === 0) {
+      return res.json({ ok: true, persistence: true, items: [], count: 0, summary: notEnough(items.length) });
+    }
+
+    return res.json({
+      ok: true,
+      persistence: true,
+      items: candidates,
+      count: candidates.length,
+      summary: {
+        candidateCount: candidates.length,
+        sourceWindowDays: days,
+        sourceMoments: items.length,
+        note: "Candidates are suggestions only. Managers must approve triggers before they go live.",
+      },
+    });
+  } catch (e: any) {
+    console.error("[manager.whisperer-trigger-candidates] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "trigger_candidates_failed" });
   }
 });
 

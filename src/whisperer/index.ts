@@ -27,3 +27,17 @@ export {
   detectCustomWhispererTriggers,
   mergeBuiltInAndCustomTriggers,
 } from "./customTriggers";
+
+// Day 130: read-only AI Trigger Discovery (offline candidate mining).
+export {
+  type DiscoveryItem,
+  type DiscoveryExample,
+  type TriggerCandidate,
+  type DiscoverInput,
+  type DiscoveryCandidateType,
+  normaliseDiscoveryText,
+  classifyDiscoveryCandidate,
+  groupSimilarPhrases,
+  buildTriggerCandidateFromCluster,
+  discoverTriggerCandidates,
+} from "./discovery";
