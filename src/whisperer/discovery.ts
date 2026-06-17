@@ -179,12 +179,6 @@ export function groupSimilarPhrases(
   return clusters;
 }
 
-let _candidateSeq = 0;
-function nextSeq(): string {
-  _candidateSeq = (_candidateSeq % 999) + 1;
-  return String(_candidateSeq).padStart(3, "0");
-}
-
 export function buildTriggerCandidateFromCluster(cluster: Cluster): TriggerCandidate {
   const { type, token, items } = cluster;
   const meta = type === "custom" ? null : TYPE_META[type];
@@ -220,7 +214,9 @@ export function buildTriggerCandidateFromCluster(cluster: Cluster): TriggerCandi
   const label = meta ? meta.label : "Custom";
 
   return {
-    id: `candidate-${type}-${token}-${nextSeq()}`,
+    // Stable id (type + dominant token) so persistent decisions match across
+    // discovery runs. One cluster per type per run keeps it unique.
+    id: `candidate-${type}-${token}`,
     type,
     title,
     suggestedName: `${label}: ${title}`,
