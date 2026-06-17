@@ -7,6 +7,7 @@
 import {
   discoverTriggerCandidates,
   classifyDiscoveryCandidate,
+  suppressKnownCandidates,
   type DiscoveryItem,
 } from "../src/whisperer/discovery";
 
@@ -76,6 +77,22 @@ check("candidates sort by seenCount desc", sorted.length >= 2 && sorted[0].seenC
 
 // ── Read-only shape: no activation/enabled flags leaking through ──
 check("candidates carry no enabled/active flag", sorted.every((c) => !("enabled" in c) && !("active" in c)));
+
+// ── Day 132: dedupe against existing custom triggers ──
+const priceCands = discoverTriggerCandidates({
+  items: [item("that is outside our budget"), item("the cost is too high", "s2"), item("the price is too high", "s3")],
+});
+const supByPhrase = suppressKnownCandidates(priceCands, [{ phrases: ["the price is too high"], keywords: [] }]);
+check("phrase overlap suppresses a candidate", supByPhrase.suppressedCount >= 1 && supByPhrase.kept.length < priceCands.length);
+
+const supByKeyword = suppressKnownCandidates(priceCands, [{ phrases: [], keywords: ["budget"] }]);
+check("keyword overlap suppresses a candidate", supByKeyword.suppressedCount >= 1);
+
+const supNone = suppressKnownCandidates(priceCands, [{ phrases: ["totally unrelated"], keywords: ["unrelated"] }]);
+check("no overlap suppresses nothing", supNone.suppressedCount === 0 && supNone.kept.length === priceCands.length);
+
+const supEmpty = suppressKnownCandidates(priceCands, []);
+check("empty library suppresses nothing", supEmpty.suppressedCount === 0 && supEmpty.kept.length === priceCands.length);
 
 console.log(failures === 0 ? "\nWhisperer discovery validation PASSED" : `\nWhisperer discovery validation FAILED (${failures})`);
 process.exit(failures === 0 ? 0 : 1);

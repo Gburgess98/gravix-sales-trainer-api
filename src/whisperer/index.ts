@@ -35,9 +35,11 @@ export {
   type TriggerCandidate,
   type DiscoverInput,
   type DiscoveryCandidateType,
+  type ExistingTriggerRule,
   normaliseDiscoveryText,
   classifyDiscoveryCandidate,
   groupSimilarPhrases,
   buildTriggerCandidateFromCluster,
   discoverTriggerCandidates,
+  suppressKnownCandidates,
 } from "./discovery";

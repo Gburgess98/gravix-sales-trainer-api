@@ -241,6 +241,46 @@ export function buildTriggerCandidateFromCluster(cluster: Cluster): TriggerCandi
 
 // ── Main entry ───────────────────────────────────────────────────────────────
 
+// Day 132: an existing custom trigger rule, reduced to what dedupe needs.
+export type ExistingTriggerRule = { phrases?: string[] | null; keywords?: string[] | null };
+
+// Suppress candidates that already overlap an enabled custom trigger so a
+// manager isn't re-shown something they've already actioned. Read-only, pure.
+// A candidate is suppressed when any of its suggested phrases match (exact or
+// substring, either direction) an existing match phrase, OR any suggested
+// keyword exactly matches an existing match keyword (managers pick keywords
+// deliberately, so an exact overlap is a real duplicate).
+export function suppressKnownCandidates(
+  candidates: TriggerCandidate[],
+  existing: ExistingTriggerRule[]
+): { kept: TriggerCandidate[]; suppressedCount: number } {
+  if (!candidates.length || !existing.length) return { kept: candidates, suppressedCount: 0 };
+
+  const existingPhrases = new Set<string>();
+  const existingKeywords = new Set<string>();
+  for (const e of existing) {
+    for (const p of e.phrases ?? []) { const n = normaliseTranscriptText(String(p)); if (n) existingPhrases.add(n); }
+    for (const k of e.keywords ?? []) { const n = normaliseTranscriptText(String(k)); if (n) existingKeywords.add(n); }
+  }
+  if (existingPhrases.size === 0 && existingKeywords.size === 0) return { kept: candidates, suppressedCount: 0 };
+
+  const kept: TriggerCandidate[] = [];
+  let suppressed = 0;
+  for (const c of candidates) {
+    const phraseHit = c.suggestedPhrases.some((p) => {
+      const n = normaliseTranscriptText(p);
+      if (!n) return false;
+      if (existingPhrases.has(n)) return true;
+      for (const ep of existingPhrases) if (n.includes(ep) || ep.includes(n)) return true;
+      return false;
+    });
+    const keywordHit = c.suggestedKeywords.some((k) => existingKeywords.has(normaliseTranscriptText(k)));
+    if (phraseHit || keywordHit) { suppressed += 1; continue; }
+    kept.push(c);
+  }
+  return { kept, suppressedCount: suppressed };
+}
+
 export function discoverTriggerCandidates(input: DiscoverInput): TriggerCandidate[] {
   const minSeen = Math.max(1, input.minSeenCount ?? 2);
   const limit = Math.max(1, input.limit ?? 10);

@@ -14,7 +14,7 @@ import { Router, type Request, type Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { requireManager } from "../middleware/requireManager";
 import { sparringHardeningColumns } from "../sparring";
-import { whispererTablesAvailable, discoverTriggerCandidates, type DiscoveryItem } from "../whisperer";
+import { whispererTablesAvailable, discoverTriggerCandidates, suppressKnownCandidates, type DiscoveryItem } from "../whisperer";
 import {
   isCompanyManager,
   isOfficeManager,
@@ -1223,10 +1223,40 @@ router.get("/whisperer-trigger-candidates", async (req: Request, res: Response) 
       }))
       .filter((it: DiscoveryItem) => it.text.trim().length > 0);
 
-    const candidates = discoverTriggerCandidates({ items, minSeenCount: 2, limit });
+    let candidates = discoverTriggerCandidates({ items, minSeenCount: 2, limit });
+
+    // Day 132: suppress candidates that already overlap an enabled custom
+    // trigger in scope, so actioned suggestions stop re-appearing. Fail-soft —
+    // a missing/erroring library never breaks discovery (no suppression then).
+    let suppressedExistingCount = 0;
+    try {
+      let lq = supa
+        .from("whisperer_trigger_library")
+        .select("match_phrases, match_keywords, office_id, company_id, org_id")
+        .eq("enabled", true)
+        .limit(500);
+      lq = applyLibraryScope(lq, userContext);
+      const { data: libRows, error: libErr } = await lq;
+      if (libErr) {
+        if (!whispererLibraryTableMissing(libErr)) throw libErr;
+      } else if (libRows && libRows.length) {
+        const existing = libRows.map((r: any) => ({ phrases: r.match_phrases ?? [], keywords: r.match_keywords ?? [] }));
+        const { kept, suppressedCount } = suppressKnownCandidates(candidates, existing);
+        candidates = kept;
+        suppressedExistingCount = suppressedCount;
+      }
+    } catch (e: any) {
+      console.warn("[manager.whisperer-trigger-candidates] dedupe failed", e?.message || e);
+    }
 
     if (candidates.length === 0) {
-      return res.json({ ok: true, persistence: true, items: [], count: 0, summary: notEnough(items.length) });
+      return res.json({
+        ok: true,
+        persistence: true,
+        items: [],
+        count: 0,
+        summary: { ...notEnough(items.length), suppressedExistingCount },
+      });
     }
 
     return res.json({
@@ -1238,6 +1268,7 @@ router.get("/whisperer-trigger-candidates", async (req: Request, res: Response) 
         candidateCount: candidates.length,
         sourceWindowDays: days,
         sourceMoments: items.length,
+        suppressedExistingCount,
         note: "Candidates are suggestions only. Managers must approve triggers before they go live.",
       },
     });
