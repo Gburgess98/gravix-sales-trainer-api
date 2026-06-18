@@ -299,6 +299,72 @@ function whispererOutcomeColumnMissing(error: any): boolean {
     (msg.includes("does not exist") || msg.includes("could not find") || msg.includes("schema cache") || msg.includes("column"));
 }
 
+// Day 142: detect the raw-segments table being absent (migration not applied in
+// this environment). Mirrors whispererOutcomeColumnMissing. Keeps the live
+// /segments route working when whisperer_segments has not been migrated.
+function whispererSegmentsTableMissing(error: any): boolean {
+  const msg = String(error?.message || "").toLowerCase();
+  return msg.includes("whisperer_segments") &&
+    (msg.includes("does not exist") || msg.includes("could not find") || msg.includes("schema cache"));
+}
+
+// Day 142: persist a single FINAL transcript segment (triggered or not) so
+// discovery can mine untriggered buyer language. Pure DB insert — NO LLM, no
+// audio, text only. Always fail-soft: any error (missing table or otherwise)
+// returns { id: null, persistence: false } and never breaks the live route.
+async function persistWhispererSegment(args: {
+  session: Record<string, any>;
+  text: string;
+  speaker: string;              // raw label as sent (rep/prospect/unknown/speaker_N)
+  speakerRole: string | null;   // canonical rep/prospect/unknown used for detection
+  speakerOriginal: string | null; // raw diarised label for traceability
+  confidence: number | null;
+  source: string;               // live | manual | simulator
+  clientSentAt: string | null;
+  receivedAt: Date;
+  triggersCount: number;
+  triggerTypes: string[];
+  meta: Record<string, any>;
+}): Promise<{ id: string | null; persistence: boolean }> {
+  try {
+    const s = args.session;
+    const source = ["live", "manual", "simulator"].includes(args.source) ? args.source : "live";
+    const row = {
+      session_id: s.id,
+      call_id: s.call_id ?? null,
+      user_id: s.user_id ?? null,
+      org_id: s.org_id ?? null,
+      company_id: s.company_id ?? null,
+      office_id: s.office_id ?? null,
+      speaker: args.speaker || "unknown",
+      speaker_original: args.speakerOriginal,
+      speaker_role: args.speakerRole,
+      text: args.text.slice(0, 2000),
+      text_normalised: args.text.toLowerCase().replace(/\s+/g, " ").trim().slice(0, 2000),
+      confidence: args.confidence,
+      is_final: true,
+      source,
+      client_sent_at: args.clientSentAt,
+      received_at: args.receivedAt.toISOString(),
+      processed_at: new Date().toISOString(),
+      triggers_count: args.triggersCount,
+      trigger_types: args.triggerTypes,
+      meta: args.meta ?? {},
+    };
+    const { data, error } = await supa.from("whisperer_segments").insert(row).select("id").single();
+    if (error) {
+      if (!whispererSegmentsTableMissing(error)) {
+        console.warn("[whisperer/segments] raw segment insert failed", error.message);
+      }
+      return { id: null, persistence: false };
+    }
+    return { id: String((data as any).id), persistence: true };
+  } catch (e: any) {
+    console.warn("[whisperer/segments] raw segment persist threw", e?.message || e);
+    return { id: null, persistence: false };
+  }
+}
+
 // Day 122: a session's outcome can be marked by its owner or by a manager whose
 // hierarchy covers the session's office/company. Mirrors manager.ts scoping
 // (users.role + is_admin), so the reps.tier gate is not needed here.
@@ -722,10 +788,44 @@ router.post("/sessions/:id/segments", express.json(), async (req, res) => {
       }
     }
 
+    // Day 142: persist the raw FINAL segment regardless of whether a trigger
+    // fired, so discovery can later mine untriggered buyer language. Only when
+    // the session itself is persisted (the FK needs a real session row); always
+    // fail-soft so a missing whisperer_segments table never breaks the live path.
+    const sourceRaw = String((req.body as any)?.source || (req.body as any)?.mode || "").trim().toLowerCase();
+    const confidenceRaw = Number((req.body as any)?.confidence);
+    const triggerTypes = Array.from(new Set(detected.map((t) => t.type)));
+    const customTriggerIds = detected
+      .map((t) => (t.meta as any)?.customTriggerId)
+      .filter((x): x is string => Boolean(x));
+    let segmentPersist: { id: string | null; persistence: boolean } = { id: null, persistence: false };
+    if (persisted) {
+      segmentPersist = await persistWhispererSegment({
+        session,
+        text,
+        speaker: speakerLabel,
+        speakerRole: detectionSpeaker,
+        speakerOriginal: diarizedSpeaker,
+        confidence: Number.isFinite(confidenceRaw) ? confidenceRaw : null,
+        source: sourceRaw || "live",
+        clientSentAt: clientSentAtRaw || null,
+        receivedAt,
+        triggersCount: detected.length,
+        triggerTypes,
+        meta: {
+          latencyMs,
+          ...(diarizedSpeaker ? { diarizedSpeaker } : {}),
+          ...(customTriggerIds.length ? { customTriggerIds } : {}),
+        },
+      });
+    }
+
     return res.json({
       ok: true,
       persistence: persisted,
       segment: {
+        id: segmentPersist.id,
+        persistence: segmentPersist.persistence,
         text,
         speaker: speakerLabel,
         receivedAt: receivedAt.toISOString(),
