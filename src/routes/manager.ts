@@ -1530,8 +1530,12 @@ router.delete("/whisperer-trigger-candidates/:id/decision", async (req: Request,
 // are stamped with the manager's org/company/office; managers only act within
 // their scope. Fail-soft when the table hasn't been migrated.
 
-const WTL_FIELDS =
+// Base columns present since Day 119. Day 139 adds the source-link columns,
+// kept in a separate constant so GET/POST can fall back to the base set when
+// the Day 139 migration hasn't been applied in an environment yet.
+const WTL_FIELDS_BASE =
   "id, org_id, company_id, office_id, created_by, name, description, type, match_phrases, match_keywords, suggestion_title, suggestion_response, urgency, emoji, enabled, priority, created_at, updated_at";
+const WTL_FIELDS = `${WTL_FIELDS_BASE}, source_candidate_id, source_meta`;
 
 function whispererLibraryTableMissing(error: any): boolean {
   const msg = String(error?.message || "").toLowerCase();
@@ -1539,7 +1543,16 @@ function whispererLibraryTableMissing(error: any): boolean {
     (msg.includes("does not exist") || msg.includes("could not find") || msg.includes("schema cache"));
 }
 
+// Day 139: detect the source-link columns being absent (migration not applied
+// in this environment) so library reads/writes fail soft to the base columns.
+function librarySourceColumnsMissing(error: any): boolean {
+  const msg = String(error?.message || "").toLowerCase();
+  return (msg.includes("source_candidate_id") || msg.includes("source_meta")) &&
+    (msg.includes("does not exist") || msg.includes("could not find") || msg.includes("schema cache") || msg.includes("column"));
+}
+
 function normaliseLibraryItem(row: any) {
+  const sourceCandidateId = row.source_candidate_id ?? null;
   return {
     id: String(row.id),
     name: row.name,
@@ -1555,7 +1568,44 @@ function normaliseLibraryItem(row: any) {
     priority: row.priority,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // Day 139 — approved candidate → source link (null/{} when unmigrated).
+    sourceCandidateId,
+    sourceMeta: row.source_meta ?? {},
+    source: sourceCandidateId ? "trigger_candidate" : null,
   };
+}
+
+// Day 139: build the optional source-link patch for a custom trigger create.
+// Only used on POST (source fields are immutable after create). Stores a small
+// summary snapshot — never the full example transcript text.
+function buildLibrarySourcePatch(body: any): Record<string, any> {
+  const patch: Record<string, any> = {};
+  const rawId = body?.sourceCandidateId;
+  if (typeof rawId === "string" && rawId.trim()) {
+    patch.source_candidate_id = rawId.trim().slice(0, 200);
+  }
+  const rawMeta = body?.sourceMeta;
+  if (rawMeta && typeof rawMeta === "object" && !Array.isArray(rawMeta)) {
+    const m = rawMeta as Record<string, any>;
+    const clampStr = (v: any, n: number) => (typeof v === "string" ? v.slice(0, n) : undefined);
+    const clampNum = (v: any) => (Number.isFinite(Number(v)) ? Number(v) : undefined);
+    const meta: Record<string, any> = {
+      source: clampStr(m.source, 40) ?? "trigger_candidate",
+      candidateId: clampStr(m.candidateId, 200),
+      suggestedName: clampStr(m.suggestedName ?? m.title, 200),
+      type: clampStr(m.type, 40),
+      seenCount: clampNum(m.seenCount),
+      confidence: clampNum(m.confidence),
+      examplesCount: clampNum(m.examplesCount),
+      reason: clampStr(m.reason, 500),
+      suggestedPhrases: Array.isArray(m.suggestedPhrases) ? m.suggestedPhrases.slice(0, 5).map((p: any) => String(p).slice(0, 120)) : undefined,
+      suggestedKeywords: Array.isArray(m.suggestedKeywords) ? m.suggestedKeywords.slice(0, 10).map((k: any) => String(k).slice(0, 60)) : undefined,
+    };
+    // Drop undefined keys so the snapshot stays compact.
+    for (const k of Object.keys(meta)) if (meta[k] === undefined) delete meta[k];
+    patch.source_meta = meta;
+  }
+  return patch;
 }
 
 // Body → DB column patch with validation. Returns {error} or {patch}.
@@ -1616,10 +1666,17 @@ router.get("/whisperer-trigger-library", async (req: Request, res: Response) => 
     if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
 
     const ctx = await getUserContext(supa, userId);
-    let q = supa.from("whisperer_trigger_library").select(WTL_FIELDS).order("priority", { ascending: false }).limit(200);
-    q = applyLibraryScope(q, ctx);
+    const runSelect = (fields: string) => {
+      let q = supa.from("whisperer_trigger_library").select(fields).order("priority", { ascending: false }).limit(200);
+      q = applyLibraryScope(q, ctx);
+      return q;
+    };
 
-    const { data, error } = await q;
+    let { data, error } = await runSelect(WTL_FIELDS);
+    if (error && librarySourceColumnsMissing(error)) {
+      // Day 139 migration not applied here — fall back to the base columns.
+      ({ data, error } = await runSelect(WTL_FIELDS_BASE));
+    }
     if (error) {
       if (whispererLibraryTableMissing(error)) return res.json({ ok: true, persistence: false, items: [] });
       throw error;
@@ -1642,7 +1699,7 @@ router.post("/whisperer-trigger-library", async (req: Request, res: Response) =>
     if (vErr) return res.status(400).json({ ok: false, error: vErr });
 
     const ctx = await getUserContext(supa, userId);
-    const row = {
+    const base = {
       ...patch,
       org_id: null,
       company_id: ctx?.company_id ?? null,
@@ -1650,8 +1707,22 @@ router.post("/whisperer-trigger-library", async (req: Request, res: Response) =>
       created_by: userId,
       updated_at: new Date().toISOString(),
     };
+    // Day 139 — optional source link (immutable after create).
+    const sourcePatch = buildLibrarySourcePatch(req.body ?? {});
 
-    const { data, error } = await supa.from("whisperer_trigger_library").insert(row).select(WTL_FIELDS).single();
+    const insert = (fields: string, withSource: boolean) =>
+      supa
+        .from("whisperer_trigger_library")
+        .insert(withSource ? { ...base, ...sourcePatch } : base)
+        .select(fields)
+        .single();
+
+    let { data, error } = await insert(WTL_FIELDS, true);
+    if (error && librarySourceColumnsMissing(error)) {
+      // Source columns not migrated here — still create the trigger without
+      // them (fail-soft), so manual approval/save is never blocked.
+      ({ data, error } = await insert(WTL_FIELDS_BASE, false));
+    }
     if (error) {
       if (whispererLibraryTableMissing(error)) {
         return res.status(503).json({ ok: false, error: "migration_required", hint: "Run sql/20260615_whisperer_trigger_library.sql" });
@@ -1686,7 +1757,14 @@ router.patch("/whisperer-trigger-library/:id", async (req: Request, res: Respons
     if (!existing) return res.status(404).json({ ok: false, error: "not_found_or_out_of_scope" });
 
     patch.updated_at = new Date().toISOString();
-    const { data, error } = await supa.from("whisperer_trigger_library").update(patch).eq("id", id).select(WTL_FIELDS).single();
+    // Note: source fields are intentionally not editable via PATCH (immutable
+    // after create). Fall back to base columns when the Day 139 migration is
+    // absent so enable/disable/edit keeps working.
+    const update = (fields: string) => supa.from("whisperer_trigger_library").update(patch).eq("id", id).select(fields).single();
+    let { data, error } = await update(WTL_FIELDS);
+    if (error && librarySourceColumnsMissing(error)) {
+      ({ data, error } = await update(WTL_FIELDS_BASE));
+    }
     if (error) throw error;
     return res.json({ ok: true, item: normaliseLibraryItem(data) });
   } catch (e: any) {
