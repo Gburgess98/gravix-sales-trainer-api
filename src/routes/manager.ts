@@ -1406,6 +1406,125 @@ router.post("/whisperer-trigger-candidates/:id/decision", async (req: Request, r
   }
 });
 
+// GET /v1/manager/whisperer-trigger-candidate-decisions?days=30&limit=20
+// TIER 2B Day 136: reviewed candidate history. Lists the manager's persisted
+// candidate decisions (approved/dismissed/rejected) in scope so they can see
+// what they've actioned and restore dismissed/rejected ones. Read-only.
+// Fail-soft when the table hasn't been migrated (persistence:false, no 500).
+router.get("/whisperer-trigger-candidate-decisions", async (req: Request, res: Response) => {
+  try {
+    if (!supa) throw new Error("server_missing_supabase_env");
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+
+    const days = Math.max(1, Math.min(90, parseInt(String(req.query.days ?? "30"), 10) || 30));
+    const rawLimit = parseInt(String(req.query.limit ?? "20"), 10);
+    const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 20, 1), 50);
+    const since = isoDaysAgo(days);
+
+    const emptySummary = { dismissed: 0, rejected: 0, approved: 0, sourceWindowDays: days };
+
+    const ctx = await getUserContext(supa, userId);
+    let q = supa
+      .from("whisperer_trigger_candidate_decisions")
+      .select("id, candidate_id, candidate_type, decision, decided_by, note, source, created_at, updated_at")
+      .gte("created_at", since)
+      .order("updated_at", { ascending: false })
+      .limit(limit);
+    q = applyLibraryScope(q, ctx);
+
+    const { data, error } = await q;
+    if (error) {
+      if (candidateDecisionsTableMissing(error)) {
+        return res.json({ ok: true, persistence: false, items: [], count: 0, summary: emptySummary });
+      }
+      throw error;
+    }
+
+    const items = (data ?? []).map((r: any) => ({
+      id: String(r.id),
+      candidateId: String(r.candidate_id),
+      candidateType: r.candidate_type ?? null,
+      decision: String(r.decision),
+      decidedBy: r.decided_by ?? null,
+      note: r.note ?? null,
+      source: r.source ?? {},
+      createdAt: r.created_at ?? null,
+      updatedAt: r.updated_at ?? null,
+    }));
+
+    const summary = { ...emptySummary };
+    for (const it of items) {
+      if (it.decision === "dismissed") summary.dismissed += 1;
+      else if (it.decision === "rejected") summary.rejected += 1;
+      else if (it.decision === "approved") summary.approved += 1;
+    }
+
+    return res.json({ ok: true, persistence: true, items, count: items.length, summary });
+  } catch (e: any) {
+    console.error("[manager.whisperer-trigger-candidate-decisions] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "candidate_decisions_failed" });
+  }
+});
+
+// DELETE /v1/manager/whisperer-trigger-candidates/:id/decision
+// TIER 2B Day 136: un-dismiss / reopen a candidate. Removes the persisted
+// decision row for this candidate in the manager's scope so it becomes eligible
+// to surface again in discovery. NEVER deletes a custom trigger or activates
+// anything — it only deletes the candidate decision row.
+router.delete("/whisperer-trigger-candidates/:id/decision", async (req: Request, res: Response) => {
+  try {
+    if (!supa) throw new Error("server_missing_supabase_env");
+    const userId = getUserId(req);
+    if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
+
+    const candidateId = String(req.params.id || "").trim();
+    if (!candidateId) return res.status(400).json({ ok: false, error: "invalid_candidate_id" });
+
+    const ctx = await getUserContext(supa, userId);
+    const officeId = ctx?.office_id ?? null;
+    const companyId = ctx?.company_id ?? null;
+    const table = "whisperer_trigger_candidate_decisions";
+
+    // Match the same scope the POST decision stamps with.
+    let sel = supa.from(table).select("id").eq("candidate_id", candidateId).is("org_id", null);
+    sel = officeId ? sel.eq("office_id", officeId) : sel.is("office_id", null);
+    sel = companyId ? sel.eq("company_id", companyId) : sel.is("company_id", null);
+    const { data: existing, error: selErr } = await sel.maybeSingle();
+    if (selErr) {
+      if (candidateDecisionsTableMissing(selErr)) {
+        return res.status(503).json({ ok: false, error: "migration_required", hint: "Run sql/20260617_whisperer_trigger_candidate_decisions.sql" });
+      }
+      throw selErr;
+    }
+
+    if (!existing) {
+      return res.json({ ok: true, candidateId, restored: false });
+    }
+
+    const { error: dErr } = await supa.from(table).delete().eq("id", (existing as any).id);
+    if (dErr) {
+      if (candidateDecisionsTableMissing(dErr)) {
+        return res.status(503).json({ ok: false, error: "migration_required", hint: "Run sql/20260617_whisperer_trigger_candidate_decisions.sql" });
+      }
+      throw dErr;
+    }
+
+    void logAuditEvent({
+      actorUserId: userId,
+      action: "whisperer.candidate_decision_restore",
+      entityType: "whisperer_trigger_candidate",
+      entityId: candidateId,
+      metadata: { company_id: companyId, office_id: officeId },
+    });
+
+    return res.json({ ok: true, candidateId, restored: true });
+  } catch (e: any) {
+    console.error("[manager.whisperer-trigger-candidate decision DELETE] error", e);
+    return res.status(500).json({ ok: false, error: e?.message || "candidate_decision_restore_failed" });
+  }
+});
+
 // ── Custom Whisperer trigger library (Tier 2B Day 119) ───────────────────────
 // Manager CRUD, tenant-scoped. requireManager gates the whole router. New rules
 // are stamped with the manager's org/company/office; managers only act within
