@@ -4,6 +4,8 @@
  * Usage: npx tsx scripts/validate-whisperer-discovery.ts
  */
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   discoverTriggerCandidates,
   classifyDiscoveryCandidate,
@@ -93,6 +95,52 @@ check("no overlap suppresses nothing", supNone.suppressedCount === 0 && supNone.
 
 const supEmpty = suppressKnownCandidates(priceCands, []);
 check("empty library suppresses nothing", supEmpty.suppressedCount === 0 && supEmpty.kept.length === priceCands.length);
+
+// ── Day 144: raw-segment (blind-spot) provenance ──
+const rawItem = (text: string, sessionId: string, segmentId: string): DiscoveryItem => ({
+  text, sessionId, detectedAt: new Date().toISOString(), segmentId, source: "raw_segment", untriggered: true,
+});
+
+const rawCands = discoverTriggerCandidates({
+  items: [
+    rawItem("we need procurement to approve this", "s1", "seg-1"),
+    rawItem("procurement needs to approve this first", "s2", "seg-2"),
+    rawItem("our procurement team has to sign this off", "s3", "seg-3"),
+  ],
+});
+const rawAuthority = rawCands.find((c) => c.type === "authority");
+check("repeated untriggered raw inputs produce a candidate", Boolean(rawAuthority));
+check("raw candidate has source raw_segment", rawAuthority?.source === "raw_segment");
+check("raw candidate has untriggered true", rawAuthority?.untriggered === true);
+check("raw candidate has exampleSegmentIds", (rawAuthority?.exampleSegmentIds?.length ?? 0) >= 1);
+check("raw candidate sessionsCount >= 2", (rawAuthority?.sessionsCount ?? 0) >= 2);
+check("raw candidate examples carry segmentId", (rawAuthority?.examples ?? []).every((e) => Boolean(e.segmentId)));
+
+// Trigger-text source items remain trigger_segment / not untriggered (fallback path).
+const trigCands = discoverTriggerCandidates({
+  items: [
+    { text: "the price is too high", sessionId: "s1", source: "trigger_segment", untriggered: false },
+    { text: "the cost is too high for us", sessionId: "s2", source: "trigger_segment", untriggered: false },
+  ],
+});
+const trigPrice = trigCands.find((c) => c.type === "price");
+check("fallback trigger-text candidate still works", Boolean(trigPrice));
+check("trigger candidate source is trigger_segment", trigPrice?.source === "trigger_segment");
+check("trigger candidate untriggered is false", trigPrice?.untriggered === false);
+
+// Mixed sources within one cluster → source "mixed".
+const mixedCands = discoverTriggerCandidates({
+  items: [
+    { text: "that is outside our budget", sessionId: "s1", source: "raw_segment", untriggered: true },
+    { text: "the price is too high", sessionId: "s2", source: "trigger_segment", untriggered: false },
+    { text: "the cost is too high", sessionId: "s3", source: "raw_segment", untriggered: true },
+  ],
+});
+check("mixed-source cluster reports source mixed", mixedCands.find((c) => c.type === "price")?.source === "mixed");
+
+// No LLM in the discovery helper.
+const discSrc = readFileSync(join(__dirname, "..", "src", "whisperer", "discovery.ts"), "utf8");
+check("discovery helper has no LLM call", !/openai|anthropic|chat\.completions|responses\.create/i.test(discSrc));
 
 console.log(failures === 0 ? "\nWhisperer discovery validation PASSED" : `\nWhisperer discovery validation FAILED (${failures})`);
 process.exit(failures === 0 ? 0 : 1);

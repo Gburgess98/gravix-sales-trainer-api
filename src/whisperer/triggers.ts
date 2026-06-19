@@ -118,6 +118,9 @@ const INTENTS: Record<Exclude<WhispererTriggerType, "custom">, IntentDef> = {
       { re: /\bneeds? (sign.?off|approval|to (approve|decide|sign off))\b/, score: 82 },
       { re: /\b(decision maker|sign.?off|approval)\b/, score: 80 },
       { re: /\bnot (really )?my (call|decision|department)\b/, score: 82 },
+      // Procurement involvement is a classic authority/approval blocker.
+      { re: /\bprocurement\b/, score: 82 },
+      { re: /\b(has|have|need|needs|got) to (approve|sign|sign off|sign (it|this|that) off)\b/, score: 80 },
     ],
   },
   trust: {

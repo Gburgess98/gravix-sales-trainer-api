@@ -1169,6 +1169,15 @@ function candidateDecisionsTableMissing(error: any): boolean {
 
 const CANDIDATE_DECISIONS = new Set(["approved", "dismissed", "rejected"]);
 
+// Day 144: detect the raw-segments table being absent (migration not applied in
+// this environment) so discovery falls back to trigger-text mining. Mirrors
+// candidateDecisionsTableMissing.
+function whispererSegmentsTableMissing(error: any): boolean {
+  const msg = String(error?.message || "").toLowerCase();
+  return msg.includes("whisperer_segments") &&
+    (msg.includes("does not exist") || msg.includes("could not find") || msg.includes("schema cache"));
+}
+
 // ── GET /v1/manager/whisperer-trigger-candidates ─────────────────────────────
 // TIER 2B Day 130: AI Trigger Discovery — READ-ONLY. Mines stored trigger
 // segment text across the manager's scope and surfaces recurring sales moments
@@ -1202,39 +1211,95 @@ router.get("/whisperer-trigger-candidates", async (req: Request, res: Response) 
 
     const userContext = await getUserContext(supa, userId);
 
-    // Ended sessions in scope/window — discovery is offline, so only ended ones.
-    let sessionQuery = supa
-      .from("whisperer_sessions")
-      .select("id")
-      .eq("status", "ended")
-      .gte("started_at", since)
-      .order("started_at", { ascending: false })
-      .limit(500);
-    sessionQuery = applyHierarchyFilters(sessionQuery, userContext);
+    // Day 144: mine raw whisperer_segments FIRST — the untriggered final
+    // segments are the blind spots (objections/competitor mentions/buyer
+    // language that fired no trigger). Tenant-scoped via hierarchy filters; rep
+    // speech and very short lines excluded; never touches the live path or an
+    // LLM. Falls back to trigger-text mining below when the raw table is
+    // missing/empty so existing behaviour is preserved exactly.
+    let items: DiscoveryItem[] = [];
+    let source: "raw_segments" | "trigger_segments" = "trigger_segments";
+    let rawSegmentsConsidered = 0;
+    let untriggeredSegmentsConsidered = 0;
+    let triggerMomentsConsidered = 0;
 
-    const { data: sessionRows, error: sessErr } = await sessionQuery;
-    if (sessErr) throw sessErr;
-    const sessionIds = (sessionRows ?? []).map((s: any) => String(s.id));
-    if (sessionIds.length === 0) {
-      return res.json({ ok: true, persistence: true, items: [], count: 0, summary: notEnough(0) });
+    try {
+      let segQuery = supa
+        .from("whisperer_segments")
+        .select("id, session_id, text, triggers_count, speaker, speaker_role, created_at")
+        .eq("is_final", true)
+        .gte("created_at", since)
+        .order("created_at", { ascending: false })
+        .limit(5000);
+      segQuery = applyHierarchyFilters(segQuery, userContext);
+      const { data: segRows, error: segErr } = await segQuery;
+      if (segErr) {
+        if (!whispererSegmentsTableMissing(segErr)) throw segErr;
+        // Raw table not migrated here → leave items empty, fall back below.
+      } else {
+        rawSegmentsConsidered = (segRows ?? []).length;
+        const eligible = (segRows ?? []).filter((r: any) => {
+          const role = String(r.speaker_role || "").toLowerCase();
+          const sp = String(r.speaker || "").toLowerCase();
+          if (role === "rep" || sp === "rep") return false; // never mine rep speech
+          return String(r.text || "").trim().length >= 8;
+        });
+        const untriggered = eligible.filter((r: any) => Number(r.triggers_count) === 0);
+        untriggeredSegmentsConsidered = untriggered.length;
+        const rawItems: DiscoveryItem[] = untriggered.map((r: any) => ({
+          text: String(r.text || ""),
+          sessionId: r.session_id ? String(r.session_id) : null,
+          detectedAt: r.created_at ? String(r.created_at) : null,
+          segmentId: r.id ? String(r.id) : null,
+          source: "raw_segment",
+          untriggered: true,
+        }));
+        if (rawItems.length > 0) {
+          items = rawItems;
+          source = "raw_segments";
+        }
+      }
+    } catch (e: any) {
+      console.warn("[manager.whisperer-trigger-candidates] raw segment mine failed", e?.message || e);
     }
 
-    // Stored trigger segment text is the only transcript source today (Day 130).
-    const { data: trigRows, error: trigErr } = await supa
-      .from("whisperer_triggers")
-      .select("segment_text, session_id, detected_at")
-      .in("session_id", sessionIds)
-      .order("detected_at", { ascending: false })
-      .limit(5000);
-    if (trigErr) throw trigErr;
+    // Fallback (Day 130 behaviour): mine stored trigger segment text when there
+    // is no raw blind-spot input. Ended sessions only — discovery is offline.
+    if (source !== "raw_segments") {
+      let sessionQuery = supa
+        .from("whisperer_sessions")
+        .select("id")
+        .eq("status", "ended")
+        .gte("started_at", since)
+        .order("started_at", { ascending: false })
+        .limit(500);
+      sessionQuery = applyHierarchyFilters(sessionQuery, userContext);
 
-    const items: DiscoveryItem[] = (trigRows ?? [])
-      .map((r: any) => ({
-        text: String(r.segment_text || ""),
-        sessionId: r.session_id ? String(r.session_id) : null,
-        detectedAt: r.detected_at ? String(r.detected_at) : null,
-      }))
-      .filter((it: DiscoveryItem) => it.text.trim().length > 0);
+      const { data: sessionRows, error: sessErr } = await sessionQuery;
+      if (sessErr) throw sessErr;
+      const sessionIds = (sessionRows ?? []).map((s: any) => String(s.id));
+      if (sessionIds.length > 0) {
+        const { data: trigRows, error: trigErr } = await supa
+          .from("whisperer_triggers")
+          .select("segment_text, session_id, detected_at")
+          .in("session_id", sessionIds)
+          .order("detected_at", { ascending: false })
+          .limit(5000);
+        if (trigErr) throw trigErr;
+
+        items = (trigRows ?? [])
+          .map((r: any) => ({
+            text: String(r.segment_text || ""),
+            sessionId: r.session_id ? String(r.session_id) : null,
+            detectedAt: r.detected_at ? String(r.detected_at) : null,
+            source: "trigger_segment" as const,
+            untriggered: false,
+          }))
+          .filter((it: DiscoveryItem) => it.text.trim().length > 0);
+        triggerMomentsConsidered = items.length;
+      }
+      source = "trigger_segments";
+    }
 
     let candidates = discoverTriggerCandidates({ items, minSeenCount: 2, limit });
 
@@ -1284,13 +1349,29 @@ router.get("/whisperer-trigger-candidates", async (req: Request, res: Response) 
       console.warn("[manager.whisperer-trigger-candidates] decision filter failed", e?.message || e);
     }
 
+    // Day 144: provenance + counters shared across the empty and populated paths.
+    const discoverySummary = {
+      source,
+      sourceWindowDays: days,
+      sourceMoments: items.length,
+      rawSegmentsConsidered,
+      untriggeredSegmentsConsidered,
+      triggerMomentsConsidered,
+      suppressedExistingCount,
+      suppressedDecisionCount,
+    };
+
     if (candidates.length === 0) {
       return res.json({
         ok: true,
         persistence: true,
         items: [],
         count: 0,
-        summary: { ...notEnough(items.length), suppressedExistingCount, suppressedDecisionCount },
+        summary: {
+          ...discoverySummary,
+          candidateCount: 0,
+          note: "Not enough Whisperer data yet.",
+        },
       });
     }
 
@@ -1300,11 +1381,8 @@ router.get("/whisperer-trigger-candidates", async (req: Request, res: Response) 
       items: candidates,
       count: candidates.length,
       summary: {
+        ...discoverySummary,
         candidateCount: candidates.length,
-        sourceWindowDays: days,
-        sourceMoments: items.length,
-        suppressedExistingCount,
-        suppressedDecisionCount,
         note: "Candidates are suggestions only. Managers must approve triggers before they go live.",
       },
     });

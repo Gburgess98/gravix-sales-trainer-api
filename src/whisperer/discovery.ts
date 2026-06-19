@@ -6,9 +6,11 @@
 // creates or enables triggers. It surfaces recurring sales moments so a manager
 // can later approve them into the existing custom trigger library by hand.
 //
-// Data note (Day 130): only trigger segment text is persisted today (a raw
-// transcript table does not exist), so discovery mines `whisperer_triggers`
-// segment text. A future LLM classifier could refine clustering — see the
+// Data note (Day 144): discovery now mines raw `whisperer_segments` first — the
+// untriggered final segments are the blind spots — and falls back to
+// `whisperer_triggers` segment text when the raw table is missing/empty. This
+// helper stays pure: the caller (manager route) does the I/O and tags each item
+// with its source. A future LLM classifier could refine clustering — see the
 // placeholder in classifyDiscoveryCandidate — but no LLM is wired today.
 
 import {
@@ -28,17 +30,26 @@ const clamp = (n: number) => Math.max(0, Math.min(100, Math.round(n)));
 // Types a candidate can be classified into (mirrors the live engine + custom).
 export type DiscoveryCandidateType = WhispererTriggerType; // includes "custom"
 
-// One stored unit of text to mine (built from a whisperer_triggers row).
+// One stored unit of text to mine. Day 130: built from a whisperer_triggers row
+// (trigger_segment). Day 144: also built from a raw whisperer_segments row
+// (raw_segment), which carries a segmentId and whether it was untriggered.
+export type DiscoverySource = "raw_segment" | "trigger_segment";
+
 export type DiscoveryItem = {
   text: string;
   sessionId?: string | null;
   detectedAt?: string | null;
+  segmentId?: string | null;     // Day 144 — raw whisperer_segments.id
+  source?: DiscoverySource;      // Day 144 — defaults to trigger_segment
+  untriggered?: boolean;         // Day 144 — true for raw blind-spot segments
 };
 
 export type DiscoveryExample = {
   text: string;
   sessionId: string | null;
   detectedAt: string | null;
+  segmentId?: string | null;     // Day 144
+  source?: DiscoverySource;      // Day 144
 };
 
 export type TriggerCandidate = {
@@ -56,6 +67,11 @@ export type TriggerCandidate = {
   examples: DiscoveryExample[];
   reason: string;
   status: "candidate";
+  // Day 144 — blind-spot provenance (optional; absent on legacy callers).
+  source?: DiscoverySource | "mixed";
+  untriggered?: boolean;
+  exampleSegmentIds?: string[];
+  sessionsCount?: number;
 };
 
 export type DiscoverInput = {
@@ -208,10 +224,22 @@ export function buildTriggerCandidateFromCluster(cluster: Cluster): TriggerCandi
     text: it.text.slice(0, 280),
     sessionId: it.sessionId ?? null,
     detectedAt: it.detectedAt ?? null,
+    segmentId: it.segmentId ?? null,
+    source: it.source ?? "trigger_segment",
   }));
 
   const title = meta ? meta.title : "Recurring phrase";
   const label = meta ? meta.label : "Custom";
+
+  // Day 144 — provenance. A cluster is single-source unless items mix sources.
+  const sources = new Set(items.map((it) => it.source ?? "trigger_segment"));
+  const source: DiscoverySource | "mixed" = sources.size === 1 ? ([...sources][0] as DiscoverySource) : "mixed";
+  const untriggered = items.length > 0 && items.every((it) => it.untriggered === true);
+  const exampleSegmentIds = items
+    .map((it) => it.segmentId)
+    .filter((x): x is string => Boolean(x))
+    .slice(0, 10);
+  const sessionsCount = new Set(items.map((it) => it.sessionId).filter(Boolean)).size;
 
   return {
     // Stable id (type + dominant token) so persistent decisions match across
@@ -229,9 +257,15 @@ export function buildTriggerCandidateFromCluster(cluster: Cluster): TriggerCandi
     seenCount: items.length,
     examples,
     reason: meta
-      ? `Repeated ${token} language across recent sessions.`
+      ? untriggered
+        ? `Repeated ${token} language in recent sessions that fired no Whisperer trigger — a possible blind spot.`
+        : `Repeated ${token} language across recent sessions.`
       : "Phrase recurs across recent sessions without a useful trigger.",
     status: "candidate",
+    source,
+    untriggered,
+    exampleSegmentIds,
+    sessionsCount,
   };
 }
 
