@@ -14,7 +14,7 @@ import { Router, type Request, type Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { requireManager } from "../middleware/requireManager";
 import { sparringHardeningColumns } from "../sparring";
-import { whispererTablesAvailable, discoverTriggerCandidates, suppressKnownCandidates, type DiscoveryItem } from "../whisperer";
+import { whispererTablesAvailable, discoverTriggerCandidates, blendTriggerCandidates, suppressKnownCandidates, type DiscoveryItem } from "../whisperer";
 import { logAuditEvent } from "../lib/audit";
 import {
   isCompanyManager,
@@ -1211,18 +1211,18 @@ router.get("/whisperer-trigger-candidates", async (req: Request, res: Response) 
 
     const userContext = await getUserContext(supa, userId);
 
-    // Day 144: mine raw whisperer_segments FIRST — the untriggered final
-    // segments are the blind spots (objections/competitor mentions/buyer
-    // language that fired no trigger). Tenant-scoped via hierarchy filters; rep
-    // speech and very short lines excluded; never touches the live path or an
-    // LLM. Falls back to trigger-text mining below when the raw table is
-    // missing/empty so existing behaviour is preserved exactly.
-    let items: DiscoveryItem[] = [];
-    let source: "raw_segments" | "trigger_segments" = "trigger_segments";
+    // Day 145: BLEND both discovery sources so managers see raw blind spots AND
+    // recurring triggered moments. Raw blind spots rank first; a pattern present
+    // in both becomes a single "mixed" candidate. Both sources are mined every
+    // time (no raw-first hiding). Raw stays fail-soft — a missing
+    // whisperer_segments table simply contributes no raw candidates. Offline,
+    // tenant-scoped, no LLM, no DB writes.
     let rawSegmentsConsidered = 0;
     let untriggeredSegmentsConsidered = 0;
     let triggerMomentsConsidered = 0;
 
+    // ── Source 1: raw whisperer_segments (untriggered blind spots) ──
+    let rawItems: DiscoveryItem[] = [];
     try {
       let segQuery = supa
         .from("whisperer_segments")
@@ -1235,7 +1235,7 @@ router.get("/whisperer-trigger-candidates", async (req: Request, res: Response) 
       const { data: segRows, error: segErr } = await segQuery;
       if (segErr) {
         if (!whispererSegmentsTableMissing(segErr)) throw segErr;
-        // Raw table not migrated here → leave items empty, fall back below.
+        // Raw table not migrated here → no raw candidates, trigger source still runs.
       } else {
         rawSegmentsConsidered = (segRows ?? []).length;
         const eligible = (segRows ?? []).filter((r: any) => {
@@ -1246,7 +1246,7 @@ router.get("/whisperer-trigger-candidates", async (req: Request, res: Response) 
         });
         const untriggered = eligible.filter((r: any) => Number(r.triggers_count) === 0);
         untriggeredSegmentsConsidered = untriggered.length;
-        const rawItems: DiscoveryItem[] = untriggered.map((r: any) => ({
+        rawItems = untriggered.map((r: any) => ({
           text: String(r.text || ""),
           sessionId: r.session_id ? String(r.session_id) : null,
           detectedAt: r.created_at ? String(r.created_at) : null,
@@ -1254,54 +1254,58 @@ router.get("/whisperer-trigger-candidates", async (req: Request, res: Response) 
           source: "raw_segment",
           untriggered: true,
         }));
-        if (rawItems.length > 0) {
-          items = rawItems;
-          source = "raw_segments";
-        }
       }
     } catch (e: any) {
       console.warn("[manager.whisperer-trigger-candidates] raw segment mine failed", e?.message || e);
     }
 
-    // Fallback (Day 130 behaviour): mine stored trigger segment text when there
-    // is no raw blind-spot input. Ended sessions only — discovery is offline.
-    if (source !== "raw_segments") {
-      let sessionQuery = supa
-        .from("whisperer_sessions")
-        .select("id")
-        .eq("status", "ended")
-        .gte("started_at", since)
-        .order("started_at", { ascending: false })
-        .limit(500);
-      sessionQuery = applyHierarchyFilters(sessionQuery, userContext);
-
-      const { data: sessionRows, error: sessErr } = await sessionQuery;
-      if (sessErr) throw sessErr;
-      const sessionIds = (sessionRows ?? []).map((s: any) => String(s.id));
-      if (sessionIds.length > 0) {
-        const { data: trigRows, error: trigErr } = await supa
-          .from("whisperer_triggers")
-          .select("segment_text, session_id, detected_at")
-          .in("session_id", sessionIds)
-          .order("detected_at", { ascending: false })
-          .limit(5000);
-        if (trigErr) throw trigErr;
-
-        items = (trigRows ?? [])
-          .map((r: any) => ({
-            text: String(r.segment_text || ""),
-            sessionId: r.session_id ? String(r.session_id) : null,
-            detectedAt: r.detected_at ? String(r.detected_at) : null,
-            source: "trigger_segment" as const,
-            untriggered: false,
-          }))
-          .filter((it: DiscoveryItem) => it.text.trim().length > 0);
-        triggerMomentsConsidered = items.length;
-      }
-      source = "trigger_segments";
+    // ── Source 2: stored trigger segment text (recurring triggered moments) ──
+    let triggerItems: DiscoveryItem[] = [];
+    let sessionQuery = supa
+      .from("whisperer_sessions")
+      .select("id")
+      .eq("status", "ended")
+      .gte("started_at", since)
+      .order("started_at", { ascending: false })
+      .limit(500);
+    sessionQuery = applyHierarchyFilters(sessionQuery, userContext);
+    const { data: sessionRows, error: sessErr } = await sessionQuery;
+    if (sessErr) throw sessErr;
+    const sessionIds = (sessionRows ?? []).map((s: any) => String(s.id));
+    if (sessionIds.length > 0) {
+      const { data: trigRows, error: trigErr } = await supa
+        .from("whisperer_triggers")
+        .select("segment_text, session_id, detected_at")
+        .in("session_id", sessionIds)
+        .order("detected_at", { ascending: false })
+        .limit(5000);
+      if (trigErr) throw trigErr;
+      triggerItems = (trigRows ?? [])
+        .map((r: any) => ({
+          text: String(r.segment_text || ""),
+          sessionId: r.session_id ? String(r.session_id) : null,
+          detectedAt: r.detected_at ? String(r.detected_at) : null,
+          source: "trigger_segment" as const,
+          untriggered: false,
+        }))
+        .filter((it: DiscoveryItem) => it.text.trim().length > 0);
+      triggerMomentsConsidered = triggerItems.length;
     }
 
-    let candidates = discoverTriggerCandidates({ items, minSeenCount: 2, limit });
+    // Discover each source independently, then blend + rank (blind spots first).
+    const rawCandidates = discoverTriggerCandidates({ items: rawItems, minSeenCount: 2, limit });
+    const triggerCandidates = discoverTriggerCandidates({ items: triggerItems, minSeenCount: 2, limit });
+    const rawCandidateCount = rawCandidates.length;
+    const triggerCandidateCount = triggerCandidates.length;
+    let candidates = blendTriggerCandidates(rawCandidates, triggerCandidates);
+
+    // Summary source reflects which sources actually produced candidates.
+    const source: "raw_segments" | "trigger_segments" | "mixed" =
+      rawCandidateCount > 0 && triggerCandidateCount > 0
+        ? "mixed"
+        : rawCandidateCount > 0
+          ? "raw_segments"
+          : "trigger_segments";
 
     // Day 132: suppress candidates that already overlap an enabled custom
     // trigger in scope, so actioned suggestions stop re-appearing. Fail-soft —
@@ -1349,14 +1353,22 @@ router.get("/whisperer-trigger-candidates", async (req: Request, res: Response) 
       console.warn("[manager.whisperer-trigger-candidates] decision filter failed", e?.message || e);
     }
 
-    // Day 144: provenance + counters shared across the empty and populated paths.
+    // Day 145: apply the limit after blending + suppression so blind spots and
+    // triggered moments compete for the same slots (blind spots already rank first).
+    candidates = candidates.slice(0, limit);
+    const mixedCandidateCount = candidates.filter((c) => c.source === "mixed").length;
+
+    // Provenance + counters shared across the empty and populated paths.
     const discoverySummary = {
       source,
       sourceWindowDays: days,
-      sourceMoments: items.length,
+      sourceMoments: rawItems.length + triggerItems.length,
       rawSegmentsConsidered,
       untriggeredSegmentsConsidered,
       triggerMomentsConsidered,
+      rawCandidateCount,
+      triggerCandidateCount,
+      mixedCandidateCount,
       suppressedExistingCount,
       suppressedDecisionCount,
     };

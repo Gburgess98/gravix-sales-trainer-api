@@ -41,5 +41,6 @@ export {
   groupSimilarPhrases,
   buildTriggerCandidateFromCluster,
   discoverTriggerCandidates,
+  blendTriggerCandidates,
   suppressKnownCandidates,
 } from "./discovery";

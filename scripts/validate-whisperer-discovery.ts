@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   discoverTriggerCandidates,
+  blendTriggerCandidates,
   classifyDiscoveryCandidate,
   suppressKnownCandidates,
   type DiscoveryItem,
@@ -137,6 +138,49 @@ const mixedCands = discoverTriggerCandidates({
   ],
 });
 check("mixed-source cluster reports source mixed", mixedCands.find((c) => c.type === "price")?.source === "mixed");
+
+// ── Day 145: blended / ranked discovery ──
+const rawAuthorityCands = discoverTriggerCandidates({
+  items: [
+    rawItem("we need procurement to approve this", "s1", "seg-1"),
+    rawItem("procurement needs to approve this first", "s2", "seg-2"),
+  ],
+});
+const trigPriceCands = discoverTriggerCandidates({
+  items: [
+    { text: "the price is too high", sessionId: "s5", source: "trigger_segment", untriggered: false },
+    { text: "the cost is too high for us", sessionId: "s6", source: "trigger_segment", untriggered: false },
+  ],
+});
+
+// Blend distinct patterns: both survive, raw blind spot ranks first.
+const blendedDistinct = blendTriggerCandidates(rawAuthorityCands, trigPriceCands);
+check("blend keeps raw candidate", blendedDistinct.some((c) => c.type === "authority" && c.source === "raw_segment"));
+check("blend keeps trigger candidate", blendedDistinct.some((c) => c.type === "price" && c.source === "trigger_segment"));
+check("raw blind spot ranks before trigger-only", blendedDistinct[0].untriggered === true);
+check("trigger-only candidate untriggered false", Boolean(blendedDistinct.find((c) => c.source === "trigger_segment" && c.untriggered === false)));
+
+// Same pattern in both sources (same type + dominant "budget" token → same id)
+// → merges into a single "mixed" candidate.
+const rawPriceCands = discoverTriggerCandidates({
+  items: [rawItem("that is outside our budget", "s1", "seg-a"), rawItem("we don't have budget for this", "s2", "seg-b")],
+});
+const trigPriceForMix = discoverTriggerCandidates({
+  items: [
+    { text: "that is outside our budget right now", sessionId: "s3", source: "trigger_segment", untriggered: false },
+    { text: "we don't have budget for this", sessionId: "s4", source: "trigger_segment", untriggered: false },
+  ],
+});
+const blendedSame = blendTriggerCandidates(rawPriceCands, trigPriceForMix);
+const mixedPrice = blendedSame.find((c) => c.type === "price");
+check("same pattern in both → single price candidate", blendedSame.filter((c) => c.type === "price").length === 1);
+check("merged candidate source is mixed", mixedPrice?.source === "mixed");
+check("mixed candidate untriggered true (raw contributed)", mixedPrice?.untriggered === true);
+check("mixed candidate seenCount is summed", (mixedPrice?.seenCount ?? 0) >= 4);
+
+// Blend degenerates correctly: empty raw → trigger-only; empty trigger → raw-only.
+check("blend(empty,trigger) = trigger-only", blendTriggerCandidates([], trigPriceCands).every((c) => c.source === "trigger_segment"));
+check("blend(raw,empty) = raw-only", blendTriggerCandidates(rawAuthorityCands, []).every((c) => c.source === "raw_segment"));
 
 // No LLM in the discovery helper.
 const discSrc = readFileSync(join(__dirname, "..", "src", "whisperer", "discovery.ts"), "utf8");

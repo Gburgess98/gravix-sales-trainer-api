@@ -311,6 +311,46 @@ export function suppressKnownCandidates(
   return { kept, suppressedCount: suppressed };
 }
 
+// Day 145: blend raw blind-spot candidates with triggered-moment candidates so
+// managers see both instead of raw-first hiding triggered patterns. Candidates
+// share a stable id (`candidate-<type>-<token>`), so a pattern present in both
+// sources merges into one "mixed" candidate. Ranking: untriggered blind spots
+// first (raw + mixed-with-untriggered), then everything else, each group by
+// seenCount desc then confidence desc. Pure — no I/O, no LLM.
+export function blendTriggerCandidates(
+  rawCandidates: TriggerCandidate[],
+  triggerCandidates: TriggerCandidate[]
+): TriggerCandidate[] {
+  const byId = new Map<string, TriggerCandidate>();
+  for (const c of rawCandidates) byId.set(c.id, { ...c });
+
+  for (const t of triggerCandidates) {
+    const existing = byId.get(t.id);
+    if (!existing) { byId.set(t.id, { ...t }); continue; }
+    // Same pattern in both sources → merge into a single "mixed" candidate.
+    const examples = [...(existing.examples ?? []), ...(t.examples ?? [])].slice(0, 3);
+    const exampleSegmentIds = [...new Set([...(existing.exampleSegmentIds ?? []), ...(t.exampleSegmentIds ?? [])])].slice(0, 10);
+    byId.set(t.id, {
+      ...existing,
+      source: "mixed",
+      untriggered: Boolean(existing.untriggered || t.untriggered),
+      seenCount: existing.seenCount + t.seenCount,
+      confidence: Math.max(existing.confidence, t.confidence),
+      examples,
+      exampleSegmentIds,
+      sessionsCount: (existing.sessionsCount ?? 0) + (t.sessionsCount ?? 0),
+      reason: "Recurs in both raw transcript segments (untriggered) and triggered Whisperer moments.",
+    });
+  }
+
+  const merged = [...byId.values()];
+  // Tier: untriggered blind spots first (covers raw + mixed-with-untriggered),
+  // then mixed, then trigger-only.
+  const tier = (c: TriggerCandidate) => (c.untriggered ? 0 : c.source === "mixed" ? 1 : 2);
+  merged.sort((a, b) => (tier(a) - tier(b)) || (b.seenCount - a.seenCount) || (b.confidence - a.confidence));
+  return merged;
+}
+
 export function discoverTriggerCandidates(input: DiscoverInput): TriggerCandidate[] {
   const minSeen = Math.max(1, input.minSeenCount ?? 2);
   const limit = Math.max(1, input.limit ?? 10);
