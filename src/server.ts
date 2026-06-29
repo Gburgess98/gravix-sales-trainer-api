@@ -756,10 +756,13 @@ app.post("/v1/upload/signed", async (req, res) => {
 app.post("/v1/upload/finalize", async (req, res) => {
   try {
     const userId = getUserId(req);
-    const { path, filename, mime, size, sha256 } = (req.body || {}) as {
-      path: string; filename: string; mime?: string; size?: number; sha256?: string;
+    const { path, filename, mime, size, sha256, accountId } = (req.body || {}) as {
+      path: string; filename: string; mime?: string; size?: number; sha256?: string; accountId?: string | null;
     };
     if (!path || !filename) return res.status(400).json({ ok: false, error: "missing_path_or_filename" });
+    // Day 162 — optional structured CRM account link. Only used when a valid UUID
+    // is supplied; the upload still succeeds (fail-soft) if linking is unavailable.
+    const linkAccountId = (typeof accountId === "string" && /^[0-9a-f-]{36}$/i.test(accountId)) ? accountId : null;
     if (!path.startsWith(`${userId}/`)) return res.status(400).json({ ok: false, error: "path_user_mismatch" });
 
     // best-effort existence check
@@ -798,7 +801,7 @@ app.post("/v1/upload/finalize", async (req, res) => {
     }
 
     // 1) DB row
-    const { error: dbErrCall } = await supabase.from("calls").insert({
+    const callInsert: Record<string, any> = {
       id,
       user_id: userId,
       org_id: DEFAULT_ORG_ID,
@@ -812,7 +815,18 @@ app.post("/v1/upload/finalize", async (req, res) => {
       audio_path: path,
       duration_sec: durationSec,
       duration_ms: durationMs,
-    });
+    };
+    if (linkAccountId) callInsert.account_id = linkAccountId;
+
+    let linkedAccountId: string | null = linkAccountId;
+    let { error: dbErrCall } = await supabase.from("calls").insert(callInsert);
+    // Fail-soft: if the optional account link is rejected (bad id / column / FK),
+    // retry the insert without it so the core upload path never breaks.
+    if (dbErrCall && linkAccountId) {
+      delete callInsert.account_id;
+      linkedAccountId = null;
+      ({ error: dbErrCall } = await supabase.from("calls").insert(callInsert));
+    }
     if (dbErrCall) return res.status(500).json({ ok: false, error: `DB insert failed: ${dbErrCall.message}` });
 
     // 2) Job row
@@ -837,7 +851,7 @@ app.post("/v1/upload/finalize", async (req, res) => {
     // 3) Sim worker
     simulateTranscription(jobId, id, path, userId).catch((e) => console.error("Sim worker failed:", e.message));
 
-    res.json({ ok: true, callId: id, jobId, filename, storagePath: path, size: size || null, mime: mime || null, sha256: hash });
+    res.json({ ok: true, callId: id, jobId, filename, storagePath: path, size: size || null, mime: mime || null, sha256: hash, accountId: linkedAccountId });
   } catch (e: any) {
     res.status(500).json({ ok: false, error: e?.message || "server_error" });
   }
