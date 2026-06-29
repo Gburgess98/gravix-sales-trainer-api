@@ -312,6 +312,35 @@ function parseTargetIds(value: unknown): string[] {
   ).slice(0, 100);
 }
 
+// Day 155 — merge a whitelisted sparring completion proof into existing assignment
+// meta without replacing it. Returns the merged meta, or null when there is no
+// valid proof to persist (so the caller leaves meta untouched). Only known keys
+// are copied across; unknown keys are ignored.
+export function mergeCompletionProof(
+  existingMeta: unknown,
+  proof: unknown
+): Record<string, any> | null {
+  if (!proof || typeof proof !== "object") return null;
+  const p = proof as Record<string, any>;
+  const sessionId =
+    typeof p.matched_sparring_session_id === "string" ? p.matched_sparring_session_id.trim() : "";
+  if (!sessionId) return null;
+
+  const merged: Record<string, any> =
+    existingMeta && typeof existingMeta === "object" ? { ...(existingMeta as Record<string, any>) } : {};
+
+  merged.completed_via = "sparring_session_match";
+  merged.matched_sparring_session_id = sessionId;
+  if (typeof p.completion_score === "number" && Number.isFinite(p.completion_score)) {
+    merged.completion_score = p.completion_score;
+  }
+  if (typeof p.completed_session_at === "string" && p.completed_session_at.trim()) {
+    merged.completed_session_at = p.completed_session_at.trim();
+  }
+  merged.completed_from_dashboard = p.completed_from_dashboard === true;
+  return merged;
+}
+
 async function isManagerUser(userId: string) {
   const supa = getSupaAdmin();
 
@@ -1304,7 +1333,7 @@ export function assignmentsRoutes() {
       const supa = getSupaAdmin();
       const { data: current, error: curErr } = await supa
         .from("assignments")
-        .select("id, manager_id, rep_id, status, due_at, completed_at, completed_by, title, type")
+        .select("id, manager_id, rep_id, status, due_at, completed_at, completed_by, title, type, meta")
         .eq("id", id)
         .maybeSingle();
 
@@ -1320,6 +1349,7 @@ export function assignmentsRoutes() {
         completed_at?: string | null;
         completed_by?: string | null;
         title?: string;
+        completion_proof?: Record<string, any> | null;
       };
 
       const patch: Record<string, any> = {};
@@ -1353,11 +1383,18 @@ export function assignmentsRoutes() {
         }
       }
 
+      // Persist completion proof metadata only when completing the assignment.
+      // mergeCompletionProof whitelists keys and merges into existing meta.
+      if (patch.status === "completed") {
+        const mergedMeta = mergeCompletionProof((current as any).meta, body.completion_proof);
+        if (mergedMeta) patch.meta = mergedMeta;
+      }
+
       const { data, error } = await supa
         .from("assignments")
         .update(patch as any)
         .eq("id", id)
-        .select("id, rep_id, manager_id, type, target_id, title, status, due_at, created_at, completed_at, completed_by")
+        .select("id, rep_id, manager_id, type, target_id, title, status, due_at, created_at, completed_at, completed_by, source, meta")
         .maybeSingle();
 
       if (error) throw error;
