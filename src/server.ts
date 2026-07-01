@@ -818,6 +818,20 @@ app.post("/v1/upload/finalize", async (req, res) => {
     };
     if (linkAccountId) callInsert.account_id = linkAccountId;
 
+    // Day 165 — stamp the uploader's hierarchy (office/company) so the call is
+    // visible in the manager's scoped Review Queue and Command Centre, both of
+    // which filter calls by office_id / company_id. Fail-soft: if the lookup
+    // returns nothing the upload still proceeds (unscoped, as before).
+    try {
+      const { data: urow } = await supabase
+        .from("users")
+        .select("office_id, company_id")
+        .eq("id", userId)
+        .maybeSingle();
+      if (urow?.office_id) callInsert.office_id = urow.office_id;
+      if (urow?.company_id) callInsert.company_id = urow.company_id;
+    } catch { /* fail-soft: hierarchy scoping is best-effort */ }
+
     let linkedAccountId: string | null = linkAccountId;
     let { error: dbErrCall } = await supabase.from("calls").insert(callInsert);
     // Fail-soft: if the optional account link is rejected (bad id / column / FK),
