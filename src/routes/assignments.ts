@@ -235,9 +235,25 @@ async function getUserHierarchy(supa: any, userId: string) {
     .eq("id", userId)
     .maybeSingle();
 
+  if (data?.company_id || data?.office_id) {
+    return {
+      office_id: data?.office_id || null,
+      company_id: data?.company_id || null,
+    };
+  }
+
+  // Day 168 — Phase 1 identity bridge (same as accounts.ts/calls.ts): auth-first
+  // reps have no users row, so assignments created for them were stamped with
+  // null office/company and disappeared from every scoped manager query.
+  const { data: repRow } = await supa
+    .from("reps")
+    .select("office_id, company_id")
+    .eq("id", userId)
+    .maybeSingle();
+
   return {
-    office_id: data?.office_id || null,
-    company_id: data?.company_id || null,
+    office_id: repRow?.office_id || null,
+    company_id: repRow?.company_id || null,
   };
 }
 
@@ -257,6 +273,25 @@ async function getUserContext(supa: any, userId: string): Promise<UserContext | 
     company_id: data.company_id || null,
     is_admin: Boolean(data.is_admin),
   };
+}
+
+// Day 168 — same scope rule as manager.ts applyHierarchyFilters (Day 166/167):
+// office scope when an office is assigned, else company scope. Never emits
+// .eq("office_id", null) — a Postgres uuid error that made every assignment
+// query fail for seeded demo managers with no office (Command Centre showed 0
+// open assignments despite rows existing). Never broadens beyond company.
+function applyOrgScope(query: any, ctx: UserContext | null) {
+  if (!ctx) return query;
+  if (isOfficeManager(ctx)) {
+    if (ctx.office_id) return query.eq("office_id", ctx.office_id);
+    if (ctx.company_id) return query.eq("company_id", ctx.company_id);
+    return query;
+  }
+  if (isCompanyManager(ctx)) {
+    if (ctx.company_id) return query.eq("company_id", ctx.company_id);
+    return query;
+  }
+  return query;
 }
 
 // 🔥 IMPROVEMENT SCORE
@@ -561,13 +596,7 @@ export function assignmentsRoutes() {
         .order("created_at", { ascending: false });
 
       if (manager && managerContext) {
-        if (isOfficeManager(managerContext)) {
-          q = q.eq("office_id", managerContext.office_id);
-        }
-
-        if (isCompanyManager(managerContext)) {
-          q = q.eq("company_id", managerContext.company_id);
-        }
+        q = applyOrgScope(q, managerContext);
       } else {
         q = q.eq("rep_id", userId);
       }
@@ -657,13 +686,7 @@ export function assignmentsRoutes() {
       const managerContext = await getUserContext(supa, managerId);
 
       if (managerContext) {
-        if (isOfficeManager(managerContext)) {
-          q = q.eq("office_id", managerContext.office_id);
-        }
-
-        if (isCompanyManager(managerContext)) {
-          q = q.eq("company_id", managerContext.company_id);
-        }
+        q = applyOrgScope(q, managerContext);
       }
     }
 
@@ -718,13 +741,7 @@ export function assignmentsRoutes() {
       const managerContext = await getUserContext(supa, managerId);
 
       if (managerContext) {
-        if (isOfficeManager(managerContext)) {
-          q = q.eq("office_id", managerContext.office_id);
-        }
-
-        if (isCompanyManager(managerContext)) {
-          q = q.eq("company_id", managerContext.company_id);
-        }
+        q = applyOrgScope(q, managerContext);
       }
     }
 
@@ -1467,13 +1484,7 @@ export function assignmentsRoutes() {
       .order("id", { ascending: false });
 
     if (managerContext) {
-      if (isOfficeManager(managerContext)) {
-        q = q.eq("office_id", managerContext.office_id);
-      }
-
-      if (isCompanyManager(managerContext)) {
-        q = q.eq("company_id", managerContext.company_id);
-      }
+      q = applyOrgScope(q, managerContext);
     }
 
     if (repId) q = q.eq("rep_id", repId);
@@ -1822,13 +1833,7 @@ export function assignmentsRoutes() {
         const managerContext = await getUserContext(supa, userId);
 
         if (managerContext) {
-          if (isOfficeManager(managerContext)) {
-            q = q.eq("office_id", managerContext.office_id);
-          }
-
-          if (isCompanyManager(managerContext)) {
-            q = q.eq("company_id", managerContext.company_id);
-          }
+          q = applyOrgScope(q, managerContext);
         }
       }
 

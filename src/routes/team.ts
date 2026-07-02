@@ -10,53 +10,87 @@ const supa = createClient(
   { auth: { persistSession: false } }
 );
 
-// ----- Users list (schema-agnostic) ----------------------------------------
-const CANDIDATES: { select: string; searchCols: string[] }[] = [
-  { select: "id, full_name, role, manager_id", searchCols: ["full_name"] },
-  { select: "id:user_id, full_name, role, manager_id", searchCols: ["full_name"] },
-  { select: "id, full_name:name, role, manager_id", searchCols: ["name"] },
-  { select: "id:user_id, full_name:name, role, manager_id", searchCols: ["name"] },
-  { select: "id, full_name, email, role, manager_id", searchCols: ["full_name", "email"] },
-  { select: "id:user_id, full_name, email, role, manager_id", searchCols: ["full_name", "email"] },
-  { select: "id, full_name:name, email, role, manager_id", searchCols: ["name", "email"] },
-  { select: "id:user_id, full_name:name, email, role, manager_id", searchCols: ["name", "email"] },
-  { select: "id, role, manager_id", searchCols: [] },
-  { select: "id:user_id, role, manager_id", searchCols: [] },
-];
+// ----- Users list (tenant-scoped, Day 168) ----------------------------------
+// Previously this endpoint listed the `profiles` table with no tenant filter —
+// every profile in the DB was returned to any caller, which leaked
+// wrong-company reps into the Upload Call picker. It now resolves the
+// requester's company (users first, reps identity bridge second — same rule
+// as accounts.ts resolveCompanyId) and only returns members of that company,
+// sourced from `reps` (named) with a `users` fallback (email-only rows).
+// No requester or no company → empty list, never the whole DB.
 
-async function trySelect(selectClause: string, searchCols: string[], q: string, limit: number) {
-  let query = supa.from("profiles").select(selectClause, { count: "exact" }).limit(limit);
-  if (q && searchCols.length) {
-    const expr = searchCols.map((c) => `${c}.ilike.%${q}%`).join(",");
-    query = query.or(expr);
-  }
-  return await query;
+function requesterIdFromHeaders(req: any): string {
+  return String(
+    req.header("x-user-id") ||
+    req.header("x-forwarded-user-id") ||
+    req.header("x-gravix-user-id") ||
+    ""
+  ).trim();
+}
+
+async function resolveCompanyId(userId: string): Promise<string | null> {
+  if (!userId) return null;
+
+  const { data: userRow } = await supa
+    .from("users")
+    .select("company_id")
+    .eq("id", userId)
+    .maybeSingle();
+  if (userRow?.company_id) return String(userRow.company_id);
+
+  const { data: repRow } = await supa
+    .from("reps")
+    .select("company_id")
+    .eq("id", userId)
+    .maybeSingle();
+  return (repRow as any)?.company_id ? String((repRow as any).company_id) : null;
 }
 
 // GET /v1/team/users?q=alex&limit=100
 router.get("/users", async (req, res) => {
   try {
-    const q = (req.query.q as string | undefined)?.trim() || "";
+    const q = (req.query.q as string | undefined)?.trim().toLowerCase() || "";
     const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 100));
 
-    let data: any[] | null = null;
-    let lastErr: any = null;
-    for (const cand of CANDIDATES) {
-      const { data: d, error } = await trySelect(cand.select, cand.searchCols, q, limit);
-      if (!error) { data = d || []; lastErr = null; break; }
-      lastErr = error;
-    }
-    if (!data) return res.status(500).json({ ok: false, error: lastErr?.message || "select_failed" });
+    const requesterId = requesterIdFromHeaders(req);
+    const companyId = await resolveCompanyId(requesterId);
+    if (!companyId) return res.json({ ok: true, items: [] });
 
-    const items = (data as any[]).map((u) => {
-      const id = u.id;
+    type Item = { id: string; name: string; email: string | null; role: string | null; manager_id: string | null };
+    const byId = new Map<string, Item>();
+
+    const { data: repRows, error: repErr } = await supa
+      .from("reps")
+      .select("id, name, display_name, email, tier, manager_id")
+      .eq("company_id", companyId)
+      .limit(500);
+    if (repErr) return res.status(500).json({ ok: false, error: repErr.message });
+    for (const r of (repRows ?? []) as any[]) {
+      const id = String(r.id);
+      const email = typeof r.email === "string" ? r.email : null;
+      const name = r.display_name || r.name || email || id;
+      byId.set(id, { id, name: String(name), email, role: r.tier ? String(r.tier) : null, manager_id: r.manager_id ?? null });
+    }
+
+    // Company members with a users row but no reps row (legacy hierarchy) —
+    // email-only display, never overrides a named reps entry.
+    const { data: userRows, error: userErr } = await supa
+      .from("users")
+      .select("id, email, role, manager_id")
+      .eq("company_id", companyId)
+      .limit(500);
+    if (userErr && byId.size === 0) return res.status(500).json({ ok: false, error: userErr.message });
+    for (const u of (userRows ?? []) as any[]) {
+      const id = String(u.id);
+      if (byId.has(id)) continue;
       const email = typeof u.email === "string" ? u.email : null;
-      const fullName = typeof u.full_name === "string" ? u.full_name : null;
-      const name = fullName || email || id;
-      const role = typeof u.role === "string" ? u.role : null;
-      const manager_id = u.manager_id ?? null;
-      return { id, name, email, role, manager_id };
-    }).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+      byId.set(id, { id, name: String(email || id), email, role: u.role ? String(u.role) : null, manager_id: u.manager_id ?? null });
+    }
+
+    const items = Array.from(byId.values())
+      .filter((it) => !q || it.name.toLowerCase().includes(q) || (it.email || "").toLowerCase().includes(q))
+      .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+      .slice(0, limit);
 
     return res.json({ ok: true, items });
   } catch (e: any) {
