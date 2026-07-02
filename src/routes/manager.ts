@@ -77,11 +77,17 @@ function applyHierarchyFilters(query: any, user: UserContext | null) {
   if (!user) return query;
 
   if (isOfficeManager(user)) {
-    return query.eq("office_id", user.office_id);
+    // Seeded demo orgs have office managers with no office assigned; filtering
+    // .eq("office_id", null) is a Postgres uuid error, so fall back to company
+    // scope (then unscoped, matching the null-context behaviour above).
+    if (user.office_id) return query.eq("office_id", user.office_id);
+    if (user.company_id) return query.eq("company_id", user.company_id);
+    return query;
   }
 
   if (isCompanyManager(user)) {
-    return query.eq("company_id", user.company_id);
+    if (user.company_id) return query.eq("company_id", user.company_id);
+    return query;
   }
 
   return query;
