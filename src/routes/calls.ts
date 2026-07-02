@@ -73,7 +73,20 @@ async function getRequesterOrgId(requester: string): Promise<string | null> {
     .maybeSingle();
 
   if (error) throw error;
-  return data?.org_id ?? null;
+  if (data?.org_id) return data.org_id;
+
+  // Day 167 — managers who have never recorded/uploaded a call have no
+  // call-derived org, which blocked them from opening any rep call (403).
+  // Fall back to their reps-table membership; org visibility rules still apply.
+  const { data: repRow, error: repError } = await supa
+    .from("reps")
+    .select("org_id")
+    .eq("id", requester)
+    .not("org_id", "is", null)
+    .maybeSingle();
+
+  if (repError) return null;
+  return repRow?.org_id ?? null;
 }
 
 async function getUserHierarchy(supa: any, userId: string) {
