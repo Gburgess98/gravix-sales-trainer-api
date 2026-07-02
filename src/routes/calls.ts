@@ -124,6 +124,25 @@ async function getManagerUserContext(userId: string): Promise<UserContext | null
   };
 }
 
+// Day 170: single-call mirror of manager.ts applyHierarchyFilters. Seeded
+// demo orgs have office managers with no office assigned, so fall back to
+// company scope (then unscoped), matching the review-queue visibility rules.
+function managerReviewScopeAllows(
+  ctx: UserContext | null,
+  call: { office_id?: string | null; company_id?: string | null }
+): boolean {
+  if (isOfficeManager(ctx)) {
+    if (ctx?.office_id) return String(call.office_id || "") === String(ctx.office_id);
+    if (ctx?.company_id) return String(call.company_id || "") === String(ctx.company_id);
+    return true;
+  }
+  if (isCompanyManager(ctx)) {
+    if (ctx?.company_id) return String(call.company_id || "") === String(ctx.company_id);
+    return true;
+  }
+  return true;
+}
+
 // True when call_manager_reviews has not been migrated yet (Day 91 migration).
 function isMissingReviewTableError(error: any): boolean {
   const msg = String(error?.message || "").toLowerCase();
@@ -1527,10 +1546,7 @@ router.get("/:id/manager-review", requireManager, async (req, res) => {
     if (callErr || !call) return res.status(404).json({ ok: false, error: "not_found" });
 
     const ctx = await getManagerUserContext(requester);
-    if (isOfficeManager(ctx) && String(call.office_id || "") !== String(ctx?.office_id || "x")) {
-      return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
-    }
-    if (isCompanyManager(ctx) && String(call.company_id || "") !== String(ctx?.company_id || "x")) {
+    if (!managerReviewScopeAllows(ctx, call)) {
       return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
     }
 
@@ -1593,10 +1609,7 @@ router.post("/:id/manager-review", requireManager, async (req, res) => {
     // Hierarchy scope: the manager must be able to see this call under the
     // same rules as the command-centre/review-queue queries.
     const ctx = await getManagerUserContext(requester);
-    if (isOfficeManager(ctx) && String(call.office_id || "") !== String(ctx?.office_id || "x")) {
-      return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
-    }
-    if (isCompanyManager(ctx) && String(call.company_id || "") !== String(ctx?.company_id || "x")) {
+    if (!managerReviewScopeAllows(ctx, call)) {
       return res.status(403).json({ ok: false, error: "forbidden_out_of_scope" });
     }
 
