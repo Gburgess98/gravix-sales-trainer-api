@@ -1749,8 +1749,18 @@ function validateLibraryBody(body: any, partial: boolean): { error?: string; pat
 // or company (mirrors applyHierarchyFilters semantics for this table).
 function applyLibraryScope(query: any, ctx: any) {
   if (!ctx) return query;
-  if (isOfficeManager(ctx)) return query.eq("office_id", ctx.office_id);
-  if (isCompanyManager(ctx)) return query.eq("company_id", ctx.company_id);
+  if (isOfficeManager(ctx)) {
+    // Day 167 — same guard as applyHierarchyFilters: office managers without
+    // an office (seeded demo orgs) fall back to company scope;
+    // .eq("office_id", null) is a Postgres uuid error and 500s the endpoint.
+    if (ctx.office_id) return query.eq("office_id", ctx.office_id);
+    if (ctx.company_id) return query.eq("company_id", ctx.company_id);
+    return query;
+  }
+  if (isCompanyManager(ctx)) {
+    if (ctx.company_id) return query.eq("company_id", ctx.company_id);
+    return query;
+  }
   return query;
 }
 
