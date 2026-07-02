@@ -62,32 +62,6 @@ function getUserIdHeader(req: any): string {
   return uid;
 }
 
-async function getRequesterOrgId(requester: string): Promise<string | null> {
-  const { data, error } = await supa
-    .from("calls")
-    .select("org_id")
-    .eq("user_id", requester)
-    .not("org_id", "is", null)
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (error) throw error;
-  if (data?.org_id) return data.org_id;
-
-  // Day 167 — managers who have never recorded/uploaded a call have no
-  // call-derived org, which blocked them from opening any rep call (403).
-  // Fall back to their reps-table membership; org visibility rules still apply.
-  const { data: repRow, error: repError } = await supa
-    .from("reps")
-    .select("org_id")
-    .eq("id", requester)
-    .not("org_id", "is", null)
-    .maybeSingle();
-
-  if (repError) return null;
-  return repRow?.org_id ?? null;
-}
 
 async function getUserHierarchy(supa: any, userId: string) {
   const { data } = await supa
@@ -181,37 +155,9 @@ async function getManagerForRep(supa: any, repId: string) {
 
 import { getOrgCallVisibility } from "../lib/adminConfig";
 import { whispererTablesAvailable } from "../whisperer";
-
-async function canAccessCall(
-  requester: string,
-  callUserId: string,
-  callOrgId: string | null
-) {
-  if (callUserId === requester) return true;
-  if (!callOrgId) return false;
-
-  const requesterOrgId = await getRequesterOrgId(requester);
-  if (!requesterOrgId || requesterOrgId !== callOrgId) return false;
-
-  const visibility = await getOrgCallVisibility(callOrgId);
-
-  if (visibility === "disabled") return false;
-
-  if (visibility === "everyone") return true;
-
-  if (visibility === "managers") {
-    // TEMP: treat users with assignments as "managers"
-    const { data } = await supa
-      .from("assignments")
-      .select("id")
-      .eq("manager_id", requester)
-      .limit(1);
-
-    return (data?.length ?? 0) > 0;
-  }
-
-  return false;
-}
+// Day 171: shared org-scoped call read access lives in lib/callAccess so
+// pins.ts can apply the same visibility rule to pin reads.
+import { canAccessCall, getRequesterOrgId } from "../lib/callAccess";
 
 async function getOpenAssignmentCallIds(callIds: string[]): Promise<Set<string>> {
   const ids = Array.from(new Set(callIds.map((x) => String(x || "").trim()).filter(Boolean)));

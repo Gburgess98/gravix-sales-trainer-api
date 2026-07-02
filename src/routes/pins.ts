@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
+import { canAccessCall } from "../lib/callAccess";
 
 const router = Router();
 
@@ -45,15 +46,18 @@ router.get("/", async (req, res) => {
       return res.status(400).json({ ok: false, error: "invalid callId" });
     }
 
-    // Verify the call belongs to requester
+    // Day 171: pin reads follow the same org-scoped call visibility rule as
+    // the other call-detail endpoints (signed-audio/transcript), so managers
+    // who can open the call can read its pins. Writes below stay owner-only.
     const { data: call, error: callErr } = await supa
       .from("calls")
-      .select("id,user_id")
+      .select("id,user_id,org_id")
       .eq("id", callId)
       .single();
 
     if (callErr || !call) return res.status(404).json({ ok: false, error: "not_found" });
-    if (call.user_id !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
+    const allowed = await canAccessCall(requester, call.user_id, call.org_id ?? null);
+    if (!allowed) return res.status(403).json({ ok: false, error: "forbidden" });
 
     const { data: pins, error } = await supa
       .from("pins")
