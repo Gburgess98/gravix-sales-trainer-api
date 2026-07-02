@@ -40,6 +40,8 @@
     "check:ci": "npm run lint && npm run typecheck",
     "regression": "tsx scripts/api-regression.ts",
     "seed:demo": "tsx scripts/seed-demo-org.ts",
+    "seed:ufc-story": "tsx scripts/seed-ufc-demo-story.ts",
+    "validate-ufc-demo-seed": "tsx scripts/validate-ufc-demo-seed.ts",
     "db:backfill": "tsx scripts/backfill-reps-company.ts",
     "db:backfill-calls": "tsx scripts/backfill-calls-hierarchy.ts",
     "db:backfill-sparring": "tsx scripts/backfill-sparring-data-model.ts",
