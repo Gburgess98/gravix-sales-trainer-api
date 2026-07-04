@@ -197,8 +197,37 @@ function isUuid(v: string | null | undefined) {
   return /^[0-9a-fA-F-]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(v);
 }
 
+// Day 175 — proxy trust boundary for identity headers.
+// When PROXY_SHARED_SECRET is configured, x-user-id (and its aliases) are only
+// honoured when the request carries the matching x-proxy-secret, i.e. it came
+// from our web proxy rather than a direct caller. Untrusted identity headers
+// are stripped from the request so downstream per-route header reads cannot
+// be spoofed either. When the env is unset, behaviour is unchanged (dev/local).
+function identityHeadersTrusted(req: express.Request): boolean {
+  const expected = String(process.env.PROXY_SHARED_SECRET || "").trim();
+  if (!expected) return true;
+  const provided = String(req.header("x-proxy-secret") || "").trim();
+  if (!provided || provided.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
+
+const SPOOFABLE_IDENTITY_HEADERS = [
+  "x-user-id",
+  "x-gravix-user-id",
+  "x-forwarded-user-id",
+  "x-real-user-id",
+] as const;
+
 // Attach req.userId early so middleware ordering changes can't silently break auth.
 app.use((req, res, next) => {
+  if (!identityHeadersTrusted(req)) {
+    for (const h of SPOOFABLE_IDENTITY_HEADERS) delete req.headers[h];
+  }
+
   const headerUid = (req.header("x-user-id") || "").trim() || null;
   const token = getBearerToken(req);
   const jwtUid = tryDecodeJwtSub(token);
@@ -1773,14 +1802,20 @@ app.post("/v1/cron/crm/auto-assign", requireCron, async (req, res) => {
 
     const rid = (req as any)?.rid || req.header("x-request-id") || randomUUID();
 
+    // Day 175 — this internal self-call injects identity headers, so it must
+    // carry the proxy trust secret when one is configured or they'd be stripped.
+    const internalHeaders: Record<string, string> = {
+      "content-type": "application/json",
+      "x-request-id": String(rid),
+      "x-user-id": CRON_USER_ID,
+      "x-org-id": CRON_ORG_ID,
+    };
+    const cronProxySecret = String(process.env.PROXY_SHARED_SECRET || "").trim();
+    if (cronProxySecret) internalHeaders["x-proxy-secret"] = cronProxySecret;
+
     const r = await fetch(`${base}/v1/crm/manager/auto-assign/run`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-request-id": String(rid),
-        "x-user-id": CRON_USER_ID,
-        "x-org-id": CRON_ORG_ID,
-      },
+      headers: internalHeaders,
       body: JSON.stringify(body),
     });
 

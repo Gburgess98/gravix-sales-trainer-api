@@ -124,7 +124,27 @@ check(
   /data\.user_id && String\(data\.user_id\) !== requester/.test(serverTs)
 );
 
-// 8. Scope guards: no voice/TTS or new LLM hot path added ----------------------
+// 8. Day 175 — proxy trust boundary for identity headers -----------------------
+check(
+  "identity headers gated behind PROXY_SHARED_SECRET when configured",
+  /PROXY_SHARED_SECRET/.test(serverTs) &&
+    /identityHeadersTrusted/.test(serverTs) &&
+    /timingSafeEqual/.test(serverTs)
+);
+
+check(
+  "untrusted spoofable identity headers are stripped before any route runs",
+  /SPOOFABLE_IDENTITY_HEADERS/.test(serverTs) &&
+    /delete req\.headers\[h\]/.test(serverTs) &&
+    serverTs.indexOf("SPOOFABLE_IDENTITY_HEADERS") < serverTs.indexOf('app.use("/v1/dashboard"')
+);
+
+check(
+  "internal cron self-call carries the proxy trust secret when configured",
+  /internalHeaders\["x-proxy-secret"\] = cronProxySecret/.test(serverTs)
+);
+
+// 9. Scope guards: no voice/TTS or new LLM hot path added ----------------------
 {
   const srcFiles: string[] = [];
   const walk = (dir: string) => {
