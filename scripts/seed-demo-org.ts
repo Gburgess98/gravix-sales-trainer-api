@@ -365,12 +365,14 @@ type SeedCall = { id: string; user_id: string; created_at: string };
 async function seedCalls(authMap: Map<string, string>): Promise<SeedCall[]> {
   process.stdout.write("  → Calls + Scores... ");
 
-  const repIds = REPS.map((r) => authMap.get(r.email)).filter(Boolean) as string[];
+  const repList = REPS
+    .map((r) => ({ repId: authMap.get(r.email), repName: r.name }))
+    .filter((r): r is { repId: string; repName: string } => Boolean(r.repId));
   const callRows: Record<string, unknown>[] = [];
   const scoreRows: Record<string, unknown>[] = [];
   const result: SeedCall[] = [];
 
-  repIds.forEach((repId) => {
+  repList.forEach(({ repId, repName }) => {
     for (let ci = 0; ci < 10; ci++) {
       const callId    = uid("DEMO_CALL",  `${repId}:${ci}`);
       const scoreId   = uid("DEMO_SCORE", `${repId}:${ci}`);
@@ -397,7 +399,7 @@ async function seedCalls(authMap: Map<string, string>): Promise<SeedCall[]> {
         review_tags: { filler_density: parseFloat((rng(`filler:${repId}`, ci) * 0.12).toFixed(3)) },
       };
 
-      callRows.push({ id: callId, user_id: repId, org_id: ORG_ID, storage_path: path, audio_path: path, filename: `demo-call-${ci + 1}.mp3`, status: "scored", score_overall: overall, summary, rubric, created_at: daysAgo(dayOffset) });
+      callRows.push({ id: callId, user_id: repId, org_id: ORG_ID, storage_path: path, audio_path: path, filename: `demo-call-${ci + 1}.mp3`, rep_name: repName, status: "scored", score_overall: overall, summary, rubric, created_at: daysAgo(dayOffset) });
       scoreRows.push({ id: scoreId, call_id: callId, user_id: repId, overall, rubric, created_at: daysAgo(dayOffset) });
       result.push({ id: callId, user_id: repId, created_at: daysAgo(dayOffset) });
     }

@@ -42,6 +42,8 @@ const DEMO_COMPANY_ID = process.env.DEMO_COMPANY_ID || "bfb9604e-bc2f-46fa-be97-
 const DANA_EMAIL = "dana.white@ufcelite.demo";
 const REP_EMAIL = "nate.diaz@ufcelite.demo";
 const SEED_TAG = "ufc-story";
+// Day 172 — demo-facing identity for the hero call (existing columns only).
+const HERO_CALL_TITLE = "Nate Diaz — Price Objection Call";
 
 const dryRun = process.argv.includes("--dry-run");
 
@@ -98,6 +100,18 @@ async function main() {
   console.log(`  Call   : ${call.id} (score ${call.score_overall})\n`);
 
   const tenant = { org_id: null, company_id: DEMO_COMPANY_ID, office_id: null };
+
+  // ── 0. Friendly hero-call identity (Day 172 — replaces demo-call-N.mp3) ──
+  if (dryRun) {
+    console.log(`  DRY   calls: would title hero call "${HERO_CALL_TITLE}"`);
+  } else {
+    const { error: titleErr } = await supa
+      .from("calls")
+      .update({ filename: HERO_CALL_TITLE, rep_name: rep.name })
+      .eq("id", call.id);
+    if (titleErr) throw new Error(`calls hero title: ${titleErr.message}`);
+    console.log(`  OK    calls: hero call titled "${HERO_CALL_TITLE}"`);
+  }
 
   // ── 1. Whisperer session (ended, linked to the demo call) ──
   const sessionId = uid("whisperer-session:1");

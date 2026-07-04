@@ -132,8 +132,15 @@ type ScoredCallRow = {
   filename: string | null;
   score_overall: number | null;
   analysis_json: any;
+  rubric: any;
   created_at: string;
 };
+
+// Some rows (including demo-seeded calls) carry stage scores in the rubric
+// column rather than analysis_json — fall back so weakest-skill isn't "Unknown".
+export function stageSourceOf(call: { analysis_json?: any; rubric?: any }): any {
+  return call.analysis_json ?? call.rubric ?? null;
+}
 
 // Stage scores live in analysis_json.stages ({ intro: { score }, ... }) with
 // rubric-shaped fallbacks for older rows.
@@ -172,7 +179,7 @@ export function reviewReasons(call: ScoredCallRow): string[] {
     reasons.push(`Score below ${REVIEW_SCORE_THRESHOLD}`);
   }
 
-  const stages = extractStageScores(call.analysis_json);
+  const stages = extractStageScores(stageSourceOf(call));
   for (const key of SKILL_KEYS) {
     const score = stages[key];
     if (typeof score === "number" && score < CRITICAL_STAGE_THRESHOLD) {
@@ -333,7 +340,7 @@ router.get("/command-centre", async (req: Request, res: Response) => {
 
     let callsQuery = supa
       .from("calls")
-      .select("id, user_id, filename, status, score_overall, analysis_json, created_at, office_id, company_id")
+      .select("id, user_id, filename, status, score_overall, analysis_json, rubric, created_at, office_id, company_id")
       .eq("status", "scored")
       .gte("created_at", since)
       .order("created_at", { ascending: false })
@@ -352,7 +359,7 @@ router.get("/command-centre", async (req: Request, res: Response) => {
     const prevSince = isoDaysAgo(days * 2);
     let prevCallsQuery = supa
       .from("calls")
-      .select("id, analysis_json, office_id, company_id")
+      .select("id, analysis_json, rubric, office_id, company_id")
       .eq("status", "scored")
       .gte("created_at", prevSince)
       .lt("created_at", since)
@@ -458,7 +465,7 @@ router.get("/command-centre", async (req: Request, res: Response) => {
         if (overall < 50) agg.callsBelow50 += 1;
       }
 
-      const stages = extractStageScores(call.analysis_json);
+      const stages = extractStageScores(stageSourceOf(call));
       for (const key of SKILL_KEYS) {
         const score = stages[key];
         if (typeof score !== "number") continue;
@@ -493,7 +500,7 @@ router.get("/command-centre", async (req: Request, res: Response) => {
       .sort((a, b) => Number(a.score_overall ?? 101) - Number(b.score_overall ?? 101))
       .slice(0, 10)
       .map((call) => {
-        const stages = extractStageScores(call.analysis_json);
+        const stages = extractStageScores(stageSourceOf(call));
         const weakest = weakestSkillOf(stages);
         return {
           callId: String(call.id),
@@ -575,8 +582,8 @@ router.get("/command-centre", async (req: Request, res: Response) => {
 
     // ── Previous-window skill averages (Day 94 trends) ──
     const prevSkillAgg = new Map<SkillKey, { sum: number; count: number }>();
-    for (const call of (prevCallsResult.data ?? []) as Array<{ analysis_json: any }>) {
-      const stages = extractStageScores(call.analysis_json);
+    for (const call of (prevCallsResult.data ?? []) as Array<{ analysis_json: any; rubric?: any }>) {
+      const stages = extractStageScores(stageSourceOf(call));
       for (const key of SKILL_KEYS) {
         const score = stages[key];
         if (typeof score !== "number") continue;
@@ -703,7 +710,7 @@ router.get("/review-queue", async (req: Request, res: Response) => {
 
     let callsQuery = supa
       .from("calls")
-      .select("id, user_id, filename, status, score_overall, analysis_json, created_at, office_id, company_id")
+      .select("id, user_id, filename, status, score_overall, analysis_json, rubric, created_at, office_id, company_id")
       .eq("status", "scored")
       .gte("created_at", since)
       .order("created_at", { ascending: false })
@@ -743,7 +750,7 @@ router.get("/review-queue", async (req: Request, res: Response) => {
     }
 
     const items = queue.map(({ call, reasons }) => {
-      const stages = extractStageScores(call.analysis_json);
+      const stages = extractStageScores(stageSourceOf(call));
       const weakest = weakestSkillOf(stages);
       return {
         callId: String(call.id),
