@@ -219,9 +219,18 @@ async function requireManagerOrg(req: any): Promise<{ requester: string; orgId: 
 
   const headerProvided = !!String(req.header("x-org-id") || "").trim();
 
-  if (allowBypass || isZeroOrg || !headerProvided) {
+  // Day 174 — bypass routes are dev/local only. In production a missing or
+  // zero x-org-id (both client-controllable) must fail closed, not skip the
+  // org membership check; otherwise any caller can read unscoped data.
+  const isProduction = process.env.NODE_ENV === "production";
+
+  if (!isProduction && (allowBypass || isZeroOrg || !headerProvided)) {
     // When header is missing we cannot safely validate membership; treat as bypassed (dev/local).
     return { requester, orgId, bypassed: true };
+  }
+
+  if (isProduction && (isZeroOrg || !headerProvided)) {
+    throw new Error("forbidden_org_scope");
   }
 
   await assertRequesterInOrg({ requester, orgId });

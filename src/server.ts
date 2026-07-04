@@ -203,8 +203,10 @@ app.use((req, res, next) => {
   const token = getBearerToken(req);
   const jwtUid = tryDecodeJwtSub(token);
 
-  // DEV escape hatch (local only)
-  const envUid = (process.env.DEV_TEST_UID || "").trim() || null;
+  // DEV escape hatch (local only — never honoured in production)
+  const envUid = process.env.NODE_ENV === "production"
+    ? null
+    : (process.env.DEV_TEST_UID || "").trim() || null;
 
   let ctx: AuthCtx = { userId: null, via: null };
 
@@ -290,7 +292,7 @@ app.use("/v1/dashboard", dashboardRoutes);
 app.use("/v1/internal", internalRoutes);
 
 // --- Dashboard: Leaderboard (top reps by avg score) ---
-app.get("/v1/dashboard/leaderboard", async (req, res) => {
+app.get("/v1/dashboard/leaderboard", requireIdentity, async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit || 10), 50);
     const days = Math.min(Number(req.query.days || 90), 365);
@@ -364,7 +366,7 @@ app.get("/v1/dashboard/leaderboard", async (req, res) => {
 });
 
 // --- Rep Overview (KPIs + recent) ---
-app.get("/v1/reps/:id/overview", async (req, res) => {
+app.get("/v1/reps/:id/overview", requireIdentity, async (req, res) => {
   try {
     const repId = String(req.params.id || "");
     if (!repId) return res.status(400).json({ ok: false, error: "rep_id required" });
@@ -489,7 +491,7 @@ app.get("/v1/reps/:id/overview", async (req, res) => {
 });
 
 // --- Dashboard: Top Objections (from assignments.drill_id starting 'objection-') ---
-app.get("/v1/dashboard/objections/top", async (req, res) => {
+app.get("/v1/dashboard/objections/top", requireIdentity, async (req, res) => {
   try {
     const days = Math.min(Number(req.query.days || 90), 365);
     const limit = Math.min(Number(req.query.limit || 5), 20);
@@ -580,13 +582,27 @@ const upload = multer({
 function getUserId(req: express.Request): string {
   const fromCtx = (req as any)?.auth?.userId || (req as any)?.userId;
   const headerUid = req.header("x-user-id");
-  const uid = (String(fromCtx || headerUid || process.env.DEV_TEST_UID || "").trim()) || null;
+  const devUid = process.env.NODE_ENV === "production" ? "" : (process.env.DEV_TEST_UID || "");
+  const uid = (String(fromCtx || headerUid || devUid || "").trim()) || null;
 
   if (!uid || !/^[0-9a-fA-F-]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(uid)) {
     throw new Error("Missing or invalid user id");
   }
 
   return uid;
+}
+
+// Day 174 — minimal identity guard for legacy endpoints defined directly on
+// `app`. Relies on the early auth-context middleware (header/JWT/dev-env) so
+// existing proxy and local-dev flows keep working; anonymous callers get 401.
+function requireIdentity(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  const uid = (req as any)?.userId;
+  if (!uid) return sendJsonError(res, 401, "missing_user_identity");
+  return next();
 }
 
 function requireAdmin(
@@ -1001,7 +1017,7 @@ app.get(["/health", "/v1/health"], (_req, res) => {
 app.head(["/health", "/v1/health"], (_req, res) => res.status(200).end());
 
 /* Jobs */
-app.get("/v1/jobs/:id", async (req, res) => {
+app.get("/v1/jobs/:id", requireIdentity, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from("jobs")
@@ -1014,6 +1030,13 @@ app.get("/v1/jobs/:id", async (req, res) => {
         ok: false,
         error: error?.message || "job_not_found",
       });
+    }
+
+    // Day 174 — job results can contain full transcripts; only the job owner
+    // may read them. Legacy rows without user_id stay readable (fail-soft).
+    const requester = String((req as any)?.userId || "");
+    if (data.user_id && String(data.user_id) !== requester) {
+      return res.status(403).json({ ok: false, error: "forbidden" });
     }
 
     return res.json({
@@ -1237,7 +1260,7 @@ app.post("/v1/admin/digest/daily", requireAdmin, async (req, res) => {
 
 
 // --- Coach Assignments: list by call ---
-app.get("/v1/coach/assignments", async (req, res) => {
+app.get("/v1/coach/assignments", requireIdentity, async (req, res) => {
   try {
     const callId = req.query.callId ? String(req.query.callId) : null;
     const accountId = req.query.accountId ? String(req.query.accountId) : null;
@@ -1340,7 +1363,7 @@ app.get("/v1/coach/assignments", async (req, res) => {
 });
 
 // --- Coach Assignments: delete by id ---
-app.delete("/v1/coach/assignments/:id", async (req, res) => {
+app.delete("/v1/coach/assignments/:id", requireIdentity, async (req, res) => {
   try {
     const { id } = req.params;
     if (!id) return res.status(400).json({ ok: false, error: "id required" });
@@ -1353,7 +1376,7 @@ app.delete("/v1/coach/assignments/:id", async (req, res) => {
 });
 
 // --- Coach Assignments: mark complete / reopen ---
-app.patch("/v1/coach/assignments/:id", async (req, res) => {
+app.patch("/v1/coach/assignments/:id", requireIdentity, async (req, res) => {
   try {
     const id = String(req.params.id || "");
     if (!id) return res.status(400).json({ ok: false, error: "id required" });
@@ -1407,7 +1430,7 @@ app.get("/v1/coach/drills", (_req, res) => {
 
 
 // --- Call score trend (demo data; replace with real query later) ---
-app.get("/v1/calls/:id/scores", async (req, res) => {
+app.get("/v1/calls/:id/scores", requireIdentity, async (req, res) => {
   try {
     const { id } = req.params;
     // TODO: replace with real DB-backed history. For now return a deterministic demo series.
@@ -1420,7 +1443,7 @@ app.get("/v1/calls/:id/scores", async (req, res) => {
   }
 });
 // --- Coach Notes (persist simple text per call) ---
-app.get("/v1/coach/notes", async (req, res) => {
+app.get("/v1/coach/notes", requireIdentity, async (req, res) => {
   try {
     const callId = String(req.query.callId || "");
     if (!callId) return res.status(400).json({ ok: false, error: "callId required" });
@@ -1438,7 +1461,7 @@ app.get("/v1/coach/notes", async (req, res) => {
   }
 });
 
-app.post("/v1/coach/notes", async (req, res) => {
+app.post("/v1/coach/notes", requireIdentity, async (req, res) => {
   try {
     const { callId, notes } = (req.body || {}) as { callId?: string; notes?: string };
     if (!callId) return res.status(400).json({ ok: false, error: "callId required" });
@@ -1461,7 +1484,7 @@ app.post("/v1/coach/notes", async (req, res) => {
 });
 
 // --- CRM Overview: Account ---
-app.get('/v1/crm/accounts/:id/overview', async (req, res) => {
+app.get('/v1/crm/accounts/:id/overview', requireIdentity, async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: 'account_id required' });
@@ -1509,7 +1532,7 @@ app.get('/v1/crm/accounts/:id/overview', async (req, res) => {
 });
 
 // --- CRM Overview: Contact ---
-app.get('/v1/crm/contacts/:id/overview', async (req, res) => {
+app.get('/v1/crm/contacts/:id/overview', requireIdentity, async (req, res) => {
   try {
     const id = String(req.params.id);
     if (!id) return res.status(400).json({ ok: false, error: 'contact_id required' });
@@ -1563,7 +1586,7 @@ app.get('/v1/crm/contacts/:id/overview', async (req, res) => {
 });
 
 // --- Coach Assignments aggregate by account/contact ---
-app.get('/v1/coach/assignments/by-entity', async (req, res) => {
+app.get('/v1/coach/assignments/by-entity', requireIdentity, async (req, res) => {
   try {
     const accountId = req.query.accountId ? String(req.query.accountId) : null;
     const contactId = req.query.contactId ? String(req.query.contactId) : null;

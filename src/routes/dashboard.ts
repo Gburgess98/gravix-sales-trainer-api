@@ -8,6 +8,22 @@ import {
 
 const router = Router();
 
+// Day 174 — resolve the requester set by the server-level auth-context
+// middleware (req.userId from header/JWT/dev-env). The previous reads of
+// req.authUserId always resolved to '' because nothing ever sets that field,
+// which silently disabled hierarchy filtering on these aggregate endpoints.
+function requesterIdOf(req: any): string {
+  return String(req?.authUserId || req?.userId || req?.header?.('x-user-id') || '').trim();
+}
+
+// All dashboard endpoints aggregate tenant data — require an identity.
+router.use((req: any, res, next) => {
+  if (!requesterIdOf(req)) {
+    return res.status(401).json({ ok: false, error: 'missing_user_identity' });
+  }
+  return next();
+});
+
 // ---- Supabase client (service role for server-side aggregations) ----
 const SUPABASE_URL = process.env.SUPABASE_URL as string;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY as string;
@@ -209,7 +225,7 @@ router.get('/kpis', async (req, res) => {
     const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? '90'), 10) || 90));
     const since = isoDaysAgo(days);
     const orgId = (req.query.orgId ? String(req.query.orgId) : '').trim();
-    const userId = String((req as any).authUserId || '').trim();
+    const userId = requesterIdOf(req);
 
     // Defaults keep UI rendering even if queries fail
     let total_calls = 0;
@@ -599,7 +615,7 @@ router.get('/reporting-summary', async (req, res) => {
     const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? '7'), 10) || 7));
     const since = isoDaysAgo(days);
     const orgId = (req.query.orgId ? String(req.query.orgId) : '').trim();
-    const userId = String((req as any).authUserId || '').trim();
+    const userId = requesterIdOf(req);
     const db = sbAdmin ?? supabase;
     if (!db) throw new Error('No Supabase client available');
 
@@ -837,7 +853,7 @@ router.get('/leaderboard', async (req, res) => {
     const minCalls = Math.max(0, Math.min(1000, parseInt(String(req.query.minCalls ?? '3'), 10) || 3));
     const since = isoDaysAgo(days);
     const orgId = (req.query.orgId ? String(req.query.orgId) : '').trim();
-    const userId = String((req as any).authUserId || '').trim();
+    const userId = requesterIdOf(req);
 
     // Pull all scored calls since cutoff; aggregate in Node for portability
     let callQuery = supabase
