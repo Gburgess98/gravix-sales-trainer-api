@@ -43,6 +43,7 @@
     "seed:ufc-story": "tsx scripts/seed-ufc-demo-story.ts",
     "validate-ufc-demo-seed": "tsx scripts/validate-ufc-demo-seed.ts",
     "validate:team-management": "tsx scripts/validate-team-management-day-212.ts",
+    "validate:analytics-labels": "tsx scripts/validate-analytics-labels-day-213b.ts",
     "db:backfill": "tsx scripts/backfill-reps-company.ts",
     "db:backfill-calls": "tsx scripts/backfill-calls-hierarchy.ts",
     "db:backfill-sparring": "tsx scripts/backfill-sparring-data-model.ts",

@@ -4361,6 +4361,28 @@ router.get("/analytics/score-trend", async (req, res) => {
 });
 
 
+// Day 213B — display-only rep label for analytics responses. Prefers a real
+// name, falls back to the email local part, else null. Never returns a
+// UUID-shaped value: user-facing analytics must not expose raw internal ids
+// (PREMIUM_UX_AUDIT §38, WEB repo).
+const UUID_LIKE_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function displayLabelFrom(
+  name?: string | null,
+  email?: string | null
+): string | null {
+  const n = typeof name === "string" ? name.trim() : "";
+  if (n && !UUID_LIKE_RE.test(n) && !n.includes("@")) return n;
+
+  const candidate = n.includes("@") ? n : typeof email === "string" ? email.trim() : "";
+  if (candidate.includes("@")) {
+    const local = candidate.split("@")[0]?.trim();
+    if (local && !UUID_LIKE_RE.test(local)) return local;
+  }
+  return null;
+}
+
 // GET /v1/crm/analytics/activity-by-rep
 router.get("/analytics/activity-by-rep", async (req, res) => {
   try {
@@ -4394,27 +4416,42 @@ router.get("/analytics/activity-by-rep", async (req, res) => {
 
     const repIds = Object.keys(reps);
 
-    // Fetch rep names (best-effort) from auth.users
-    let userMap: Record<string, string> = {};
+    // Day 213B — resolve human names from the public schema. The old lookup
+    // queried "auth.users", which PostgREST cannot reach, so it always
+    // fail-softed and every rep_name was echoed back as the raw UUID (the
+    // Day 213A analytics leak). Names now come from reps (named identity)
+    // with a users fallback (email-only rows); the ids being resolved are
+    // already org-scoped by the activity query above. rep_name is a display
+    // name, then an email local part, else null — never the UUID; the full
+    // id stays in rep_id for filtering/state.
+    const userMap: Record<string, string> = {};
 
     if (repIds.length) {
-      try {
-        const users = await supa
-          .from("auth.users")
-          .select("id,email")
-          .in("id", repIds);
+      const { data: repRows } = await supa
+        .from("reps")
+        .select("id, name, display_name, email")
+        .in("id", repIds);
+      for (const r of (repRows ?? []) as any[]) {
+        const label = displayLabelFrom(r.display_name ?? r.name, r.email);
+        if (label) userMap[String(r.id)] = label;
+      }
 
-        (users.data ?? []).forEach((u: any) => {
-          userMap[String(u.id)] = u.email;
-        });
-      } catch {
-        // fail-soft if auth.users not accessible
+      const unresolved = repIds.filter((id) => !userMap[id]);
+      if (unresolved.length) {
+        const { data: userRows } = await supa
+          .from("users")
+          .select("id, email")
+          .in("id", unresolved);
+        for (const u of (userRows ?? []) as any[]) {
+          const label = displayLabelFrom(null, u.email);
+          if (label) userMap[String(u.id)] = label;
+        }
       }
     }
 
     const result = Object.entries(reps).map(([rep_id, v]) => ({
       rep_id,
-      rep_name: userMap[rep_id] ?? rep_id,
+      rep_name: userMap[rep_id] ?? null,
       activities_created: v.created,
       activities_completed: v.completed,
     }));
