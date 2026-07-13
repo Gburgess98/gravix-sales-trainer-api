@@ -937,17 +937,28 @@ export function assignmentsRoutes() {
     const repOfficeId = hierarchy?.office_id || null;
     const repCompanyId = hierarchy?.company_id || null;
 
-    if (!repOfficeId) {
-      return res.status(400).json({
-        ok: false,
-        error: "rep_missing_office",
-      });
-    }
-
     if (!repCompanyId) {
       return res.status(400).json({
         ok: false,
         error: "rep_missing_company",
+      });
+    }
+
+    // Day 212 — office is optional scope, company is the hard boundary.
+    // The old rep_missing_office 400 dead-ended every company without offices
+    // (including the UFC demo org), while reads have used "office scope when
+    // assigned, else company scope" since Day 166/168 (applyOrgScope). A null
+    // office_id here stays visible to company managers, same as seeded rows.
+    // In exchange the previously-missing cross-company write guard is enforced:
+    // a manager may only assign to reps in their own company.
+    const managerHierarchy = await getUserHierarchy(supa, managerId);
+    if (
+      managerHierarchy?.company_id &&
+      managerHierarchy.company_id !== repCompanyId
+    ) {
+      return res.status(403).json({
+        ok: false,
+        error: "rep_out_of_scope",
       });
     }
 
