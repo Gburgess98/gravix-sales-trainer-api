@@ -16,13 +16,23 @@
  *   ✓ compiled block contains only the caller's company fields
  *   ✓ publish writes an audit_events row
  *
- * Self-cleaning: synthetic cross-company fixtures and every company_context
- * row created during the run are removed at the end (pre-existing rows are
- * snapshotted and left untouched).
+ * Day 224 — every manager WRITE now lands in a dedicated fixture company
+ * (Day218 Primary Co) driven by a fixture manager, not in the UFC demo
+ * company. Previously this validator saved drafts and published versions as
+ * Dana straight into UFC, which both required UFC to start with zero context
+ * rows and silently mutated demo data — once npm run seed:ufc-intelligence
+ * seeded a published UFC context, this run archived it and replaced it with
+ * validator content. Owning both companies outright also restores absolute
+ * assertions (publish → v1, second publish → v2) instead of tolerating
+ * whatever happened to already be there. The real UFC identities are still
+ * exercised read-only for the SalesRep 403 gates, where nothing is written.
  *
- * Requirements: server running (npm run dev), UFC demo seed applied,
- * sql/20260714_company_context.sql applied (otherwise reports MIGRATION
- * PENDING after proving the fail-soft behaviour).
+ * Self-cleaning: both fixture companies and all of their context rows are
+ * removed at the end. No UFC row is read, written or deleted.
+ *
+ * Requirements: server running (npm run dev), UFC demo seed applied (for the
+ * SalesRep identity), sql/20260714_company_context.sql applied (otherwise
+ * reports MIGRATION PENDING after proving the fail-soft behaviour).
  * Usage: npm run validate:intelligence-context
  */
 
@@ -64,6 +74,11 @@ async function repIdByEmail(email: string): Promise<string | null> {
   return (data as any)?.id ?? null;
 }
 
+// Primary fixture company — every manager write in this run lands here, never
+// in the UFC demo company (Day 224).
+const PCOMPANY_ID = uid("DAY218", "primary-company");
+const PMANAGER_ID = uid("DAY218", "primary-manager");
+
 // Cross-company fixtures — synthetic company whose context must stay invisible.
 const XCOMPANY_ID = uid("DAY218", "cross-company");
 const XMANAGER_ID = uid("DAY218", "cross-manager");
@@ -87,39 +102,56 @@ const UFC_CONTEXT = {
   tone: { playbook_guidance: "Always book the tour before quoting price.", tone_notes: "Direct, warm, no hard-sell scripts." },
 };
 
-async function seedCrossCompanyFixtures(orgId: string) {
-  const { error: compErr } = await supa
-    .from("companies")
-    .upsert(
+const DEMO_PARTNER = "5055e1b6-fb33-45c0-959a-d7dd45f98a13";
+const FIXTURE_COMPANY_IDS = [PCOMPANY_ID, XCOMPANY_ID];
+
+/**
+ * Two synthetic companies under the demo partner: the primary company this
+ * validator writes to, and a second one that must never see its content.
+ * Both are owned outright by the validator and dropped by cleanup().
+ */
+async function seedFixtures(orgId: string) {
+  const { error: compErr } = await supa.from("companies").upsert(
+    [
+      {
+        id: PCOMPANY_ID,
+        tmc_id: DEMO_PARTNER,
+        partner_id: DEMO_PARTNER,
+        name: "Day218 Primary Co (validator)",
+        slug: "day218-primary-validator",
+      },
       {
         id: XCOMPANY_ID,
-        tmc_id: "5055e1b6-fb33-45c0-959a-d7dd45f98a13", // demo partner (same TMC, different company)
-        partner_id: "5055e1b6-fb33-45c0-959a-d7dd45f98a13",
+        tmc_id: DEMO_PARTNER,
+        partner_id: DEMO_PARTNER,
         name: "Day218 Cross Company (validator)",
         slug: "day218-cross-company-validator",
       },
-      { onConflict: "id" }
-    );
+    ],
+    { onConflict: "id" }
+  );
   if (compErr) throw new Error(`fixture company upsert failed: ${compErr.message}`);
 
   const { error: repErr } = await supa.from("reps").upsert(
-    [{ id: XMANAGER_ID, name: "Day218 X Manager", tier: "Manager", org_id: orgId, company_id: XCOMPANY_ID }],
+    [
+      { id: PMANAGER_ID, name: "Day218 P Manager", tier: "Manager", org_id: orgId, company_id: PCOMPANY_ID },
+      { id: XMANAGER_ID, name: "Day218 X Manager", tier: "Manager", org_id: orgId, company_id: XCOMPANY_ID },
+    ],
     { onConflict: "id" }
   );
   if (repErr) throw new Error(`fixture reps upsert failed: ${repErr.message}`);
+
+  // A crashed previous run could have left context rows behind; the absolute
+  // version assertions below need a genuinely empty start.
+  await supa.from("company_context").delete().in("company_id", FIXTURE_COMPANY_IDS);
 }
 
-async function contextRowIds(companyIds: string[]): Promise<Set<string>> {
-  const { data } = await supa.from("company_context").select("id").in("company_id", companyIds);
-  return new Set(((data ?? []) as any[]).map((r) => String(r.id)));
-}
-
-async function cleanup(companyIds: string[], preExisting: Set<string>) {
-  const { data } = await supa.from("company_context").select("id").in("company_id", companyIds);
-  const created = ((data ?? []) as any[]).map((r) => String(r.id)).filter((id) => !preExisting.has(id));
+async function cleanup() {
+  const { data } = await supa.from("company_context").select("id").in("company_id", FIXTURE_COMPANY_IDS);
+  const created = ((data ?? []) as any[]).map((r) => String(r.id));
   if (created.length) await supa.from("company_context").delete().in("id", created);
-  await supa.from("reps").delete().eq("id", XMANAGER_ID);
-  await supa.from("companies").delete().eq("id", XCOMPANY_ID);
+  await supa.from("reps").delete().in("id", [PMANAGER_ID, XMANAGER_ID]);
+  await supa.from("companies").delete().in("id", FIXTURE_COMPANY_IDS);
   return created.length;
 }
 
@@ -152,16 +184,10 @@ async function main() {
     process.exit(1);
   }
 
-  const { data: danaUser } = await supa.from("users").select("company_id").eq("id", danaId).maybeSingle();
   const { data: danaRep } = await supa.from("reps").select("org_id, company_id").eq("id", danaId).single();
-  const ufcCompanyId = String((danaUser as any)?.company_id ?? (danaRep as any)?.company_id);
   const orgId = (danaRep as any).org_id as string;
 
-  const preExisting = await contextRowIds([ufcCompanyId, XCOMPANY_ID]);
-  if (preExisting.size) {
-    console.log(`  ⚠ ${preExisting.size} pre-existing company_context row(s) — left untouched.\n`);
-  }
-  await seedCrossCompanyFixtures(orgId);
+  await seedFixtures(orgId);
 
   try {
     // ── Gate checks ──────────────────────────────────────────────────────────
@@ -179,43 +205,41 @@ async function main() {
     c("publish as SalesRep → 403", repPub.status === 403, `got ${repPub.status}`);
 
     // ── Empty state ──────────────────────────────────────────────────────────
-    const hadRows = preExisting.size > 0;
-    const empty = await hit("GET", "/v1/intelligence/context", danaId);
+    // The fixture company is always empty at this point, so these are absolute.
+    const empty = await hit("GET", "/v1/intelligence/context", PMANAGER_ID);
     c("manager GET → 200 ok", empty.status === 200 && empty.data?.ok === true, `got ${empty.status}`);
-    if (!hadRows) {
-      c("empty context → draft null + published null",
-        empty.data?.draft === null && empty.data?.published === null,
-        JSON.stringify(empty.data)?.slice(0, 160));
-    }
-    const publishNoDraft = hadRows ? null : await hit("POST", "/v1/intelligence/context/publish", danaId);
-    if (publishNoDraft) {
-      c("publish with no draft → 400 no_draft_to_publish",
-        publishNoDraft.status === 400 && publishNoDraft.data?.error === "no_draft_to_publish",
-        `got ${publishNoDraft.status}`);
-    }
+    c("manager GET resolves the fixture company scope, not UFC",
+      empty.data?.company_id === PCOMPANY_ID, String(empty.data?.company_id));
+    c("empty context → draft null + published null",
+      empty.data?.draft === null && empty.data?.published === null,
+      JSON.stringify(empty.data)?.slice(0, 160));
+    const publishNoDraft = await hit("POST", "/v1/intelligence/context/publish", PMANAGER_ID);
+    c("publish with no draft → 400 no_draft_to_publish",
+      publishNoDraft.status === 400 && publishNoDraft.data?.error === "no_draft_to_publish",
+      `got ${publishNoDraft.status}`);
 
     // ── Draft validation ─────────────────────────────────────────────────────
-    const badKeys = await hit("PUT", "/v1/intelligence/context", danaId, { context: { profile: {}, bogus_section: {} } });
+    const badKeys = await hit("PUT", "/v1/intelligence/context", PMANAGER_ID, { context: { profile: {}, bogus_section: {} } });
     c("PUT with unknown top-level key → 400 unknown_context_keys",
       badKeys.status === 400 && badKeys.data?.error === "unknown_context_keys",
       `got ${badKeys.status} ${JSON.stringify(badKeys.data)?.slice(0, 120)}`);
-    const badShape = await hit("PUT", "/v1/intelligence/context", danaId, { context: ["not", "an", "object"] });
+    const badShape = await hit("PUT", "/v1/intelligence/context", PMANAGER_ID, { context: ["not", "an", "object"] });
     c("PUT with non-object context → 400", badShape.status === 400, `got ${badShape.status}`);
 
     // ── Draft save ───────────────────────────────────────────────────────────
-    const put = await hit("PUT", "/v1/intelligence/context", danaId, { context: UFC_CONTEXT });
+    const put = await hit("PUT", "/v1/intelligence/context", PMANAGER_ID, { context: UFC_CONTEXT });
     c("manager PUT saves draft", put.status === 200 && put.data?.draft?.status === "draft", `got ${put.status}`);
     c("draft carries version 0 + saved context",
       put.data?.draft?.version === 0 && put.data?.draft?.context?.profile?.about === UFC_ABOUT,
       JSON.stringify(put.data?.draft)?.slice(0, 160));
 
     // ── Publish v1 ───────────────────────────────────────────────────────────
-    const pub1 = await hit("POST", "/v1/intelligence/context/publish", danaId);
+    const pub1 = await hit("POST", "/v1/intelligence/context/publish", PMANAGER_ID);
     c("publish → 200 with version 1",
       pub1.status === 200 && pub1.data?.published?.version === 1,
       `got ${pub1.status} v${pub1.data?.published?.version}`);
     c("published row stamped published_at/published_by",
-      Boolean(pub1.data?.published?.published_at) && pub1.data?.published?.published_by === danaId,
+      Boolean(pub1.data?.published?.published_at) && pub1.data?.published?.published_by === PMANAGER_ID,
       JSON.stringify(pub1.data?.published)?.slice(0, 160));
     const compiled1 = String(pub1.data?.published?.compiled_context ?? "");
     c("compiled block contains supplied company fields",
@@ -226,28 +250,28 @@ async function main() {
 
     // ── Published stays stable after draft edits ────────────────────────────
     const edited = { ...UFC_CONTEXT, profile: { ...UFC_CONTEXT.profile, about: UFC_ABOUT_EDITED } };
-    const put2 = await hit("PUT", "/v1/intelligence/context", danaId, { context: edited });
+    const put2 = await hit("PUT", "/v1/intelligence/context", PMANAGER_ID, { context: edited });
     c("draft edit after publish saves", put2.status === 200 && put2.data?.draft?.context?.profile?.about === UFC_ABOUT_EDITED);
 
-    const after = await hit("GET", "/v1/intelligence/context", danaId);
+    const after = await hit("GET", "/v1/intelligence/context", PMANAGER_ID);
     c("published snapshot unchanged after draft edit",
       after.data?.published?.version === 1 && after.data?.published?.context?.profile?.about === UFC_ABOUT,
       JSON.stringify(after.data?.published?.context?.profile)?.slice(0, 160));
 
-    const draftCompiled = await hit("GET", "/v1/intelligence/context/compiled?state=draft", danaId);
-    const pubCompiled = await hit("GET", "/v1/intelligence/context/compiled?state=published", danaId);
+    const draftCompiled = await hit("GET", "/v1/intelligence/context/compiled?state=draft", PMANAGER_ID);
+    const pubCompiled = await hit("GET", "/v1/intelligence/context/compiled?state=published", PMANAGER_ID);
     c("compiled preview: draft reflects edit, published snapshot does not",
       String(draftCompiled.data?.compiled ?? "").includes(UFC_ABOUT_EDITED) &&
       String(pubCompiled.data?.compiled ?? "").includes(UFC_ABOUT) &&
       !String(pubCompiled.data?.compiled ?? "").includes(UFC_ABOUT_EDITED));
 
     // ── Publish v2 archives v1 ───────────────────────────────────────────────
-    const pub2 = await hit("POST", "/v1/intelligence/context/publish", danaId);
+    const pub2 = await hit("POST", "/v1/intelligence/context/publish", PMANAGER_ID);
     c("second publish bumps to version 2", pub2.status === 200 && pub2.data?.published?.version === 2, `got v${pub2.data?.published?.version}`);
     const { data: archivedRows } = await supa
       .from("company_context")
       .select("id, version, archived_at")
-      .eq("company_id", ufcCompanyId)
+      .eq("company_id", PCOMPANY_ID)
       .eq("status", "archived");
     const v1Archived = ((archivedRows ?? []) as any[]).some((r) => r.version === 1 && r.archived_at);
     c("version 1 archived (history kept, nothing deleted)", v1Archived, JSON.stringify(archivedRows)?.slice(0, 120));
@@ -255,7 +279,7 @@ async function main() {
     // ── Cross-company isolation ──────────────────────────────────────────────
     const xGet = await hit("GET", "/v1/intelligence/context", XMANAGER_ID);
     c("cross-company manager GET → 200 own scope", xGet.status === 200 && xGet.data?.company_id === XCOMPANY_ID, `got ${xGet.status} ${xGet.data?.company_id}`);
-    c("cross-company manager sees none of the UFC context",
+    c("cross-company manager sees none of the primary company context",
       xGet.data?.draft === null && xGet.data?.published === null,
       JSON.stringify(xGet.data)?.slice(0, 160));
 
@@ -265,11 +289,11 @@ async function main() {
     c("cross-company manager PUT lands in own company",
       xPut.status === 200 && xPut.data?.draft?.context?.profile?.about === X_MARKER);
 
-    const ufcAfterX = await hit("GET", "/v1/intelligence/context", danaId);
-    c("UFC context untouched by cross-company writes",
-      ufcAfterX.data?.draft?.context?.profile?.about === UFC_ABOUT_EDITED &&
-      ufcAfterX.data?.published?.version === 2 &&
-      JSON.stringify(ufcAfterX.data).indexOf(X_MARKER) === -1);
+    const primaryAfterX = await hit("GET", "/v1/intelligence/context", PMANAGER_ID);
+    c("primary company context untouched by cross-company writes",
+      primaryAfterX.data?.draft?.context?.profile?.about === UFC_ABOUT_EDITED &&
+      primaryAfterX.data?.published?.version === 2 &&
+      JSON.stringify(primaryAfterX.data).indexOf(X_MARKER) === -1);
 
     const xCompiled = await hit("GET", "/v1/intelligence/context/compiled?state=draft", XMANAGER_ID);
     c("cross-company compiled block contains only its own fields",
@@ -281,15 +305,15 @@ async function main() {
       .from("audit_events")
       .select("id, action, actor_user_id, metadata")
       .eq("action", "publish_company_context")
-      .eq("actor_user_id", danaId)
+      .eq("actor_user_id", PMANAGER_ID)
       .order("created_at", { ascending: false })
       .limit(1);
     const audit = (auditRows ?? [])[0] as any;
     c("publish writes an audit_events row",
-      Boolean(audit) && audit?.metadata?.company_id === ufcCompanyId,
+      Boolean(audit) && audit?.metadata?.company_id === PCOMPANY_ID,
       JSON.stringify(audit)?.slice(0, 120));
   } finally {
-    const removed = await cleanup([ufcCompanyId, XCOMPANY_ID], preExisting);
+    const removed = await cleanup();
     console.log(`\n  Cleanup: removed ${removed} company_context fixture row(s) + cross-company fixtures.`);
   }
 

@@ -84,6 +84,11 @@ const BASE = "/v1/intelligence/scorecards";
 const STAGES = ["intro", "discovery", "objection", "close"] as const;
 
 // Cross-company fixtures — synthetic company whose scorecards must stay invisible.
+// Primary fixture company — every manager write in this run lands here, never
+// in the UFC demo company (Day 224).
+const PCOMPANY_ID = uid("DAY219B", "primary-company");
+const PMANAGER_ID = uid("DAY219B", "primary-manager");
+
 const XCOMPANY_ID = uid("DAY219B", "cross-company");
 const XMANAGER_ID = uid("DAY219B", "cross-manager");
 
@@ -116,50 +121,71 @@ function stagesPayload(weights: [number, number, number, number], extra?: Partia
   };
 }
 
-async function seedCrossCompanyFixtures(orgId: string) {
-  const { error: compErr } = await supa
-    .from("companies")
-    .upsert(
+const DEMO_PARTNER = "5055e1b6-fb33-45c0-959a-d7dd45f98a13";
+const FIXTURE_COMPANY_IDS = [PCOMPANY_ID, XCOMPANY_ID];
+
+/**
+ * Two synthetic companies under the demo partner: the primary company this
+ * validator creates scorecards in, and a second one that must never see them.
+ * Both are owned outright by the validator and dropped by cleanup().
+ */
+async function seedFixtures(orgId: string) {
+  const { error: compErr } = await supa.from("companies").upsert(
+    [
+      {
+        id: PCOMPANY_ID,
+        tmc_id: DEMO_PARTNER,
+        partner_id: DEMO_PARTNER,
+        name: "Day219B Primary Co (validator)",
+        slug: "day219b-primary-validator",
+      },
       {
         id: XCOMPANY_ID,
-        tmc_id: "5055e1b6-fb33-45c0-959a-d7dd45f98a13", // demo partner (same TMC, different company)
-        partner_id: "5055e1b6-fb33-45c0-959a-d7dd45f98a13",
+        tmc_id: DEMO_PARTNER,
+        partner_id: DEMO_PARTNER,
         name: "Day219B Cross Company (validator)",
         slug: "day219b-cross-company-validator",
       },
-      { onConflict: "id" }
-    );
+    ],
+    { onConflict: "id" }
+  );
   if (compErr) throw new Error(`fixture company upsert failed: ${compErr.message}`);
 
   const { error: repErr } = await supa.from("reps").upsert(
-    [{ id: XMANAGER_ID, name: "Day219B X Manager", tier: "Manager", org_id: orgId, company_id: XCOMPANY_ID }],
+    [
+      { id: PMANAGER_ID, name: "Day219B P Manager", tier: "Manager", org_id: orgId, company_id: PCOMPANY_ID },
+      { id: XMANAGER_ID, name: "Day219B X Manager", tier: "Manager", org_id: orgId, company_id: XCOMPANY_ID },
+    ],
     { onConflict: "id" }
   );
   if (repErr) throw new Error(`fixture reps upsert failed: ${repErr.message}`);
+
+  // A crashed previous run could have left scorecards behind; the empty-list
+  // assertion below needs a genuinely empty start.
+  await purgeScorecards(FIXTURE_COMPANY_IDS);
 }
 
-async function scorecardIds(companyIds: string[]): Promise<Set<string>> {
+async function purgeScorecards(companyIds: string[]) {
   const { data } = await supa.from("scorecards").select("id").in("company_id", companyIds);
-  return new Set(((data ?? []) as any[]).map((r) => String(r.id)));
-}
-
-async function cleanup(companyIds: string[], preExisting: Set<string>) {
-  const { data } = await supa.from("scorecards").select("id").in("company_id", companyIds);
-  const created = ((data ?? []) as any[]).map((r) => String(r.id)).filter((id) => !preExisting.has(id));
-  if (created.length) {
-    const { data: versions } = await supa
-      .from("scorecard_versions").select("id").in("scorecard_id", created);
-    const versionIds = ((versions ?? []) as any[]).map((v) => String(v.id));
-    if (versionIds.length) {
-      await supa.from("scorecard_criteria").delete().in("scorecard_version_id", versionIds);
-      await supa.from("scorecard_stage_weights").delete().in("scorecard_version_id", versionIds);
-      await supa.from("scorecard_versions").delete().in("id", versionIds);
-    }
-    await supa.from("scorecards").delete().in("id", created);
+  const ids = ((data ?? []) as any[]).map((r) => String(r.id));
+  if (!ids.length) return 0;
+  const { data: versions } = await supa
+    .from("scorecard_versions").select("id").in("scorecard_id", ids);
+  const versionIds = ((versions ?? []) as any[]).map((v) => String(v.id));
+  if (versionIds.length) {
+    await supa.from("scorecard_criteria").delete().in("scorecard_version_id", versionIds);
+    await supa.from("scorecard_stage_weights").delete().in("scorecard_version_id", versionIds);
+    await supa.from("scorecard_versions").delete().in("id", versionIds);
   }
-  await supa.from("reps").delete().eq("id", XMANAGER_ID);
-  await supa.from("companies").delete().eq("id", XCOMPANY_ID);
-  return created.length;
+  await supa.from("scorecards").delete().in("id", ids);
+  return ids.length;
+}
+
+async function cleanup() {
+  const removed = await purgeScorecards(FIXTURE_COMPANY_IDS);
+  await supa.from("reps").delete().in("id", [PMANAGER_ID, XMANAGER_ID]);
+  await supa.from("companies").delete().in("id", FIXTURE_COMPANY_IDS);
+  return removed;
 }
 
 async function main() {
@@ -191,16 +217,10 @@ async function main() {
     process.exit(1);
   }
 
-  const { data: danaUser } = await supa.from("users").select("company_id").eq("id", danaId).maybeSingle();
   const { data: danaRep } = await supa.from("reps").select("org_id, company_id").eq("id", danaId).single();
-  const ufcCompanyId = String((danaUser as any)?.company_id ?? (danaRep as any)?.company_id);
   const orgId = (danaRep as any).org_id as string;
 
-  const preExisting = await scorecardIds([ufcCompanyId, XCOMPANY_ID]);
-  if (preExisting.size) {
-    console.log(`  ⚠ ${preExisting.size} pre-existing scorecard row(s) — left untouched.\n`);
-  }
-  await seedCrossCompanyFixtures(orgId);
+  await seedFixtures(orgId);
 
   try {
     // ── Gate checks ──────────────────────────────────────────────────────────
@@ -214,12 +234,10 @@ async function main() {
     c("POST as SalesRep → 403", repPost.status === 403, `got ${repPost.status}`);
 
     // ── List (empty) + default card ──────────────────────────────────────────
-    const emptyList = await hit("GET", BASE, danaId);
+    const emptyList = await hit("GET", BASE, PMANAGER_ID);
     c("manager GET list → 200 ok", emptyList.status === 200 && emptyList.data?.ok === true, `got ${emptyList.status}`);
-    if (!preExisting.size) {
-      c("empty company lists no scorecards", Array.isArray(emptyList.data?.items) && emptyList.data.items.length === 0,
-        `got ${emptyList.data?.items?.length}`);
-    }
+    c("empty company lists no scorecards", Array.isArray(emptyList.data?.items) && emptyList.data.items.length === 0,
+      `got ${emptyList.data?.items?.length}`);
     c("list carries the read-only Gravix default card",
       emptyList.data?.default_rubric?.read_only === true &&
       emptyList.data?.default_rubric?.version === "v1" &&
@@ -228,7 +246,7 @@ async function main() {
 
     // ── Create draft ─────────────────────────────────────────────────────────
     const name = `Discovery Call — ${RUN_TAG}`;
-    const created = await hit("POST", BASE, danaId, { name, description: "Validator fixture." });
+    const created = await hit("POST", BASE, PMANAGER_ID, { name, description: "Validator fixture." });
     c("manager POST creates draft scorecard", created.status === 201 && created.data?.scorecard?.status === "draft",
       `got ${created.status}`);
     const cardId = String(created.data?.scorecard?.id ?? "");
@@ -240,23 +258,23 @@ async function main() {
     const defaultTotal = (draftVersion?.stage_weights ?? []).reduce((s: number, w: any) => s + w.weight, 0);
     c("default stage weights total 100", defaultTotal === 100, `got ${defaultTotal}`);
 
-    const dupe = await hit("POST", BASE, danaId, { name: name.toUpperCase() });
+    const dupe = await hit("POST", BASE, PMANAGER_ID, { name: name.toUpperCase() });
     c("duplicate name (case-insensitive) → 409", dupe.status === 409 && dupe.data?.error === "scorecard_name_taken",
       `got ${dupe.status}`);
-    const noName = await hit("POST", BASE, danaId, {});
+    const noName = await hit("POST", BASE, PMANAGER_ID, {});
     c("create without name → 400", noName.status === 400, `got ${noName.status}`);
 
     // ── Save draft version ───────────────────────────────────────────────────
     const versionId = String(draftVersion?.id ?? "");
     const versionPath = `${BASE}/${cardId}/versions/${versionId}`;
 
-    const badStage = await hit("PUT", versionPath, danaId, {
+    const badStage = await hit("PUT", versionPath, PMANAGER_ID, {
       stages: { ...stagesPayload([10, 35, 30, 25]), pitch: { weight: 0, criteria: [] } },
     });
     c("invalid stage rejected → 400 invalid_stage", badStage.status === 400 && badStage.data?.error === "invalid_stage",
       `got ${badStage.status} ${badStage.data?.error}`);
 
-    const badEmphasis = await hit("PUT", versionPath, danaId, {
+    const badEmphasis = await hit("PUT", versionPath, PMANAGER_ID, {
       stages: stagesPayload([10, 35, 30, 25], {
         intro: { weight: 10, criteria: [{ label: "x", emphasis: "huge" }] },
       }),
@@ -265,7 +283,7 @@ async function main() {
       badEmphasis.status === 400 && JSON.stringify(badEmphasis.data).includes("invalid_emphasis"),
       `got ${badEmphasis.status} ${badEmphasis.data?.error}`);
 
-    const badCritical = await hit("PUT", versionPath, danaId, {
+    const badCritical = await hit("PUT", versionPath, PMANAGER_ID, {
       stages: stagesPayload([10, 35, 30, 25], {
         intro: { weight: 10, criteria: [{ label: "x", critical: true }] },
       }),
@@ -274,14 +292,14 @@ async function main() {
       badCritical.status === 400 && JSON.stringify(badCritical.data).includes("critical_requires_pass_fail"),
       `got ${badCritical.status}`);
 
-    const badWeight = await hit("PUT", versionPath, danaId, {
+    const badWeight = await hit("PUT", versionPath, PMANAGER_ID, {
       stages: stagesPayload([10, 35, 30, 25], { close: { weight: 250, criteria: [] } }),
     });
     c("out-of-range stage weight rejected → 400",
       badWeight.status === 400 && JSON.stringify(badWeight.data).includes("invalid_stage_weight"),
       `got ${badWeight.status}`);
 
-    const badCallType = await hit("PUT", versionPath, danaId, {
+    const badCallType = await hit("PUT", versionPath, PMANAGER_ID, {
       call_types: ["walk_in"],
       stages: stagesPayload([10, 35, 30, 25]),
     });
@@ -289,7 +307,7 @@ async function main() {
       badCallType.status === 400 && JSON.stringify(badCallType.data).includes("invalid_call_type"),
       `got ${badCallType.status}`);
 
-    const draftSave = await hit("PUT", versionPath, danaId, {
+    const draftSave = await hit("PUT", versionPath, PMANAGER_ID, {
       call_types: ["discovery"],
       stages: stagesPayload([10, 35, 30, 24]), // deliberately 99 — saving is never blocked
     });
@@ -307,22 +325,22 @@ async function main() {
     c("PUT version as SalesRep → 403", repSave.status === 403, `got ${repSave.status}`);
 
     // ── Activation rules ─────────────────────────────────────────────────────
-    const actAt99 = await hit("POST", `${BASE}/${cardId}/activate`, danaId);
+    const actAt99 = await hit("POST", `${BASE}/${cardId}/activate`, PMANAGER_ID);
     c("activation with weights totalling 99 → 400 weights_must_total_100",
       actAt99.status === 400 && JSON.stringify(actAt99.data).includes("weights_must_total_100"),
       `got ${actAt99.status} ${actAt99.data?.error}`);
 
-    await hit("PUT", versionPath, danaId, { call_types: [], stages: stagesPayload([10, 35, 30, 25]) });
-    const actNoType = await hit("POST", `${BASE}/${cardId}/activate`, danaId);
+    await hit("PUT", versionPath, PMANAGER_ID, { call_types: [], stages: stagesPayload([10, 35, 30, 25]) });
+    const actNoType = await hit("POST", `${BASE}/${cardId}/activate`, PMANAGER_ID);
     c("activation without call type or company default → 400",
       actNoType.status === 400 && JSON.stringify(actNoType.data).includes("call_type_or_company_default_required"),
       `got ${actNoType.status}`);
 
-    await hit("PUT", versionPath, danaId, { call_types: ["discovery"], stages: stagesPayload([10, 35, 30, 25]) });
+    await hit("PUT", versionPath, PMANAGER_ID, { call_types: ["discovery"], stages: stagesPayload([10, 35, 30, 25]) });
     const repActivate = await hit("POST", `${BASE}/${cardId}/activate`, nateId);
     c("activate as SalesRep → 403", repActivate.status === 403, `got ${repActivate.status}`);
 
-    const activate = await hit("POST", `${BASE}/${cardId}/activate`, danaId, { activation_note: "Validator activation." });
+    const activate = await hit("POST", `${BASE}/${cardId}/activate`, PMANAGER_ID, { activation_note: "Validator activation." });
     c("manager activates valid draft → 200 active v1",
       activate.status === 200 && activate.data?.version?.status === "active" && activate.data?.version?.version === 1,
       `got ${activate.status} ${JSON.stringify(activate.data)?.slice(0, 140)}`);
@@ -333,20 +351,20 @@ async function main() {
       snapshotStages.reduce((sum: number, s: any) => sum + s.weight, 0) === 100,
       JSON.stringify(snapshotStages)?.slice(0, 140));
 
-    const editActive = await hit("PUT", versionPath, danaId, { stages: stagesPayload([25, 25, 25, 25]) });
+    const editActive = await hit("PUT", versionPath, PMANAGER_ID, { stages: stagesPayload([25, 25, 25, 25]) });
     c("active version is immutable → 409 version_immutable",
       editActive.status === 409 && editActive.data?.error === "version_immutable",
       `got ${editActive.status}`);
 
     // One active per call type across the company.
-    const rival = await hit("POST", BASE, danaId, { name: `Rival — ${RUN_TAG}` });
+    const rival = await hit("POST", BASE, PMANAGER_ID, { name: `Rival — ${RUN_TAG}` });
     const rivalId = String(rival.data?.scorecard?.id ?? "");
     const rivalVersionId = String(rival.data?.draft_version?.id ?? "");
-    await hit("PUT", `${BASE}/${rivalId}/versions/${rivalVersionId}`, danaId, {
+    await hit("PUT", `${BASE}/${rivalId}/versions/${rivalVersionId}`, PMANAGER_ID, {
       call_types: ["discovery"],
       stages: stagesPayload([25, 25, 25, 25]),
     });
-    const conflict = await hit("POST", `${BASE}/${rivalId}/activate`, danaId);
+    const conflict = await hit("POST", `${BASE}/${rivalId}/activate`, PMANAGER_ID);
     c("second activation on the same call type → 409 call_type_conflict",
       conflict.status === 409 && conflict.data?.error === "call_type_conflict" &&
       conflict.data?.conflicts?.[0]?.scorecard_id === cardId,
@@ -357,7 +375,7 @@ async function main() {
       .from("audit_events")
       .select("id, action, metadata")
       .eq("action", "activate_scorecard_version")
-      .eq("actor_user_id", danaId)
+      .eq("actor_user_id", PMANAGER_ID)
       .order("created_at", { ascending: false })
       .limit(1);
     const audit = (auditRows ?? [])[0] as any;
@@ -373,7 +391,7 @@ async function main() {
     const xFork = await hit("POST", forkPath, XMANAGER_ID);
     c("cross-company fork → 404", xFork.status === 404, `got ${xFork.status}`);
 
-    const fork = await hit("POST", forkPath, danaId);
+    const fork = await hit("POST", forkPath, PMANAGER_ID);
     c("fork active version → 201 draft v2",
       fork.status === 201 && fork.data?.version?.version === 2 && fork.data?.version?.status === "draft",
       `got ${fork.status} v${fork.data?.version?.version} ${fork.data?.version?.status}`);
@@ -386,23 +404,23 @@ async function main() {
       fork.data?.version?.origin === "manual",
       JSON.stringify({ forkWeightTotal, criteria: (fork.data?.version?.criteria ?? []).length }));
 
-    const forkAgain = await hit("POST", forkPath, danaId);
+    const forkAgain = await hit("POST", forkPath, PMANAGER_ID);
     c("second fork while a draft exists → 409 draft_already_exists",
       forkAgain.status === 409 && forkAgain.data?.error === "draft_already_exists" &&
       forkAgain.data?.draft_version_id === forkedVersionId,
       `got ${forkAgain.status} ${forkAgain.data?.error}`);
-    const forkDraft = await hit("POST", `${BASE}/${cardId}/versions/${forkedVersionId}/fork`, danaId);
+    const forkDraft = await hit("POST", `${BASE}/${cardId}/versions/${forkedVersionId}/fork`, PMANAGER_ID);
     c("forking a draft version → 400 cannot_fork_draft",
       forkDraft.status === 400 && forkDraft.data?.error === "cannot_fork_draft",
       `got ${forkDraft.status} ${forkDraft.data?.error}`);
 
     // Editing the forked draft must never touch the active snapshot.
-    const editFork = await hit("PUT", `${BASE}/${cardId}/versions/${forkedVersionId}`, danaId, {
+    const editFork = await hit("PUT", `${BASE}/${cardId}/versions/${forkedVersionId}`, PMANAGER_ID, {
       call_types: ["discovery"],
       stages: stagesPayload([25, 25, 25, 25]),
     });
     c("forked draft is editable", editFork.status === 200, `got ${editFork.status}`);
-    const detailAfterFork = await hit("GET", `${BASE}/${cardId}`, danaId);
+    const detailAfterFork = await hit("GET", `${BASE}/${cardId}`, PMANAGER_ID);
     const activeAfterFork = (detailAfterFork.data?.versions ?? []).find((v: any) => v.status === "active");
     const activeSnapshotWeights = (activeAfterFork?.snapshot?.stages ?? []).map((s: any) => s.weight);
     c("active snapshot unchanged after editing the forked draft",
@@ -414,7 +432,7 @@ async function main() {
     const xReplace = await hit("POST", `${BASE}/${cardId}/activate`, XMANAGER_ID, { replace_conflicts: true });
     c("cross-company activate with replace flag → 404", xReplace.status === 404, `got ${xReplace.status}`);
 
-    const replaceActivate = await hit("POST", `${BASE}/${rivalId}/activate`, danaId, { replace_conflicts: true });
+    const replaceActivate = await hit("POST", `${BASE}/${rivalId}/activate`, PMANAGER_ID, { replace_conflicts: true });
     c("activation with replace_conflicts supersedes the conflict → 200",
       replaceActivate.status === 200 && replaceActivate.data?.version?.status === "active",
       `got ${replaceActivate.status} ${JSON.stringify(replaceActivate.data)?.slice(0, 140)}`);
@@ -438,7 +456,7 @@ async function main() {
     const repArchive = await hit("POST", `${BASE}/${rivalId}/archive`, nateId);
     c("archive as SalesRep → 403", repArchive.status === 403, `got ${repArchive.status}`);
 
-    const archive = await hit("POST", `${BASE}/${rivalId}/archive`, danaId);
+    const archive = await hit("POST", `${BASE}/${rivalId}/archive`, PMANAGER_ID);
     c("manager archives scorecard → 200 archived",
       archive.status === 200 && archive.data?.scorecard?.status === "archived" &&
       Boolean(archive.data?.scorecard?.archived_at),
@@ -450,17 +468,17 @@ async function main() {
       ((rivalVersions as any[])[0].snapshot?.stages ?? []).length === 4,
       JSON.stringify((rivalVersions ?? []).map((v: any) => v.status)));
 
-    const archivedEdit = await hit("PUT", `${BASE}/${rivalId}`, danaId, { name: `Rival renamed — ${RUN_TAG}` });
+    const archivedEdit = await hit("PUT", `${BASE}/${rivalId}`, PMANAGER_ID, { name: `Rival renamed — ${RUN_TAG}` });
     c("archived scorecard rejects metadata edits → 409", archivedEdit.status === 409, `got ${archivedEdit.status}`);
-    const archivedSave = await hit("PUT", `${BASE}/${rivalId}/versions/${rivalVersionId}`, danaId, {
+    const archivedSave = await hit("PUT", `${BASE}/${rivalId}/versions/${rivalVersionId}`, PMANAGER_ID, {
       stages: stagesPayload([25, 25, 25, 25]),
     });
     c("archived scorecard rejects version saves → 409", archivedSave.status === 409, `got ${archivedSave.status}`);
-    const archivedActivate = await hit("POST", `${BASE}/${rivalId}/activate`, danaId);
+    const archivedActivate = await hit("POST", `${BASE}/${rivalId}/activate`, PMANAGER_ID);
     c("archived scorecard rejects activation → 409", archivedActivate.status === 409, `got ${archivedActivate.status}`);
-    const archivedFork = await hit("POST", `${BASE}/${rivalId}/versions/${String((rivalVersions as any[])[0].id)}/fork`, danaId);
+    const archivedFork = await hit("POST", `${BASE}/${rivalId}/versions/${String((rivalVersions as any[])[0].id)}/fork`, PMANAGER_ID);
     c("archived scorecard rejects fork → 409", archivedFork.status === 409, `got ${archivedFork.status}`);
-    const archiveAgain = await hit("POST", `${BASE}/${rivalId}/archive`, danaId);
+    const archiveAgain = await hit("POST", `${BASE}/${rivalId}/archive`, PMANAGER_ID);
     c("archiving twice → 409", archiveAgain.status === 409, `got ${archiveAgain.status}`);
 
     // ── Day 220: lifecycle audit trail ───────────────────────────────────────
@@ -475,12 +493,12 @@ async function main() {
         .from("audit_events")
         .select("id, metadata")
         .eq("action", action)
-        .eq("actor_user_id", danaId)
+        .eq("actor_user_id", PMANAGER_ID)
         .order("created_at", { ascending: false })
         .limit(1);
       const row = (rows ?? [])[0] as any;
       const scoped =
-        row?.metadata?.company_id === ufcCompanyId ||
+        row?.metadata?.company_id === PCOMPANY_ID ||
         row?.metadata?.scorecard_id === cardId ||
         row?.metadata?.scorecard_id === rivalId;
       c(`audit row exists for ${action}`, Boolean(row) && scoped, JSON.stringify(row)?.slice(0, 120));
@@ -489,7 +507,7 @@ async function main() {
     // ── Cross-company isolation ──────────────────────────────────────────────
     const xList = await hit("GET", BASE, XMANAGER_ID);
     const xIds = new Set(((xList.data?.items ?? []) as any[]).map((i) => String(i.id)));
-    c("cross-company manager list excludes UFC scorecards",
+    c("cross-company manager list excludes the primary company scorecards",
       xList.status === 200 && !xIds.has(cardId) && !xIds.has(rivalId),
       `got ${xList.status}, ${xIds.size} items`);
 
@@ -506,7 +524,7 @@ async function main() {
     c("UFC scorecard untouched by cross-company attempts", (ufcCard as any)?.name === name,
       JSON.stringify(ufcCard));
   } finally {
-    const removed = await cleanup([ufcCompanyId, XCOMPANY_ID], preExisting);
+    const removed = await cleanup();
     console.log(`\n  Cleanup: removed ${removed} scorecard fixture(s) + cross-company fixtures.`);
   }
 

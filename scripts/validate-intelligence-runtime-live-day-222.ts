@@ -8,14 +8,14 @@
  * demo data, through the real manager HTTP routes and the real scoring entry
  * point (scoreWithLLM), rather than by calling the resolvers directly:
  *
- *   ✓ Dana (real demo manager) publishes a real UFC company context over
- *     PUT /v1/intelligence/context + POST /v1/intelligence/context/publish
- *   ✓ Dana creates + activates a real UFC company-default scorecard over
- *     POST /v1/intelligence/scorecards → PUT .../versions/:id → POST .../activate
- *     using ONLY the fixed four stages (intro/discovery/objection/close)
+ *   ✓ the seeded UFC context is published at v1 and its compiled block carries
+ *     the real UFC positioning, objections and no-go language
+ *   ✓ the seeded "UFC Sales Scorecard" is active + company default, over ONLY
+ *     the fixed four stages (intro/discovery/objection/close), weights 100
+ *   ✓ Dana reads both over the real manager HTTP routes
  *   ✓ a controlled Day 222 proof call (price objection + weak close) is scored
  *     through scoreWithLLM and its persisted calls.rubric._meta names exactly
- *     the context version and scorecard version the manager just published
+ *     the seeded context version and scorecard version
  *   ✓ the prompt blocks the runtime would send carry the real UFC content
  *   ✓ cache keys: custom ≠ default, context bump changes the key, scorecard
  *     bump changes the key, default key shape unchanged
@@ -26,24 +26,32 @@
  * SCORING METHOD (honest statement — no LLM call is made):
  *   OPENAI_API_KEY is deliberately unset inside this process, so a cache MISS
  *   could never reach a paid model. A sentinel result is seeded into
- *   score_cache under the key derived from the context/scorecard versions the
- *   manager published. scoreWithLLM then runs for real: it resolves the
- *   company's assets ITSELF, builds the key ITSELF, and only hits that
- *   sentinel if its own resolution matched. The cache HIT is therefore the
- *   proof of correct live resolution, and the rubric it writes to calls.rubric
- *   is real runtime output. The LLM request path itself is unexercised — its
- *   two injection points (context + scorecard prompt blocks) are asserted
- *   directly against the live resolved assets instead.
+ *   score_cache under the key derived from the SEEDED context/scorecard
+ *   versions. scoreWithLLM then runs for real: it resolves the company's
+ *   assets ITSELF, builds the key ITSELF, and only hits that sentinel if its
+ *   own resolution matched. The cache HIT is therefore the proof of correct
+ *   live resolution, and the rubric it writes to calls.rubric is real runtime
+ *   output. The LLM request path itself is unexercised — its two injection
+ *   points (context + scorecard prompt blocks) are asserted directly against
+ *   the live resolved assets instead.
  *
- * SELF-CLEANING — nothing is left behind. The published context and activated
- * scorecard are removed at the end, because validate:intelligence-context and
- * validate:intelligence-scorecards both assert the UFC company starts with no
- * context and no scorecards. Seeding these as permanent demo assets is a
- * separate decision (see Day 223 recommendation in the blueprint).
+ * Day 224 — this validator no longer publishes or activates anything. The UFC
+ * context + scorecard are PERSISTENT demo assets owned by
+ * npm run seed:ufc-intelligence; this run proves the runtime consumes them and
+ * must never delete them. Creating them here (the Day 222 shape) is what forced
+ * UFC to start empty and made this validator fight the seed. The manager
+ * create/publish/activate flows are covered by validate:intelligence-context
+ * and validate:intelligence-scorecards, which now run against their own
+ * throwaway fixture companies.
+ *
+ * Self-cleaning: only what this run owns — the proof call, its cache entry and
+ * the isolation fixtures. The seeded draft context is edited to prove scoring
+ * ignores it, then restored byte-for-byte.
  *
  * Requirements: sql/20260714_company_context.sql +
- * sql/20260714b_scorecard_studio.sql applied, UFC demo seed present, and the
- * API server running (default http://localhost:4000 — override with API_BASE).
+ * sql/20260714b_scorecard_studio.sql applied, npm run seed:ufc-intelligence
+ * applied, and the API server running (default http://localhost:4000 —
+ * override with API_BASE).
  * Usage: npm run validate:intelligence-runtime-live
  */
 
@@ -108,7 +116,8 @@ const SC_ARCHIVED = uid("sc-archived");
 const SCV_ARCHIVED = uid("scv-archived");
 const SCV_SUPERSEDED = uid("scv-superseded");
 
-const SCORECARD_NAME = "UFC Elite — Company Default (Day222 proof)";
+// Day 224 — the persistent scorecard seeded by npm run seed:ufc-intelligence.
+const SCORECARD_NAME = "UFC Sales Scorecard";
 const SENTINEL = "DAY222 PROOF SENTINEL — served from the seeded score cache.";
 
 async function hit(method: string, path: string, userId: string, body?: object) {
@@ -121,111 +130,6 @@ async function hit(method: string, path: string, userId: string, body?: object) 
   try { data = await res.json(); } catch { /* ignore */ }
   return { status: res.status, data };
 }
-
-// ---------------------------------------------------------------------------
-// Real UFC demo context — bounded, from the Day 208 Context Engine field spec.
-// Describes the actual product being demoed (an elite sales coaching system).
-// ---------------------------------------------------------------------------
-const UFC_CONTEXT = {
-  profile: {
-    about:
-      "Gravix sells an elite sales training and coaching system to revenue teams: AI call review, sparring practice and manager-led coaching assignments in one platform.",
-    sales_motion:
-      "Managers review recorded calls, assign coaching, and reps practise objections in sparring before the next live call.",
-    icp: "Sales managers, SDR leaders and revenue leaders running teams of 5–50 reps.",
-  },
-  offering: {
-    products_services: [
-      { name: "AI call review", description: "Every call scored against the company scorecard with stage-level evidence." },
-      { name: "Sparring", description: "Reps rehearse objections against realistic AI scenarios and are scored on the same rubric." },
-      { name: "Coaching assignments", description: "Managers assign drills from a weak call and track completion." },
-    ],
-    pricing_positioning: {
-      pricing_notes: "Premium annual platform licence, priced per active seat.",
-      positioning_notes:
-        "A premium operational coaching platform, not a recording archive — bought for repeatable rep improvement, never sold on price.",
-    },
-  },
-  objections: [
-    {
-      objection: "It's too expensive",
-      approved_response:
-        "Isolate the concern, then reframe on cost per rep against the revenue of one recovered deal.",
-      weak_response: "Discounting immediately or apologising for the price.",
-    },
-    {
-      objection: "I need to think about it",
-      approved_response: "Find the actual hesitation, then agree a dated next step before the call ends.",
-      weak_response: "Agreeing to 'circle back' with no date.",
-    },
-    {
-      objection: "Just send me some info",
-      approved_response: "Offer to walk one real call through the platform live rather than sending a deck.",
-      weak_response: "Sending a brochure and waiting.",
-    },
-  ],
-  compliance: {
-    no_go_language: ["Guaranteed revenue increase", "You will definitely close more deals", "Risk-free"],
-    required_disclosures: ["Call recording and AI scoring must be disclosed to the customer's reps."],
-  },
-  tone: {
-    playbook_guidance:
-      "Direct and evidence-led. Lead with what the manager will see in the platform, not adjectives.",
-    tone_notes: "Manager-first, concrete, never pressure-heavy and never over-promising.",
-  },
-};
-
-// Fixed four stages only — weights total 100 as required for activation.
-const SCORECARD_STAGE_PAYLOAD = {
-  intro: {
-    weight: 20,
-    guidance: "Judge whether the rep earned the right to run the call.",
-    criteria: [
-      {
-        label: "Set agenda and establish credibility",
-        description: "States the purpose of the call and why Gravix is credible for this manager's problem.",
-        scoring_guidance: "Full marks only when both an agenda and a credibility anchor land before discovery.",
-        emphasis: "standard",
-      },
-    ],
-  },
-  discovery: {
-    weight: 30,
-    guidance: "Judge the depth of the problem the rep uncovered.",
-    criteria: [
-      {
-        label: "Uncover pain, current process and decision process",
-        description: "Draws out how calls are reviewed today, what it costs, and who signs off.",
-        scoring_guidance: "Full marks only when all three land before any pitch.",
-        emphasis: "major",
-      },
-    ],
-  },
-  objection: {
-    weight: 30,
-    guidance: "Judge how a price objection was handled against the approved response.",
-    criteria: [
-      {
-        label: "Isolate the price concern and reframe on value",
-        description: "Isolates price as the real objection, then reframes on cost per rep against recovered revenue.",
-        scoring_guidance: "Immediate discounting scores 0 for this criterion.",
-        emphasis: "major",
-      },
-    ],
-  },
-  close: {
-    weight: 20,
-    guidance: "Judge whether a real commitment was secured.",
-    criteria: [
-      {
-        label: "Secure a clear next step and commitment",
-        description: "Locks a dated next step with the named decision maker.",
-        scoring_guidance: "'I'll follow up' with no date scores 0 for this criterion.",
-        emphasis: "major",
-      },
-    ],
-  },
-};
 
 // Controlled proof transcript — clearly exercises a price objection + weak close.
 const PROOF_TRANSCRIPT = [
@@ -285,26 +189,12 @@ async function cleanup() {
   await supa.from("company_context").delete().eq("company_id", XCOMPANY_ID);
   await supa.from("companies").delete().eq("id", XCOMPANY_ID);
 
-  // Day 222 UFC assets — removed so the Day 218 / 219B validators keep their
-  // "UFC starts clean" precondition.
-  const { data: cards } = await supa
-    .from("scorecards").select("id").eq("company_id", UFC_COMPANY_ID).eq("name", SCORECARD_NAME);
-  const cardIds = ((cards ?? []) as any[]).map((r) => String(r.id));
-  if (cardIds.length) {
-    const { data: vers } = await supa
-      .from("scorecard_versions").select("id").in("scorecard_id", cardIds);
-    const verIds = ((vers ?? []) as any[]).map((r) => String(r.id));
-    if (verIds.length) {
-      await supa.from("scorecard_criteria").delete().in("scorecard_version_id", verIds);
-      await supa.from("scorecard_stage_weights").delete().in("scorecard_version_id", verIds);
-      await supa.from("scorecard_versions").delete().in("id", verIds);
-    }
-    await supa.from("scorecards").delete().in("id", cardIds);
-  }
-  await supa.from("company_context").delete().eq("company_id", UFC_COMPANY_ID);
+  // Day 224 — the UFC context + scorecard are PERSISTENT demo assets seeded by
+  // npm run seed:ufc-intelligence. This validator proves them; it does not own
+  // them and must never delete them.
 
-  console.log("\n  Cleanup: removed the Day222 proof call, cache entry, isolation fixtures,");
-  console.log("           and the Day222 UFC context + scorecard (UFC left as found).");
+  console.log("\n  Cleanup: removed the Day222 proof call, cache entry and isolation");
+  console.log("           fixtures. The seeded UFC context + scorecard are left in place.");
 }
 
 async function main() {
@@ -334,72 +224,59 @@ async function main() {
     process.exit(1);
   }
 
-  // A pre-existing UFC context/scorecard would make this a different test.
-  const { data: preCtx } = await supa
-    .from("company_context").select("id").eq("company_id", UFC_COMPANY_ID);
-  const { data: preSc } = await supa
-    .from("scorecards").select("id").eq("company_id", UFC_COMPANY_ID);
-  if ((preCtx ?? []).length || (preSc ?? []).length) {
-    console.error("  ✗ UFC already has context/scorecard rows — resolve manually before proving.");
+  // Day 224 — the UFC Intelligence assets are now seeded and PERSISTENT, so
+  // this validator proves the runtime against the real demo assets instead of
+  // publishing its own and tearing them down.
+  const { data: seededCtx } = await supa
+    .from("company_context").select("id, version").eq("company_id", UFC_COMPANY_ID).eq("status", "published").maybeSingle();
+  const { data: seededCard } = await supa
+    .from("scorecards").select("id, name, is_company_default")
+    .eq("company_id", UFC_COMPANY_ID).eq("name", SCORECARD_NAME).eq("status", "active").maybeSingle();
+  if (!seededCtx || !seededCard) {
+    console.error("  ✗ UFC Intelligence assets missing — run npm run seed:ufc-intelligence first.");
     process.exit(1);
   }
+  const cardId = String((seededCard as any).id);
 
   try {
-    // ---- 1. Manager publishes real UFC context (live HTTP) ----------------
-    console.log("— Manager publishes UFC context (live HTTP as Dana)");
+    // ---- 1. The seeded UFC context (published by seed:ufc-intelligence) ---
+    console.log("— Seeded UFC context");
 
-    const put = await hit("PUT", "/v1/intelligence/context", dana, { context: UFC_CONTEXT });
-    c("Dana saves the UFC context draft", put.status === 200 && put.data?.draft?.status === "draft", `got ${put.status}`);
-    // The route serialises without company_id and scopes server-side from
-    // Dana's identity, so verify the scope on the stored row itself.
-    const { data: draftScope } = await supa
-      .from("company_context").select("company_id").eq("id", String(put.data?.draft?.id ?? "")).maybeSingle();
-    c("draft lands in the UFC company scope", (draftScope as any)?.company_id === UFC_COMPANY_ID,
-      JSON.stringify((draftScope as any)?.company_id));
+    const pubRow = seededCtx as any;
+    c("UFC has exactly one published context", Boolean(pubRow?.id));
+    c("published context is v1", Number(pubRow.version) === 1, `v${pubRow.version}`);
 
-    const pub = await hit("POST", "/v1/intelligence/context/publish", dana);
-    c("Dana publishes the context → v1", pub.status === 200 && pub.data?.published?.version === 1, `got ${pub.status} v${pub.data?.published?.version}`);
-    c("published row is stamped published_at/published_by=Dana",
-      Boolean(pub.data?.published?.published_at) && pub.data?.published?.published_by === dana);
-
-    const publishedCompiled = String(pub.data?.published?.compiled_context ?? "");
+    const { data: ctxFull } = await supa
+      .from("company_context").select("compiled_context, published_at, published_by")
+      .eq("id", pubRow.id).single();
+    const publishedCompiled = String((ctxFull as any)?.compiled_context ?? "");
+    c("published row is stamped published_at/published_by",
+      Boolean((ctxFull as any)?.published_at) && Boolean((ctxFull as any)?.published_by));
     c("compiled block carries the real UFC positioning",
-      publishedCompiled.includes("premium operational coaching platform"));
+      publishedCompiled.includes("premium, evidence-led sales coaching platform"));
     c("compiled block carries the real UFC objections",
       publishedCompiled.includes("It's too expensive") && publishedCompiled.includes("Just send me some info"));
     c("compiled block carries the no-go compliance language",
       publishedCompiled.includes("Guaranteed revenue increase"));
 
-    // ---- 2. Manager creates + activates a UFC scorecard (live HTTP) -------
-    console.log("— Manager creates + activates the UFC scorecard (live HTTP as Dana)");
+    // Dana can still read her own company's published context over HTTP.
+    const danaGet = await hit("GET", "/v1/intelligence/context", dana);
+    c("Dana reads the published UFC context over HTTP",
+      danaGet.status === 200 && danaGet.data?.company_id === UFC_COMPANY_ID &&
+      danaGet.data?.published?.version === 1,
+      `got ${danaGet.status}`);
 
-    const create = await hit("POST", "/v1/intelligence/scorecards", dana, {
-      name: SCORECARD_NAME,
-      description: "Day 222 live proof — UFC company default over the fixed four stages.",
-      is_company_default: true,
-    });
-    c("Dana creates the UFC scorecard", create.status === 201 && create.data?.ok === true, `got ${create.status} ${JSON.stringify(create.data)?.slice(0, 120)}`);
-    const cardId = String(create.data?.scorecard?.id ?? "");
-    const draftVersionId = String(create.data?.draft_version?.id ?? "");
-    c("scorecard is created as a draft with a draft version", create.data?.scorecard?.status === "draft" && Boolean(draftVersionId));
+    // ---- 2. The seeded UFC scorecard --------------------------------------
+    console.log("— Seeded UFC scorecard");
 
-    const saveVersion = await hit("PUT", `/v1/intelligence/scorecards/${cardId}/versions/${draftVersionId}`, dana, {
-      call_types: [],
-      stages: SCORECARD_STAGE_PAYLOAD,
-    });
-    c("Dana saves stage weights 20/30/30/20 + one criterion per stage",
-      saveVersion.status === 200 && saveVersion.data?.ok === true,
-      `got ${saveVersion.status} ${JSON.stringify(saveVersion.data)?.slice(0, 160)}`);
-
-    const activate = await hit("POST", `/v1/intelligence/scorecards/${cardId}/activate`, dana, {});
-    c("Dana activates the scorecard", activate.status === 200 && activate.data?.ok === true,
-      `got ${activate.status} ${JSON.stringify(activate.data)?.slice(0, 160)}`);
+    c("UFC Sales Scorecard is active and the company default",
+      (seededCard as any).is_company_default === true);
 
     const { data: activeVer } = await supa
       .from("scorecard_versions").select("id, version, status, snapshot")
       .eq("scorecard_id", cardId).eq("status", "active").maybeSingle();
     const activeVersionId = String((activeVer as any)?.id ?? "");
-    c("an active version now exists with an immutable snapshot",
+    c("an active version exists with an immutable snapshot",
       Boolean(activeVersionId) && Boolean((activeVer as any)?.snapshot));
     const snapStages = ((activeVer as any)?.snapshot?.stages ?? []) as any[];
     c("snapshot uses only the fixed four stages",
@@ -408,6 +285,11 @@ async function main() {
     c("snapshot weights total 100 (20/30/30/20)",
       snapStages.reduce((t, s) => t + (Number(s.weight) || 0), 0) === 100 &&
       JSON.stringify(snapStages.map((s) => Number(s.weight))) === JSON.stringify([20, 30, 30, 20]));
+
+    const danaList = await hit("GET", "/v1/intelligence/scorecards", dana);
+    c("Dana sees the scorecard in her Studio list over HTTP",
+      danaList.status === 200 && JSON.stringify(danaList.data ?? {}).includes(SCORECARD_NAME),
+      `got ${danaList.status}`);
 
     // ---- 3. The runtime resolves what the manager published ---------------
     console.log("— Runtime resolution against the live UFC assets");
@@ -436,9 +318,9 @@ async function main() {
     c("scorecard prompt block renders all four fixed stages with weights",
       ["intro (weight 20", "discovery (weight 30", "objection (weight 30", "close (weight 20"]
         .every((s) => scBlock.includes(`Stage ${s}`)));
-    c("scorecard prompt block carries the manager's criteria",
-      scBlock.includes("Isolate the price concern and reframe on value") &&
-      scBlock.includes("Secure a clear next step and commitment"));
+    c("scorecard prompt block carries the seeded criteria",
+      scBlock.includes("Isolate price concern and reframe value") &&
+      scBlock.includes("Secure clear next step and commitment"));
     c("scorecard prompt block pins the fixed JSON schema (no new stages)",
       scBlock.includes("fixed JSON schema"));
 
@@ -517,8 +399,8 @@ async function main() {
     c("_meta.scorecard_version_id = the active version", meta.scorecard_version_id === activeVersionId, JSON.stringify(meta.scorecard_version_id));
     c("_meta.scorecard_version = 1", meta.scorecard_version === 1, JSON.stringify(meta.scorecard_version));
     c("_meta.context_version = the published version", meta.context_version === 1, JSON.stringify(meta.context_version));
-    c("_meta.context_published_at = the publish timestamp",
-      meta.context_published_at === pub.data?.published?.published_at, JSON.stringify(meta.context_published_at));
+    c("_meta.context_published_at = the seeded publish timestamp",
+      meta.context_published_at === (ctxFull as any)?.published_at, JSON.stringify(meta.context_published_at));
     c("persisted rubric keeps the fixed four-stage shape",
       JSON.stringify(Object.keys((scoredCall as any)?.rubric ?? {}).sort()) ===
       JSON.stringify(["_meta", "close", "discovery", "intro", "objection"]));
@@ -593,6 +475,10 @@ async function main() {
     const { data: draftRow } = await supa
       .from("company_context").select("id, status").eq("company_id", UFC_COMPANY_ID).eq("status", "draft").maybeSingle();
     c("the UFC draft context row still exists after publish", Boolean(draftRow));
+    // Edit the seeded draft, prove scoring ignores it, then restore it exactly
+    // — the draft is demo data now, not this validator's to leave mangled.
+    const { data: draftBefore } = await supa
+      .from("company_context").select("context").eq("id", (draftRow as any)?.id).single();
     const draftEdit = await hit("PUT", "/v1/intelligence/context", dana, {
       context: { profile: { about: "DAY222 DRAFT EDIT — must never reach scoring." } },
     });
@@ -602,6 +488,11 @@ async function main() {
       JSON.stringify(ctxAfterDraftEdit) === JSON.stringify(liveCtx));
     c("the runtime's context never contains draft-only text",
       !String(ctxAfterDraftEdit?.compiled_context).includes("DAY222 DRAFT EDIT"));
+
+    const { error: restoreErr } = await supa
+      .from("company_context").update({ context: (draftBefore as any)?.context })
+      .eq("id", (draftRow as any)?.id);
+    c("seeded draft restored exactly after the isolation probe", !restoreErr, restoreErr?.message);
 
     // Archived scorecard with an active version + a superseded version.
     const now = new Date().toISOString();
