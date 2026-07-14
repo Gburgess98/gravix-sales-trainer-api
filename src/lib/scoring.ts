@@ -13,6 +13,16 @@ import type {
 } from "./types/call-analysis";
 import { cleanTranscript, buildSegments, findNearestSegment } from "./transcript";
 import { syncRepMemoryEmbedding, searchKnowledgeEmbeddings } from "./embeddings";
+import {
+  GRAVIX_DEFAULT_SCORECARD_KEY,
+  buildContextPromptBlock,
+  buildScorecardPromptBlock,
+  gravixDefaultScorecard,
+  resolveActiveScorecard,
+  resolvePublishedContext,
+  type ResolvedContext,
+  type ResolvedScorecard,
+} from "./intelligenceRuntime";
 async function getScoringKnowledgeContext(
   supabase: SupabaseClient,
   args: {
@@ -725,29 +735,43 @@ function normaliseTranscriptForDeterminism(transcript: string): string {
     .trim();
 }
 
-function buildDeterministicPromptKey(params: {
+export function buildDeterministicPromptKey(params: {
   callId: string;
   filename?: string | null;
   sha256?: string | null;
   transcript?: string | null;
+  // Day 221 — Intelligence Layer segments. Both default to the legacy key:
+  // a company with no published context and no active custom scorecard keys
+  // exactly as before, so no existing cache entry is orphaned and the
+  // default path cannot collide with a versioned one (appended segments
+  // follow the 8-hex transcriptHash, which can never contain "|").
+  contextVersion?: number | null;
+  scorecardCacheKey?: string | null;
 }) {
   const transcript = normaliseTranscriptForDeterminism(params.transcript || "");
   const transcriptHash = stableHash(transcript || params.sha256 || params.callId);
+  const parts = [
+    `rubric=${RUBRIC_VERSION}`,
+    `prompt=${SCORING_PROMPT_VERSION}`,
+    `model=${SCORING_MODEL_VERSION}`,
+    `filename=${params.filename || params.callId}`,
+    `sha256=${params.sha256 || "missing"}`,
+    `transcriptHash=${transcriptHash}`,
+  ];
+  if (params.contextVersion != null) {
+    parts.push(`context=${params.contextVersion}`);
+  }
+  if (params.scorecardCacheKey && params.scorecardCacheKey !== GRAVIX_DEFAULT_SCORECARD_KEY) {
+    parts.push(`scorecard=${params.scorecardCacheKey}`);
+  }
   return {
     transcript,
     transcriptHash,
-    key: [
-      `rubric=${RUBRIC_VERSION}`,
-      `prompt=${SCORING_PROMPT_VERSION}`,
-      `model=${SCORING_MODEL_VERSION}`,
-      `filename=${params.filename || params.callId}`,
-      `sha256=${params.sha256 || "missing"}`,
-      `transcriptHash=${transcriptHash}`,
-    ].join("|"),
+    key: parts.join("|"),
   };
 }
 
-function buildRubricWithMeta(args: {
+export function buildRubricWithMeta(args: {
   intro: RubricSection;
   discovery: RubricSection;
   objection: RubricSection;
@@ -756,20 +780,39 @@ function buildRubricWithMeta(args: {
   transcriptHash: string | null;
   transcriptPresent: boolean;
   modelVersion: string;
+  // Day 221 — Intelligence Layer provenance. Omitted (undefined) means the
+  // Gravix default path; new keys are additive so existing WEB _meta readers
+  // are unaffected.
+  resolvedContext?: ResolvedContext | null;
+  resolvedScorecard?: ResolvedScorecard | null;
 }) {
+  const scorecard = args.resolvedScorecard ?? gravixDefaultScorecard();
+  const meta: Record<string, any> = {
+    rubric_version: RUBRIC_VERSION,
+    prompt_version: SCORING_PROMPT_VERSION,
+    model_version: args.modelVersion,
+    scoring_model_version: SCORING_MODEL_VERSION,
+    call_sha256: args.callSha256,
+    transcript_hash: args.transcriptHash,
+    transcript_present: args.transcriptPresent,
+    scorecard_name: scorecard.scorecard_name,
+    scorecard_source: scorecard.source,
+  };
+  if (args.resolvedContext) {
+    meta.context_version = args.resolvedContext.context_version;
+    meta.context_published_at = args.resolvedContext.published_at;
+  }
+  if (scorecard.source !== "gravix_default") {
+    meta.scorecard_id = scorecard.scorecard_id;
+    meta.scorecard_version_id = scorecard.scorecard_version_id;
+    meta.scorecard_version = scorecard.scorecard_version;
+  }
   return {
     intro: args.intro,
     discovery: args.discovery,
     objection: args.objection,
     close: args.close,
-    _meta: {
-      rubric_version: RUBRIC_VERSION,
-      prompt_version: SCORING_PROMPT_VERSION,
-      model_version: args.modelVersion,
-      call_sha256: args.callSha256,
-      transcript_hash: args.transcriptHash,
-      transcript_present: args.transcriptPresent,
-    },
+    _meta: meta,
   };
 }
 
@@ -1587,10 +1630,20 @@ export async function scoreWithLLM(opts: {
     // Pull minimal call meta (include duration for Slack; user_id to resolve rep)
     const { data: call, error: callErr } = await supabase
       .from("calls")
-      .select("id, filename, user_id, org_id, duration_sec, sha256, transcript, analysis_json")
+      .select("id, filename, user_id, org_id, company_id, duration_sec, sha256, transcript, analysis_json")
       .eq("id", callId)
       .single();
     if (callErr || !call) throw new Error("call_not_found");
+
+    // Day 221 — Intelligence Layer resolution. Company scope comes from the
+    // Day 165 hierarchy stamp; calls carry no call_type/type/direction column
+    // today (live schema checked), so resolution falls through to the
+    // company-default scorecard, then the Gravix default. Both resolvers are
+    // fail-soft: any lookup problem degrades to the default scoring path.
+    const companyId = ((call as any)?.company_id as string | null) ?? null;
+    const callType: string | null = null;
+    const resolvedContext = await resolvePublishedContext(supabase, companyId);
+    const resolvedScorecard = await resolveActiveScorecard(supabase, companyId, callType);
 
     const rawTranscript = String(((call as any)?.transcript as string | null) ?? "");
     const cleanedTranscript = cleanTranscript(rawTranscript);
@@ -1609,6 +1662,8 @@ export async function scoreWithLLM(opts: {
       filename: (call as any)?.filename ?? null,
       sha256: ((call as any)?.sha256 as string | null) ?? null,
       transcript: cleanedTranscript,
+      contextVersion: resolvedContext?.context_version ?? null,
+      scorecardCacheKey: resolvedScorecard.cache_key,
     });
 
     const cached = await readScoreCache(supabase, deterministic.key);
@@ -1661,6 +1716,8 @@ export async function scoreWithLLM(opts: {
         transcriptHash: deterministic.transcriptHash,
         transcriptPresent: Boolean(deterministic.transcript),
         modelVersion: cachedModelVersion,
+        resolvedContext,
+        resolvedScorecard,
       });
 
       (rubric as any)._meta.voice = voice;
@@ -1826,7 +1883,12 @@ export async function scoreWithLLM(opts: {
       "Return suggestions as an array of short actionable coaching suggestions based on the weakest stages and moments.",
       "For identical transcripts, hashes, rubric versions, and prompt versions, return identical stage scores, overall score, moments, suggestions, and materially consistent reasoning.",
     ];
-    const user = userLines.join("\n");
+    // Day 221 — both blocks are "" on the default path (no published context,
+    // no active custom scorecard), keeping the prompt byte-identical to the
+    // pre-integration behaviour.
+    const scorecardBlock = buildScorecardPromptBlock(resolvedScorecard);
+    const contextBlock = buildContextPromptBlock(resolvedContext);
+    const user = userLines.join("\n") + scorecardBlock;
 
     const system = `You are a strict sales call evaluator. Score from 0–100 overall and for Intro, Discovery, Objection Handling, Close. Be concise. Also provide a short coaching summary. Treat the transcript and determinism key as the source of truth. Identical calls scored under the same rubric and prompt version must return the same result. Output must match the provided JSON schema exactly.
 
@@ -1834,7 +1896,7 @@ Relevant company playbook:
 ${knowledge.playbookText || "None"}
 
 Relevant rep memory:
-${knowledge.repMemoryText || "None"}`;
+${knowledge.repMemoryText || "None"}${contextBlock}`;
 
     const openai = getOpenAI();
     const ctrl = new AbortController();
@@ -1912,6 +1974,8 @@ ${knowledge.repMemoryText || "None"}`;
       transcriptHash: deterministic.transcriptHash,
       transcriptPresent: Boolean(deterministic.transcript),
       modelVersion: SCORING_MODEL_VERSION,
+      resolvedContext,
+      resolvedScorecard,
     });
 
     (rubric as any)._meta.voice = voice;
