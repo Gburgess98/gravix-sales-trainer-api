@@ -23,6 +23,7 @@ import sparringRouter from "./routes/sparring";
 
 import coachRoutes from "./routes/coach";
 import teamRoutes from "./routes/team";
+import intelligenceRoutes from "./routes/intelligence";
 import repsRouter from "./routes/reps";
 import { rewardsRoutes } from "./routes/rewards";
 import { PERSONAS } from "./personas";
@@ -1848,6 +1849,8 @@ app.use("/v1/crm", crmRouter);
 app.use("/v1/accounts", accountsRouter);
 app.use("/v1/coach", coachRoutes);
 app.use("/v1/team", teamRoutes);
+// Intelligence Layer — Context Engine (Day 218); manager-gated, company-scoped
+app.use("/v1/intelligence", intelligenceRoutes);
 app.use("/v1/reps", repsRouter);
 app.use("/v1/rewards", rewardsRoutes);
 app.use("/v1/sparring", sparringRouter);
