@@ -1,9 +1,22 @@
 /**
  * validate-intelligence-scorecards-day-219b.ts
  *
- * Day 219B — Scorecard Studio data layer (/v1/intelligence/scorecards).
+ * Days 219B + 220 — Scorecard Studio data layer + lifecycle completion
+ * (/v1/intelligence/scorecards).
  *
- * Coverage:
+ * Day 220 additions:
+ *   ✓ fork active version → draft n+1 copying weights/criteria/call
+ *     types/origin; second fork → 409 draft_already_exists; forking a
+ *     draft → 400; rep 403; cross-company 404
+ *   ✓ editing the forked draft never alters the active snapshot
+ *   ✓ activation conflict still blocks without { replace_conflicts: true };
+ *     with the flag it supersedes the conflicting version, drops the
+ *     replaced scorecard to draft and reports the replacement list
+ *   ✓ archive marks without deleting (versions/snapshots survive) and an
+ *     archived scorecard rejects edit/save/fork/activate with 409
+ *   ✓ audit rows for create/save-draft/fork/replace/archive lifecycle
+ *
+ * Day 219B coverage:
  *   ✓ endpoints answer 503 scorecard_studio_not_migrated until
  *     sql/20260714b_scorecard_studio.sql is applied (fail-soft)
  *   ✓ gates: no identity rejected, SalesRep → 403 on read and write
@@ -351,6 +364,127 @@ async function main() {
     c("activation writes an audit_events row",
       Boolean(audit) && audit?.metadata?.scorecard_id === cardId && audit?.metadata?.version === 1,
       JSON.stringify(audit)?.slice(0, 140));
+
+    // ── Day 220: fork active version → new draft ─────────────────────────────
+    const forkPath = `${BASE}/${cardId}/versions/${versionId}/fork`;
+
+    const repFork = await hit("POST", forkPath, nateId);
+    c("fork as SalesRep → 403", repFork.status === 403, `got ${repFork.status}`);
+    const xFork = await hit("POST", forkPath, XMANAGER_ID);
+    c("cross-company fork → 404", xFork.status === 404, `got ${xFork.status}`);
+
+    const fork = await hit("POST", forkPath, danaId);
+    c("fork active version → 201 draft v2",
+      fork.status === 201 && fork.data?.version?.version === 2 && fork.data?.version?.status === "draft",
+      `got ${fork.status} v${fork.data?.version?.version} ${fork.data?.version?.status}`);
+    const forkedVersionId = String(fork.data?.version?.id ?? "");
+    const forkWeightTotal = (fork.data?.version?.stage_weights ?? []).reduce((s: number, w: any) => s + w.weight, 0);
+    c("fork copies weights/criteria/call_types/origin",
+      forkWeightTotal === 100 &&
+      (fork.data?.version?.criteria ?? []).length === 4 &&
+      JSON.stringify(fork.data?.version?.call_types) === JSON.stringify(["discovery"]) &&
+      fork.data?.version?.origin === "manual",
+      JSON.stringify({ forkWeightTotal, criteria: (fork.data?.version?.criteria ?? []).length }));
+
+    const forkAgain = await hit("POST", forkPath, danaId);
+    c("second fork while a draft exists → 409 draft_already_exists",
+      forkAgain.status === 409 && forkAgain.data?.error === "draft_already_exists" &&
+      forkAgain.data?.draft_version_id === forkedVersionId,
+      `got ${forkAgain.status} ${forkAgain.data?.error}`);
+    const forkDraft = await hit("POST", `${BASE}/${cardId}/versions/${forkedVersionId}/fork`, danaId);
+    c("forking a draft version → 400 cannot_fork_draft",
+      forkDraft.status === 400 && forkDraft.data?.error === "cannot_fork_draft",
+      `got ${forkDraft.status} ${forkDraft.data?.error}`);
+
+    // Editing the forked draft must never touch the active snapshot.
+    const editFork = await hit("PUT", `${BASE}/${cardId}/versions/${forkedVersionId}`, danaId, {
+      call_types: ["discovery"],
+      stages: stagesPayload([25, 25, 25, 25]),
+    });
+    c("forked draft is editable", editFork.status === 200, `got ${editFork.status}`);
+    const detailAfterFork = await hit("GET", `${BASE}/${cardId}`, danaId);
+    const activeAfterFork = (detailAfterFork.data?.versions ?? []).find((v: any) => v.status === "active");
+    const activeSnapshotWeights = (activeAfterFork?.snapshot?.stages ?? []).map((s: any) => s.weight);
+    c("active snapshot unchanged after editing the forked draft",
+      activeAfterFork?.version === 1 && JSON.stringify(activeSnapshotWeights) === JSON.stringify([10, 35, 30, 25]),
+      JSON.stringify(activeSnapshotWeights));
+
+    // ── Day 220: explicit replacement activation ─────────────────────────────
+    // (rival's earlier bare activation already proved the 409 without flag)
+    const xReplace = await hit("POST", `${BASE}/${cardId}/activate`, XMANAGER_ID, { replace_conflicts: true });
+    c("cross-company activate with replace flag → 404", xReplace.status === 404, `got ${xReplace.status}`);
+
+    const replaceActivate = await hit("POST", `${BASE}/${rivalId}/activate`, danaId, { replace_conflicts: true });
+    c("activation with replace_conflicts supersedes the conflict → 200",
+      replaceActivate.status === 200 && replaceActivate.data?.version?.status === "active",
+      `got ${replaceActivate.status} ${JSON.stringify(replaceActivate.data)?.slice(0, 140)}`);
+    c("replacement list names the superseded scorecard/version",
+      (replaceActivate.data?.replaced ?? []).length === 1 &&
+      replaceActivate.data?.replaced?.[0]?.scorecard_id === cardId &&
+      replaceActivate.data?.replaced?.[0]?.version === 1 &&
+      replaceActivate.data?.replaced?.[0]?.reason === "call_type",
+      JSON.stringify(replaceActivate.data?.replaced));
+    const { data: replacedVersionRow } = await supa
+      .from("scorecard_versions").select("status").eq("id", versionId).single();
+    const { data: replacedCardRow } = await supa
+      .from("scorecards").select("status").eq("id", cardId).single();
+    c("replaced version superseded + scorecard dropped to draft (history kept)",
+      (replacedVersionRow as any)?.status === "superseded" && (replacedCardRow as any)?.status === "draft",
+      JSON.stringify({ version: (replacedVersionRow as any)?.status, card: (replacedCardRow as any)?.status }));
+
+    // ── Day 220: archive ─────────────────────────────────────────────────────
+    const xArchive = await hit("POST", `${BASE}/${rivalId}/archive`, XMANAGER_ID);
+    c("cross-company archive → 404", xArchive.status === 404, `got ${xArchive.status}`);
+    const repArchive = await hit("POST", `${BASE}/${rivalId}/archive`, nateId);
+    c("archive as SalesRep → 403", repArchive.status === 403, `got ${repArchive.status}`);
+
+    const archive = await hit("POST", `${BASE}/${rivalId}/archive`, danaId);
+    c("manager archives scorecard → 200 archived",
+      archive.status === 200 && archive.data?.scorecard?.status === "archived" &&
+      Boolean(archive.data?.scorecard?.archived_at),
+      `got ${archive.status} ${archive.data?.scorecard?.status}`);
+    const { data: rivalVersions } = await supa
+      .from("scorecard_versions").select("id, status, snapshot").eq("scorecard_id", rivalId);
+    c("archive preserves versions + snapshots (nothing deleted)",
+      (rivalVersions ?? []).length === 1 && (rivalVersions as any[])[0].status === "superseded" &&
+      ((rivalVersions as any[])[0].snapshot?.stages ?? []).length === 4,
+      JSON.stringify((rivalVersions ?? []).map((v: any) => v.status)));
+
+    const archivedEdit = await hit("PUT", `${BASE}/${rivalId}`, danaId, { name: `Rival renamed — ${RUN_TAG}` });
+    c("archived scorecard rejects metadata edits → 409", archivedEdit.status === 409, `got ${archivedEdit.status}`);
+    const archivedSave = await hit("PUT", `${BASE}/${rivalId}/versions/${rivalVersionId}`, danaId, {
+      stages: stagesPayload([25, 25, 25, 25]),
+    });
+    c("archived scorecard rejects version saves → 409", archivedSave.status === 409, `got ${archivedSave.status}`);
+    const archivedActivate = await hit("POST", `${BASE}/${rivalId}/activate`, danaId);
+    c("archived scorecard rejects activation → 409", archivedActivate.status === 409, `got ${archivedActivate.status}`);
+    const archivedFork = await hit("POST", `${BASE}/${rivalId}/versions/${String((rivalVersions as any[])[0].id)}/fork`, danaId);
+    c("archived scorecard rejects fork → 409", archivedFork.status === 409, `got ${archivedFork.status}`);
+    const archiveAgain = await hit("POST", `${BASE}/${rivalId}/archive`, danaId);
+    c("archiving twice → 409", archiveAgain.status === 409, `got ${archiveAgain.status}`);
+
+    // ── Day 220: lifecycle audit trail ───────────────────────────────────────
+    for (const action of [
+      "create_scorecard",
+      "save_scorecard_draft",
+      "fork_scorecard_version",
+      "replace_scorecard_conflicts",
+      "archive_scorecard",
+    ]) {
+      const { data: rows } = await supa
+        .from("audit_events")
+        .select("id, metadata")
+        .eq("action", action)
+        .eq("actor_user_id", danaId)
+        .order("created_at", { ascending: false })
+        .limit(1);
+      const row = (rows ?? [])[0] as any;
+      const scoped =
+        row?.metadata?.company_id === ufcCompanyId ||
+        row?.metadata?.scorecard_id === cardId ||
+        row?.metadata?.scorecard_id === rivalId;
+      c(`audit row exists for ${action}`, Boolean(row) && scoped, JSON.stringify(row)?.slice(0, 120));
+    }
 
     // ── Cross-company isolation ──────────────────────────────────────────────
     const xList = await hit("GET", BASE, XMANAGER_ID);

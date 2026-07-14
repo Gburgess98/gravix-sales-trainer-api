@@ -11,7 +11,8 @@ import {
   validateForActivation,
 } from "../lib/scorecardStudio";
 
-// Intelligence Layer — Day 219B: Scorecard Studio data layer.
+// Intelligence Layer — Days 219B + 220: Scorecard Studio data layer +
+// lifecycle completion.
 //
 // Managers define what a good call looks like per call type, WITHIN the
 // fixed four-stage frame (SCORECARD_STUDIO_SPEC.md, WEB repo). Draft
@@ -20,6 +21,17 @@ import {
 // default), stamps a deterministic immutable jsonb snapshot, supersedes
 // the previous active version and writes an audit event. Nothing in the
 // scoring runtime reads these tables yet.
+//
+// Day 220 lifecycle rules:
+// - active/superseded versions are immutable — editing one means forking
+//   it into a new draft version (POST …/versions/:versionId/fork);
+// - cross-scorecard call-type conflicts are never replaced silently: the
+//   manager must send { replace_conflicts: true } and the response names
+//   every superseded version (the WEB dialog reads this);
+// - archiving marks, never deletes — every version and snapshot survives;
+//   archiving the company default is allowed because the Gravix Default
+//   rubric is the guaranteed fallback (spec safety rule). No restore
+//   endpoint yet; unarchiving is a later, explicit lane.
 //
 // Scope rules (same shape as routes/intelligence.ts, Day 218):
 // - every endpoint requireManager-gated; reps 403, no identity 401;
@@ -276,6 +288,14 @@ router.post("/", requireManager, async (req, res) => {
       .insert(defaultStageWeights().map((w) => ({ ...w, scorecard_version_id: version.id })));
     if (weightsErr) return tableError(res, weightsErr.message);
 
+    await logAuditEvent({
+      actorUserId: requesterId,
+      action: "create_scorecard",
+      entityType: "scorecard",
+      entityId: String(card.id),
+      metadata: { company_id: companyId, name },
+    });
+
     const { weightsRes } = await fetchVersionRows([String(version.id)]);
     return res.status(201).json({
       ok: true,
@@ -402,6 +422,9 @@ router.put("/:id/versions/:versionId", requireManager, async (req, res) => {
     const { data: card, error: cardErr } = await fetchScorecard(companyId, String(req.params.id));
     if (cardErr) return tableError(res, cardErr.message);
     if (!card) return res.status(404).json({ ok: false, error: "not_found" });
+    if (card.status === "archived") {
+      return res.status(409).json({ ok: false, error: "scorecard_archived" });
+    }
 
     const { data: version, error: verErr } = await supa
       .from("scorecard_versions")
@@ -455,6 +478,19 @@ router.put("/:id/versions/:versionId", requireManager, async (req, res) => {
       .single();
     if (updErr) return tableError(res, updErr.message);
 
+    await logAuditEvent({
+      actorUserId: requesterId,
+      action: "save_scorecard_draft",
+      entityType: "scorecard_version",
+      entityId: String(version.id),
+      metadata: {
+        company_id: companyId,
+        scorecard_id: String(card.id),
+        version: Number(version.version) || 0,
+        criteria_count: value.criteria.length,
+      },
+    });
+
     const { weightsRes, criteriaRes } = await fetchVersionRows([String(version.id)]);
     return res.json({
       ok: true,
@@ -463,6 +499,142 @@ router.put("/:id/versions/:versionId", requireManager, async (req, res) => {
         (weightsRes.data ?? []) as any[],
         (criteriaRes.data ?? []) as any[]
       ),
+    });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || "server_error" });
+  }
+});
+
+// ----- POST /v1/intelligence/scorecards/:id/versions/:versionId/fork ----------
+// Day 220: "edit an active scorecard" = fork its immutable version into a
+// new draft (version n+1) carrying the source's call types, weights,
+// criteria and origin (provenance survives forks — an ai_draft stays
+// visible as ai_draft in version history). Draft versions cannot be forked
+// (they are already editable), and a scorecard can only hold one draft: if
+// one exists the fork answers 409 draft_already_exists with its id rather
+// than silently returning it — the existing draft may hold unrelated
+// edits, so discarding or continuing it is the manager's call.
+router.post("/:id/versions/:versionId/fork", requireManager, async (req, res) => {
+  try {
+    const requesterId = requesterIdFromHeaders(req);
+    const companyId = await resolveCompanyId(requesterId);
+    if (!companyId) return res.status(403).json({ ok: false, error: "no_company_scope" });
+
+    const { data: card, error: cardErr } = await fetchScorecard(companyId, String(req.params.id));
+    if (cardErr) return tableError(res, cardErr.message);
+    if (!card) return res.status(404).json({ ok: false, error: "not_found" });
+    if (card.status === "archived") {
+      return res.status(409).json({ ok: false, error: "scorecard_archived" });
+    }
+
+    const { data: source, error: srcErr } = await supa
+      .from("scorecard_versions")
+      .select("*")
+      .eq("id", String(req.params.versionId))
+      .eq("scorecard_id", card.id)
+      .eq("company_id", companyId)
+      .maybeSingle();
+    if (srcErr) return tableError(res, srcErr.message);
+    if (!source) return res.status(404).json({ ok: false, error: "not_found" });
+    if (source.status === "draft") {
+      return res.status(400).json({ ok: false, error: "cannot_fork_draft" });
+    }
+
+    const { data: existingDraft, error: draftErr } = await supa
+      .from("scorecard_versions")
+      .select("id")
+      .eq("scorecard_id", card.id)
+      .eq("status", "draft")
+      .maybeSingle();
+    if (draftErr) return tableError(res, draftErr.message);
+    if (existingDraft) {
+      return res.status(409).json({
+        ok: false,
+        error: "draft_already_exists",
+        draft_version_id: String(existingDraft.id),
+      });
+    }
+
+    const { data: versionRows, error: verErr } = await supa
+      .from("scorecard_versions")
+      .select("version")
+      .eq("scorecard_id", card.id)
+      .order("version", { ascending: false })
+      .limit(1);
+    if (verErr) return tableError(res, verErr.message);
+    const nextVersion = (Number(versionRows?.[0]?.version) || 0) + 1;
+
+    const { data: fork, error: forkErr } = await supa
+      .from("scorecard_versions")
+      .insert({
+        scorecard_id: card.id,
+        company_id: companyId,
+        version: nextVersion,
+        status: "draft",
+        call_types: Array.isArray(source.call_types) ? source.call_types : [],
+        origin: source.origin ?? "manual",
+        created_by: requesterId,
+      })
+      .select("*")
+      .single();
+    if (forkErr) return tableError(res, forkErr.message);
+
+    // Copy the source's working rows (fresh ids, same content and order).
+    const { weightsRes, criteriaRes } = await fetchVersionRows([String(source.id)]);
+    if (weightsRes.error) return tableError(res, weightsRes.error.message);
+    if (criteriaRes.error) return tableError(res, criteriaRes.error.message);
+    const sourceWeights = (weightsRes.data ?? []) as any[];
+    const sourceCriteria = (criteriaRes.data ?? []) as any[];
+
+    if (sourceWeights.length) {
+      const { error: insWErr } = await supa.from("scorecard_stage_weights").insert(
+        sourceWeights.map((w) => ({
+          scorecard_version_id: fork.id,
+          stage: w.stage,
+          weight: w.weight,
+          guidance: w.guidance ?? null,
+        }))
+      );
+      if (insWErr) return tableError(res, insWErr.message);
+    }
+    if (sourceCriteria.length) {
+      const { error: insCErr } = await supa.from("scorecard_criteria").insert(
+        sourceCriteria.map((c) => ({
+          scorecard_version_id: fork.id,
+          stage: c.stage,
+          label: c.label,
+          description: c.description ?? null,
+          scoring_guidance: c.scoring_guidance ?? null,
+          good_example: c.good_example ?? null,
+          weak_example: c.weak_example ?? null,
+          coaching_prompt: c.coaching_prompt ?? null,
+          pass_fail: Boolean(c.pass_fail),
+          critical: Boolean(c.critical),
+          emphasis: c.emphasis ?? "standard",
+          sort_order: Number(c.sort_order) || 0,
+        }))
+      );
+      if (insCErr) return tableError(res, insCErr.message);
+    }
+
+    await logAuditEvent({
+      actorUserId: requesterId,
+      action: "fork_scorecard_version",
+      entityType: "scorecard_version",
+      entityId: String(fork.id),
+      metadata: {
+        company_id: companyId,
+        scorecard_id: String(card.id),
+        source_version_id: String(source.id),
+        source_version: Number(source.version) || 0,
+        version: nextVersion,
+      },
+    });
+
+    const { weightsRes: forkW, criteriaRes: forkC } = await fetchVersionRows([String(fork.id)]);
+    return res.status(201).json({
+      ok: true,
+      version: serialiseVersion(fork, (forkW.data ?? []) as any[], (forkC.data ?? []) as any[]),
     });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message || "server_error" });
@@ -520,43 +692,109 @@ router.post("/:id/activate", requireManager, async (req, res) => {
 
     // One active scorecard per call type across the company (and one active
     // company default — the partial unique index backstops that one).
+    // Day 220: conflicts are never replaced silently — without the explicit
+    // { replace_conflicts: true } flag the activation answers 409 with the
+    // full conflict list; with it, every conflicting active version is
+    // superseded (whole versions — narrowing an immutable version's call
+    // types would mutate it) and the response names each replacement.
+    const replaceConflicts = Boolean((req.body ?? {}).replace_conflicts);
+
+    type Conflict = {
+      reason: "call_type" | "company_default";
+      version_id: string;
+      scorecard_id: string;
+      version: number;
+      call_types: string[];
+    };
+    const conflicts: Conflict[] = [];
+
     if (callTypes.length) {
       const { data: activeElsewhere, error: confErr } = await supa
         .from("scorecard_versions")
-        .select("id, scorecard_id, call_types")
+        .select("id, scorecard_id, version, call_types")
         .eq("company_id", companyId)
         .eq("status", "active")
         .neq("scorecard_id", card.id)
         .overlaps("call_types", callTypes);
       if (confErr) return tableError(res, confErr.message);
-      if (activeElsewhere?.length) {
-        return res.status(409).json({
-          ok: false,
-          error: "call_type_conflict",
-          conflicts: (activeElsewhere as any[]).map((v) => ({
-            scorecard_id: String(v.scorecard_id),
-            call_types: (v.call_types ?? []).filter((t: string) => callTypes.includes(t)),
-          })),
+      for (const v of (activeElsewhere ?? []) as any[]) {
+        conflicts.push({
+          reason: "call_type",
+          version_id: String(v.id),
+          scorecard_id: String(v.scorecard_id),
+          version: Number(v.version) || 0,
+          call_types: (v.call_types ?? []).filter((t: string) => callTypes.includes(t)),
         });
       }
     }
     if (card.is_company_default) {
-      const { data: otherDefault, error: defErr } = await supa
+      const { data: otherDefaults, error: defErr } = await supa
         .from("scorecards")
         .select("id")
         .eq("company_id", companyId)
         .eq("is_company_default", true)
         .eq("status", "active")
-        .neq("id", card.id)
-        .limit(1);
+        .neq("id", card.id);
       if (defErr) return tableError(res, defErr.message);
-      if (otherDefault?.length) {
-        return res.status(409).json({
-          ok: false,
-          error: "company_default_conflict",
-          conflicts: [{ scorecard_id: String((otherDefault as any[])[0].id) }],
+      for (const other of (otherDefaults ?? []) as any[]) {
+        const { data: otherActive, error: otherErr } = await supa
+          .from("scorecard_versions")
+          .select("id, scorecard_id, version, call_types")
+          .eq("scorecard_id", other.id)
+          .eq("status", "active")
+          .maybeSingle();
+        if (otherErr) return tableError(res, otherErr.message);
+        if (!otherActive) continue;
+        if (conflicts.some((cf) => cf.version_id === String(otherActive.id))) continue;
+        conflicts.push({
+          reason: "company_default",
+          version_id: String(otherActive.id),
+          scorecard_id: String(other.id),
+          version: Number(otherActive.version) || 0,
+          call_types: Array.isArray(otherActive.call_types) ? otherActive.call_types : [],
         });
       }
+    }
+
+    if (conflicts.length && !replaceConflicts) {
+      return res.status(409).json({
+        ok: false,
+        error: conflicts.some((cf) => cf.reason === "call_type")
+          ? "call_type_conflict"
+          : "company_default_conflict",
+        conflicts,
+        hint: "Re-send with { replace_conflicts: true } to supersede these versions.",
+      });
+    }
+
+    const replaced: Conflict[] = [];
+    if (conflicts.length && replaceConflicts) {
+      for (const conflict of conflicts) {
+        const { error: supErr } = await supa
+          .from("scorecard_versions")
+          .update({ status: "superseded", updated_at: new Date().toISOString() })
+          .eq("id", conflict.version_id)
+          .eq("company_id", companyId);
+        if (supErr) return tableError(res, supErr.message);
+
+        // The replaced scorecard no longer scores anything — drop it to
+        // draft. Every version and snapshot survives untouched.
+        const { error: dropErr } = await supa
+          .from("scorecards")
+          .update({ status: "draft", updated_by: requesterId, updated_at: new Date().toISOString() })
+          .eq("id", conflict.scorecard_id)
+          .eq("company_id", companyId)
+          .eq("status", "active");
+        if (dropErr) return tableError(res, dropErr.message);
+        replaced.push(conflict);
+      }
+      await logAuditEvent({
+        actorUserId: requesterId,
+        action: "replace_scorecard_conflicts",
+        entityType: "scorecard",
+        entityId: String(card.id),
+        metadata: { company_id: companyId, replaced },
+      });
     }
 
     // Supersede this scorecard's previous active version (history kept).
@@ -629,7 +867,82 @@ router.post("/:id/activate", requireManager, async (req, res) => {
     return res.json({
       ok: true,
       version: serialiseVersion(activated, weights, criteria),
+      replaced,
     });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, error: e?.message || "server_error" });
+  }
+});
+
+// ----- POST /v1/intelligence/scorecards/:id/archive ----------------------------
+// Day 220: archive marks, never deletes. The scorecard drops out of the
+// live picture (status archived, active version superseded) but every
+// version, snapshot and criteria row survives for history. Archiving the
+// company default is allowed: the Gravix Default rubric is the guaranteed
+// fallback (spec safety rule — the MVP must be deletable without breaking
+// scoring). Archived scorecards are read-only; there is no restore
+// endpoint yet (a later, explicit lane).
+router.post("/:id/archive", requireManager, async (req, res) => {
+  try {
+    const requesterId = requesterIdFromHeaders(req);
+    const companyId = await resolveCompanyId(requesterId);
+    if (!companyId) return res.status(403).json({ ok: false, error: "no_company_scope" });
+
+    const { data: card, error: cardErr } = await fetchScorecard(companyId, String(req.params.id));
+    if (cardErr) return tableError(res, cardErr.message);
+    if (!card) return res.status(404).json({ ok: false, error: "not_found" });
+    if (card.status === "archived") {
+      return res.status(409).json({ ok: false, error: "scorecard_archived" });
+    }
+
+    const now = new Date().toISOString();
+
+    // Supersede the active version so nothing archived can be resolved as
+    // live; drafts stay as rows (read-only behind the archived guard).
+    const { data: active, error: activeErr } = await supa
+      .from("scorecard_versions")
+      .select("id, version")
+      .eq("scorecard_id", card.id)
+      .eq("status", "active")
+      .maybeSingle();
+    if (activeErr) return tableError(res, activeErr.message);
+    if (active) {
+      const { error: supErr } = await supa
+        .from("scorecard_versions")
+        .update({ status: "superseded", updated_at: now })
+        .eq("id", active.id);
+      if (supErr) return tableError(res, supErr.message);
+    }
+
+    const { data: archived, error: archErr } = await supa
+      .from("scorecards")
+      .update({ status: "archived", archived_at: now, updated_by: requesterId, updated_at: now })
+      .eq("id", card.id)
+      .eq("company_id", companyId)
+      .select("*")
+      .single();
+    if (archErr) {
+      // Best-effort restore so a failed archive does not leave the
+      // scorecard active-but-versionless.
+      if (active) {
+        await supa.from("scorecard_versions").update({ status: "active" }).eq("id", active.id);
+      }
+      return tableError(res, archErr.message);
+    }
+
+    await logAuditEvent({
+      actorUserId: requesterId,
+      action: "archive_scorecard",
+      entityType: "scorecard",
+      entityId: String(card.id),
+      metadata: {
+        company_id: companyId,
+        superseded_version: active ? Number(active.version) || 0 : null,
+        was_company_default: Boolean(card.is_company_default),
+      },
+    });
+
+    return res.json({ ok: true, scorecard: serialiseScorecard(archived) });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message || "server_error" });
   }
