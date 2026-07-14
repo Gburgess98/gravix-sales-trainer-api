@@ -15,6 +15,8 @@
  *   5. One open queue-assigned sparring drill for Nate (Coaching Queue shape).
  *   6. Two completed sparring drills with Day 155 completion-proof meta,
  *      matched to two seeded sparring sessions (62 → 78 = improving trend).
+ *   7. (Day 217B) Enriched hero-call rubric: buyer-ready stage audit
+ *      evidence on calls + call_scores, scores unchanged (45 overall).
  *
  * Idempotent: every row uses a deterministic UUID (uid("UFC_STORY", key)) and
  * upsert on id; re-running refreshes the same rows. All meta carries
@@ -44,6 +46,69 @@ const REP_EMAIL = "nate.diaz@ufcelite.demo";
 const SEED_TAG = "ufc-story";
 // Day 172 — demo-facing identity for the hero call (existing columns only).
 const HERO_CALL_TITLE = "Nate Diaz — Price Objection Call";
+
+// Day 217B — enriched hero-call audit evidence. Scores stay pinned to the
+// canonical demo story (overall 45, close weakest at 40, voice 53); only
+// fields the /calls/[id] review page already reads are written (stage
+// score/notes, voice_score, voice_rubric, review_tags weak_close /
+// filler_count / filler_words). Notes are multi-line — the audit renders
+// them whitespace-pre-wrap.
+const HERO_SUMMARY =
+  "Price objection call that ended without commitment. Nate stayed composed and acknowledged the objection, but discovery never uncovered the cost of the problem, price was never reframed against value, and the call closed on “send over some information” with no agreed next step.";
+
+const HERO_RUBRIC = {
+  overall: 45,
+  stages: {
+    intro: {
+      score: 57,
+      notes: [
+        "The opener was present but not strong enough to earn the rest of the call. Nate introduced himself clearly and set an agenda, but led with the product rather than the prospect's world, and never confirmed what a useful outcome would look like.",
+        "What worked: confident, well-paced introduction with a clear agenda.",
+        "What was missed: no rapport hook and no upfront agreement on the purpose of the call.",
+        "Coach on: opening with the prospect's likely problem, not the product.",
+        "Practise next: a 60-second opener that names the pain and checks the agenda before any pitch.",
+      ].join("\n"),
+    },
+    discovery: {
+      score: 53,
+      notes: [
+        "Discovery stayed surface-level. Nate asked what the team uses today but never explored the cost of the current approach, so the later price objection had nothing to be weighed against. The decision process went unmapped — “I would need to speak with my partner” arrived as a surprise instead of being surfaced here.",
+        "What worked: open questions early, and he let the prospect talk.",
+        "What was missed: pain quantification, decision-process questions and budget context before the pitch.",
+        "Coach on: layered discovery — problem, impact, then decision path.",
+        "Practise next: “what happens if nothing changes?” follow-ups until the cost of inaction is explicit.",
+      ].join("\n"),
+    },
+    objection: {
+      score: 56,
+      notes: [
+        "When the prospect said the package “feels too expensive for what we would actually use”, Nate acknowledged it calmly but moved straight to defending the price instead of isolating the objection. Price was never reframed against the cost of the problem, so it stayed open for the rest of the call.",
+        "What worked: composed acknowledgement — the conversation never turned defensive.",
+        "What was missed: isolate first (“if price were solved, is anything else in the way?”), then reframe on value or payback.",
+        "Coach on: acknowledge → isolate → reframe, in that order, before discussing the number.",
+        "Practise next: re-run the Objection Handling Drill against the sceptical persona.",
+      ].join("\n"),
+    },
+    close: {
+      score: 40,
+      notes: [
+        "The weakest stage of the call. The prospect ended with “send over some information and we will have a proper look”, and Nate accepted the brush-off as the outcome — no date, no owner, no defined next step. The call closed with polite interest and zero commitment.",
+        "What worked: he offered to follow up, so the door is still open.",
+        "What was missed: trading the information for time (a booked walkthrough), summarising agreed value, and asking for the meeting directly.",
+        "Coach on: never end on an unscheduled “send info” — convert it into a firm, dated next step.",
+        "Practise next: closing drill — ask for the meeting twice, with a smaller fallback commitment ready.",
+      ].join("\n"),
+    },
+  },
+  voice_score: 53,
+  voice_rubric: { overall: 53, clarity: 63, confidence: 79, pace: 73 },
+  review_tags: {
+    weak_close: true,
+    filler_count: 14,
+    filler_words: ["um", "you know", "kind of", "sort of"],
+    filler_density: 0.016,
+  },
+};
 
 const dryRun = process.argv.includes("--dry-run");
 
@@ -101,16 +166,33 @@ async function main() {
 
   const tenant = { org_id: null, company_id: DEMO_COMPANY_ID, office_id: null };
 
-  // ── 0. Friendly hero-call identity (Day 172 — replaces demo-call-N.mp3) ──
+  // ── 0. Friendly hero-call identity + enriched audit evidence ──
+  // Day 172 titled the call; Day 217B pins the canonical story rubric with
+  // buyer-ready stage evidence (same scores, richer notes) on both the calls
+  // row and its call_scores row so the /calls/[id] audit reads consistently.
   if (dryRun) {
-    console.log(`  DRY   calls: would title hero call "${HERO_CALL_TITLE}"`);
+    console.log(`  DRY   calls: would title hero call "${HERO_CALL_TITLE}" + write enriched rubric`);
+    console.log(`  DRY   call_scores: would mirror enriched rubric (overall ${HERO_RUBRIC.overall})`);
   } else {
     const { error: titleErr } = await supa
       .from("calls")
-      .update({ filename: HERO_CALL_TITLE, rep_name: rep.name })
+      .update({
+        filename: HERO_CALL_TITLE,
+        rep_name: rep.name,
+        summary: HERO_SUMMARY,
+        score_overall: HERO_RUBRIC.overall,
+        rubric: HERO_RUBRIC,
+      })
       .eq("id", call.id);
     if (titleErr) throw new Error(`calls hero title: ${titleErr.message}`);
-    console.log(`  OK    calls: hero call titled "${HERO_CALL_TITLE}"`);
+    console.log(`  OK    calls: hero call titled "${HERO_CALL_TITLE}" + enriched rubric`);
+
+    const { error: scoreErr } = await supa
+      .from("call_scores")
+      .update({ overall: HERO_RUBRIC.overall, rubric: HERO_RUBRIC })
+      .eq("call_id", call.id);
+    if (scoreErr) throw new Error(`call_scores hero rubric: ${scoreErr.message}`);
+    console.log(`  OK    call_scores: enriched rubric mirrored onto the score row`);
   }
 
   // ── 1. Whisperer session (ended, linked to the demo call) ──

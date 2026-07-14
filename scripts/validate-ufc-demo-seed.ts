@@ -41,6 +41,30 @@ check("idempotent: deterministic ids", /UFC_STORY::/.test(seed));
 check("idempotent: upsert on id", /\.upsert\(rows as any\[\], \{ onConflict: "id" \}\)/.test(seed));
 check("rows tagged as demo seed data", /demo_seed/.test(seed) && /"ufc-story"/.test(seed));
 
+// ── Day 217B: enriched hero-call audit evidence ──
+check(
+  "hero rubric pins the story stage scores (close weakest at 40)",
+  /intro:[\s\S]{0,20}score: 57/.test(seed) &&
+    /discovery:[\s\S]{0,20}score: 53/.test(seed) &&
+    /objection:[\s\S]{0,20}score: 56/.test(seed) &&
+    /close:[\s\S]{0,20}score: 40/.test(seed)
+);
+check(
+  "every stage carries non-trivial evidence notes (no \"Demo.\")",
+  !/"Demo\."/.test(seed) && (seed.match(/Practise next:/g) || []).length >= 4
+);
+check(
+  "each stage note covers missed behaviour + coaching + next practice",
+  (seed.match(/What was missed:/g) || []).length >= 4 &&
+    (seed.match(/Coach on:/g) || []).length >= 4
+);
+check("voice score preserved at 53", /voice_score: 53/.test(seed));
+check("review tags flag the weak close", /weak_close: true/.test(seed));
+check(
+  "enriched rubric mirrored onto call_scores",
+  /from\("call_scores"\)/.test(seed) && /eq\("call_id", call\.id\)/.test(seed)
+);
+
 // ── approval gates preserved ──
 check("does not seed AI candidates or decisions", !/whisperer_trigger_candidate_decisions/.test(seed));
 
