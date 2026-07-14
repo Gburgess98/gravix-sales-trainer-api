@@ -47,6 +47,7 @@
     "validate:intelligence-context": "tsx scripts/validate-intelligence-context-day-218.ts",
     "validate:intelligence-scorecards": "tsx scripts/validate-intelligence-scorecards-day-219b.ts",
     "validate:intelligence-runtime": "tsx scripts/validate-intelligence-runtime-day-221.ts",
+    "validate:intelligence-runtime-live": "tsx scripts/validate-intelligence-runtime-live-day-222.ts",
     "db:backfill": "tsx scripts/backfill-reps-company.ts",
     "db:backfill-calls": "tsx scripts/backfill-calls-hierarchy.ts",
     "db:backfill-sparring": "tsx scripts/backfill-sparring-data-model.ts",
