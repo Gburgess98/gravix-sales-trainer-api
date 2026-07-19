@@ -5,6 +5,7 @@ import { requireManager } from "../middleware/requireManager";
 import { logAuditEvent } from "../lib/audit";
 import { compileContextBlock, unknownContextKeys } from "../lib/contextEngine";
 import scorecardsRouter from "./intelligenceScorecards";
+import objectionsRouter from "./intelligenceObjections";
 
 // Intelligence Layer — Day 218: Context Engine data layer.
 //
@@ -33,6 +34,9 @@ const supa = createClient(
 
 // Scorecard Studio (Day 219B) — /v1/intelligence/scorecards*
 router.use("/scorecards", scorecardsRouter);
+
+// Objection Library (Day 236) — /v1/intelligence/objections*
+router.use("/objections", objectionsRouter);
 
 const MAX_CONTEXT_JSON_CHARS = 64_000;
 
