@@ -1323,7 +1323,9 @@ router.post("/:id/score", async (req, res) => {
     const hist = {
       call_id: id,
       user_id: requester,
-      score: body.score_overall,
+      // `overall` is the score column on call_scores — writing `score` made
+      // every snapshot insert fail, and the warn-only handler below hid it.
+      overall: body.score_overall,
       rubric: {
         ...(typeof body.rubric === "object" && body.rubric ? body.rubric : {}),
         voice_score,
@@ -1647,7 +1649,9 @@ router.get("/:id/scores", async (req, res) => {
 
     const { data, error } = await supa
       .from("call_scores")
-      .select("score, created_at")
+      // call_scores stores the value in `overall`; aliased so the response
+      // items keep their `score` key.
+      .select("score:overall, created_at")
       .eq("call_id", id)
       .order("created_at", { ascending: true })
       .limit(100);

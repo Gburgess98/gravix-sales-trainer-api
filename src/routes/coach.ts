@@ -54,9 +54,13 @@ r.post("/assign", async (req, res) => {
       ? `Created coaching assignment from flagged call (${thresholdBand || "flagged"})`
       : "Created manual coaching assignment";
 
+    // coach_assignments has no source/meta columns — provenance lives on the
+    // crm_activities row written below, which does have them. Asking for them
+    // here failed with 42703, and the guard below only recognises schema-cache
+    // errors, so the duplicate check silently reported "no duplicate".
     const duplicateCheck = await supa
       .from("coach_assignments")
-      .select("id,call_id,assignee_user_id,drill_id,notes,org_id,status,source,meta,created_at")
+      .select("id,call_id,assignee_user_id,drill_id,notes,org_id,status,created_at")
       .eq("call_id", body.callId)
       .eq("assignee_user_id", body.assigneeUserId)
       .eq("drill_id", body.drillId)
@@ -84,6 +88,9 @@ r.post("/assign", async (req, res) => {
         ok: true,
         deduped: true,
         item: duplicateCheck.data,
+        // The stored row carries no source/meta, so each of these resolves to
+        // the value computed from the call above — the same provenance that
+        // would have been stored, so the response shape and values are intact.
         reporting: {
           assignment_origin: String((duplicateCheck.data as any)?.source || assignmentSource),
           flagged_call: Boolean((duplicateCheck.data as any)?.meta?.flagged_call ?? isFlaggedCall),
@@ -102,6 +109,10 @@ r.post("/assign", async (req, res) => {
       });
     }
 
+    // No source/meta here either — writing them made this insert fail with
+    // PGRST204 on every call, and the retry below only triggers for a missing
+    // org_id, so /v1/coach/assign answered 400 for every assignment. The same
+    // provenance is written in full to crm_activities further down.
     const assignmentPayload = {
       call_id: body.callId,
       assignee_user_id: body.assigneeUserId,
@@ -109,21 +120,6 @@ r.post("/assign", async (req, res) => {
       notes: body.notes ?? null,
       org_id: (call as any)?.org_id ?? null,
       status: "open",
-      source: assignmentSource,
-      meta: {
-        source: assignmentSource,
-        action_type: "assignment_created",
-        assignment_origin: assignmentSource,
-        dedupe_key: `${body.callId}:${body.assigneeUserId}:${body.drillId}`,
-        flagged_call: isFlaggedCall,
-        threshold_band: thresholdBand,
-        needs_manager_review: needsManagerReview,
-        review_flags: reviewFlags,
-        score_overall: (call as any)?.score_overall ?? null,
-        // NEW: tracking fields for analytics
-        flag_sections: reviewFlags.map((f: any) => f.section).filter(Boolean),
-        score_before: (call as any)?.score_overall ?? null,
-      },
     } as any;
 
     console.log("[coach/assign] inserting assignment", assignmentPayload);
@@ -143,18 +139,6 @@ r.post("/assign", async (req, res) => {
         drill_id: body.drillId,
         notes: body.notes ?? null,
         status: "open",
-        source: assignmentSource,
-        meta: {
-          source: assignmentSource,
-          action_type: "assignment_created",
-          assignment_origin: assignmentSource,
-          dedupe_key: `${body.callId}:${body.assigneeUserId}:${body.drillId}`,
-          flagged_call: isFlaggedCall,
-          threshold_band: thresholdBand,
-          needs_manager_review: needsManagerReview,
-          review_flags: reviewFlags,
-          score_overall: (call as any)?.score_overall ?? null,
-        },
       } as any;
 
       if (missingOrg) {
@@ -183,10 +167,14 @@ r.post("/assign", async (req, res) => {
         call_id: body.callId,
         type: "coach_assignment",
         title: activityTitle,
-        summary: activitySummary,
         status: "open",
         source: "coach_assignment",
         meta: {
+          // crm_activities has no `summary` column, so this rode along as a
+          // top-level field and failed the whole insert with PGRST204 — the
+          // linked activity was never written. Carried in meta instead, which
+          // is the freeform jsonb this row already uses for context.
+          summary: activitySummary,
           coach_assignment_id: (data as any)?.id ?? null,
           drill_id: body.drillId,
           requester,

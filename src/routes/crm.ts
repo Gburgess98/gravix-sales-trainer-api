@@ -4150,7 +4150,9 @@ router.get("/reps/:id/coaching-history", async (req, res) => {
     try {
       const scores = await supa
         .from("call_scores")
-        .select("total_score")
+        // Aliased from the real column (`overall`) so the averaging below,
+        // which reads r.total_score, is unchanged.
+        .select("total_score:overall")
         .eq("user_id", repId)
         .limit(200);
 
@@ -4720,7 +4722,7 @@ router.get("/contacts/:id/ai-brief", async (req, res) => {
         // Pull latest score per call (best-effort)
         const { data: scoreRows } = await supa
           .from("call_scores")
-          .select("call_id, total_score, created_at")
+          .select("call_id, total_score:overall, created_at")
           .eq("user_id", requester)
           .in("call_id", callIds)
           .order("created_at", { ascending: false })

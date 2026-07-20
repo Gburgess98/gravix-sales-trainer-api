@@ -78,6 +78,17 @@ const NON_COLUMN_TOKENS = new Set(["*", "count", "sum", "avg", "min", "max"]);
  * (provenance columns that table does not have — they belong to the
  * separate `assignments` table) and assignments.org_id (that table is
  * scoped by office_id/company_id and has no org column). 24 → 18.
+ *
+ * Day 242 cleared coach.ts (the same coach_assignments.source/meta pair)
+ * and the call_scores family in calls.ts/crm.ts, where `score` and
+ * `total_score` are both the column `overall`. 18 → 13.
+ *
+ * KNOWN LIMITATION this validator does not cover: insert/upsert payloads.
+ * Day 242 found three write-side bugs of exactly this class that the scan
+ * cannot see — coach_assignments (source/meta), crm_activities (summary)
+ * and call_scores (score) — each silently discarded by a warn-only or
+ * try/catch handler. Extending to object keys in .insert()/.upsert() is
+ * the obvious next step.
  */
 const KNOWN_DRIFT = new Set([
   "src/lib/scoring.ts|admin_config|low_score_threshold",
@@ -87,10 +98,6 @@ const KNOWN_DRIFT = new Set([
   "src/routes/accounts.ts|contacts|role",
   "src/routes/accounts.ts|users|full_name",
   "src/routes/admin.ts|companies|settings",
-  "src/routes/calls.ts|call_scores|score",
-  "src/routes/coach.ts|coach_assignments|source",
-  "src/routes/coach.ts|coach_assignments|meta",
-  "src/routes/crm.ts|call_scores|total_score",
   "src/routes/crm.ts|crm_accounts|user_id",
   "src/routes/crm.ts|reps|full_name",
   "src/routes/crm.ts|reps|user_id",
