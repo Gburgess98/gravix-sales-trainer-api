@@ -53,6 +53,7 @@
     "validate:intelligence-objections": "tsx scripts/validate-intelligence-objections-day-236.ts",
     "validate:rep-stage-trends": "tsx scripts/validate-rep-stage-trends-day-238.ts",
     "validate:schema-selects": "tsx scripts/validate-schema-selects.ts",
+    "validate:dashboard-schema-drift": "tsx scripts/validate-dashboard-schema-drift.ts",
     "db:backfill": "tsx scripts/backfill-reps-company.ts",
     "db:backfill-calls": "tsx scripts/backfill-calls-hierarchy.ts",
     "db:backfill-sparring": "tsx scripts/backfill-sparring-data-model.ts",

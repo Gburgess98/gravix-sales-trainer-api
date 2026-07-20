@@ -633,14 +633,24 @@ router.get('/reporting-summary', async (req, res) => {
     const { data: calls, error: callsErr } = await callsQuery;
     if (callsErr) throw callsErr;
 
+    // coach_assignments carries no provenance columns — `source` and `meta`
+    // live on the separate `assignments` table, which is keyed by rep_id
+    // rather than assignee_user_id and is not interchangeable here. Asking
+    // for them failed with 42703 and, because the guard below matched any
+    // "does not exist", the error was swallowed and every assignment metric
+    // on this route silently reported zero.
     let coachAssignmentsQuery = db
       .from('coach_assignments')
-      .select('id,assignee_user_id,status,created_at,source,meta')
+      .select('id,assignee_user_id,status,created_at')
       .gte('created_at', since)
       .order('created_at', { ascending: false })
       .limit(50000);
     const { data: coachAssignments, error: coachErr } = await coachAssignmentsQuery;
-    if (coachErr && !(String((coachErr as any)?.message || '').toLowerCase().includes('does not exist'))) {
+    // Tolerate the table being absent in a fresh environment, but no longer
+    // a missing column — matching the `relation ... does not exist` test the
+    // assignments query in this same file already uses, so column drift
+    // fails loudly instead of quietly zeroing the numbers.
+    if (coachErr && !/relation .* does not exist/i.test(String((coachErr as any)?.message || ''))) {
       throw coachErr;
     }
 
@@ -674,6 +684,11 @@ router.get('/reporting-summary', async (req, res) => {
     let assignmentsFromCriticalFlags = 0;
     let assignmentsFromLowFlags = 0;
 
+    // Reads source/meta defensively and still resolves to '' for every row:
+    // coach_assignments has no provenance columns, so nothing in it can be
+    // identified as auto-created and the auto rate is structurally 0 until
+    // provenance exists on this table. Left as-is deliberately — inferring
+    // it from another table would be a guess, not a fix.
     for (const row of assignmentRows) {
       const source = String((row as any)?.source ?? (row as any)?.meta?.source ?? '').trim().toLowerCase();
       const meta = (row as any)?.meta || {};
@@ -903,15 +918,19 @@ router.get('/leaderboard', async (req, res) => {
       byUser.set(uid, acc);
     }
 
-    // Name hydration: profiles(id, display_name) → users(id, full_name, email) → fallback "Rep"
+    // Name hydration: profiles(user_id, full_name) → reps(id, name, email) → "Rep".
+    // profiles is keyed by user_id and its name column is full_name; the second
+    // lookup reads reps because `users` has no name column at all, and reps is
+    // the name source the rest of the app uses, keyed by id = calls.user_id.
+    // Aliased so the consuming code and the response keys are unchanged.
     const repIds = Array.from(byUser.keys()).filter(Boolean);
     const nameById = new Map<string, string>();
 
     if (repIds.length) {
       const { data: profs } = await supabase
         .from('profiles')
-        .select('id, display_name')
-        .in('id', repIds);
+        .select('id:user_id, display_name:full_name')
+        .in('user_id', repIds);
       for (const p of profs || []) {
         const id = String((p as any).id);
         const name = (p as any).display_name || '';
@@ -920,8 +939,8 @@ router.get('/leaderboard', async (req, res) => {
       const missing = repIds.filter(id => !nameById.has(id));
       if (missing.length) {
         const { data: users } = await supabase
-          .from('users')
-          .select('id, full_name, email')
+          .from('reps')
+          .select('id, full_name:name, email')
           .in('id', missing);
         for (const u of users || []) {
           const id = String((u as any).id);
@@ -1003,14 +1022,20 @@ router.get('/rep-summary', async (req, res) => {
       }
     }
 
-    // Completed drills XP (+5 each) — skip silently if table not present
+    // Completed drills XP (+5 each) — skip silently if table not present.
+    // `assignments` has no org_id: the app scopes it by office_id/company_id
+    // (applyOrgScope in routes/assignments.ts), so there is no org column to
+    // select or filter on and no proven equivalent to substitute. Both the
+    // select and the org filter previously failed with 42703 and the error
+    // was discarded by the `if (!aErr)` below, so drill XP silently stayed 0.
+    // The query is already constrained to this rep's own rows by rep_id, so
+    // dropping the impossible org filter grants no additional visibility.
     let assignsQ = supabase
       .from('assignments')
-      .select('status, created_at, org_id')
+      .select('status, created_at')
       .eq('rep_id', userId)
       .gte('created_at', since)
       .limit(5000);
-    if (orgId) assignsQ = assignsQ.eq('org_id', orgId);
     const { data: assigns, error: aErr } = await assignsQ;
     if (!aErr) {
       for (const a of assigns || []) {

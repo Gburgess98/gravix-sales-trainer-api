@@ -72,6 +72,12 @@ const NON_COLUMN_TOKENS = new Set(["*", "count", "sum", "avg", "min", "max"]);
  * with the name in full_name, and the `users` fallback was impossible
  * because that table has no name column — it now reads reps.name, the
  * name source the rest of the app already uses. 33 → 24 findings.
+ *
+ * Day 241 cleared all six src/routes/dashboard.ts entries: the same name
+ * hydration on the live leaderboard, plus coach_assignments.source/meta
+ * (provenance columns that table does not have — they belong to the
+ * separate `assignments` table) and assignments.org_id (that table is
+ * scoped by office_id/company_id and has no org column). 24 → 18.
  */
 const KNOWN_DRIFT = new Set([
   "src/lib/scoring.ts|admin_config|low_score_threshold",
@@ -88,12 +94,6 @@ const KNOWN_DRIFT = new Set([
   "src/routes/crm.ts|crm_accounts|user_id",
   "src/routes/crm.ts|reps|full_name",
   "src/routes/crm.ts|reps|user_id",
-  "src/routes/dashboard.ts|assignments|org_id",
-  "src/routes/dashboard.ts|coach_assignments|source",
-  "src/routes/dashboard.ts|coach_assignments|meta",
-  "src/routes/dashboard.ts|profiles|id",
-  "src/routes/dashboard.ts|profiles|display_name",
-  "src/routes/dashboard.ts|users|full_name",
   "src/routes/sparring.ts|companies|settings",
 ]);
 
