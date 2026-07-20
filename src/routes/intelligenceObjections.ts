@@ -81,6 +81,11 @@ function tableError(res: any, message: string | undefined) {
   return res.status(500).json({ ok: false, error: message || "server_error" });
 }
 
+// Postgres rejects a malformed uuid with 22P02 before any row match, so
+// ill-formed call ids are screened here and answer the same 404 as an
+// unknown one — no shape oracle, no 500.
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 const STATUSES = ["draft", "approved", "archived"] as const;
 const CATEGORIES = [
   "price", "timing", "authority", "trust",
@@ -534,19 +539,31 @@ router.post("/:id/evidence", requireManager, async (req, res) => {
     }
 
     // A linked call must be the company's own — cross-company call ids
-    // answer 404 like every other foreign id.
+    // answer 404 like every other foreign id, and so does anything we
+    // cannot positively resolve. The evidence row's rep_id comes from the
+    // call's owning user (calls.user_id — the calls table has no rep_id).
     let repId: string | null = null;
     if (callId) {
+      if (!UUID_RE.test(callId)) {
+        return res.status(404).json({ ok: false, error: "call_not_found" });
+      }
       const { data: call, error: callErr } = await supa
         .from("calls")
-        .select("id, company_id, rep_id")
+        .select("id, company_id, user_id")
         .eq("id", callId)
         .maybeSingle();
-      if (callErr) return tableError(res, callErr.message);
+      // A failed lookup is not proof the call exists, so it answers 404
+      // rather than 500 — but it is logged, because a silent 404 is how a
+      // schema drift here hides (Day 237A: the old select named a column
+      // that does not exist and every lookup 500'd).
+      if (callErr) {
+        console.warn("[objections] evidence call lookup failed:", callErr.message);
+        return res.status(404).json({ ok: false, error: "call_not_found" });
+      }
       if (!call || String((call as any).company_id ?? "") !== companyId) {
         return res.status(404).json({ ok: false, error: "call_not_found" });
       }
-      repId = (call as any).rep_id ? String((call as any).rep_id) : null;
+      repId = (call as any).user_id ? String((call as any).user_id) : null;
     }
 
     const { data: evidence, error: insErr } = await supa
