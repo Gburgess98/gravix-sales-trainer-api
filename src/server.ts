@@ -353,11 +353,14 @@ app.get("/v1/dashboard/leaderboard", requireIdentity, async (req, res) => {
     const repsById = new Map<string, { id: string; name: string }>();
 
     if (repIds.length) {
-      // Prefer profiles.display_name, fall back to users.full_name
+      // Prefer the user's profile name, fall back to the rep directory.
+      // profiles is keyed by user_id and its name column is full_name;
+      // the fallback reads reps.name because `users` carries no name
+      // column at all. Aliased so the consuming code below is unchanged.
       const { data: profs } = await supabase
         .from('profiles')
-        .select('id, display_name')
-        .in('id', repIds);
+        .select('id:user_id, display_name:full_name')
+        .in('user_id', repIds);
       for (const r of profs || []) {
         const id = String((r as any).id);
         const name = (r as any).display_name || 'Rep';
@@ -366,8 +369,8 @@ app.get("/v1/dashboard/leaderboard", requireIdentity, async (req, res) => {
       const missing = repIds.filter(id => !repsById.has(id));
       if (missing.length) {
         const { data: users } = await supabase
-          .from('users')
-          .select('id, full_name')
+          .from('reps')
+          .select('id, full_name:name')
           .in('id', missing);
         for (const u of users || []) {
           const id = String((u as any).id);
@@ -406,10 +409,10 @@ app.get("/v1/reps/:id/overview", requireIdentity, async (req, res) => {
     // Rep name (profiles.display_name -> users.full_name)
     let name = "Rep";
     try {
-      const { data: prof } = await supabase.from("profiles").select("id,display_name").eq("id", repId).maybeSingle();
+      const { data: prof } = await supabase.from("profiles").select("id:user_id,display_name:full_name").eq("user_id", repId).maybeSingle();
       if (prof?.display_name) name = prof.display_name;
       if (!prof?.display_name) {
-        const { data: usr } = await supabase.from("users").select("id,full_name").eq("id", repId).maybeSingle();
+        const { data: usr } = await supabase.from("reps").select("id,full_name:name").eq("id", repId).maybeSingle();
         if (usr?.full_name) name = usr.full_name;
       }
     } catch { }
@@ -1253,11 +1256,11 @@ app.post("/v1/admin/digest/daily", requireAdmin, async (req, res) => {
     const repIds = Array.from(agg.keys());
     const names = new Map<string, string>();
     if (repIds.length) {
-      const { data: profs } = await supabase.from("profiles").select("id, display_name").in("id", repIds);
+      const { data: profs } = await supabase.from("profiles").select("id:user_id, display_name:full_name").in("user_id", repIds);
       for (const p of profs || []) names.set(String((p as any).id), (p as any).display_name || "Rep");
       const missing = repIds.filter((id) => !names.has(id));
       if (missing.length) {
-        const { data: users } = await supabase.from("users").select("id, full_name").in("id", missing);
+        const { data: users } = await supabase.from("reps").select("id, full_name:name").in("id", missing);
         for (const u of users || []) names.set(String((u as any).id), (u as any).full_name || "Rep");
       }
     }

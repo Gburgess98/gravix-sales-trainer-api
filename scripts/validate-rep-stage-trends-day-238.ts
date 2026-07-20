@@ -340,6 +340,18 @@ async function main() {
   c("invalid rep id → 400 invalid_rep_id",
     badId.status === 400 && badId.data?.error === "invalid_rep_id", `got ${badId.status}`);
 
+  // ── Rep name resolution (Day 240) ────────────────────────────────────────
+  // GET /v1/reps/:id/overview resolved names via profiles.display_name with a
+  // users.full_name fallback. profiles has no display_name (its name column is
+  // full_name, keyed by user_id) and `users` has no name column at all, so both
+  // lookups threw 42703, were swallowed, and every rep displayed as "Rep".
+  const overview = await hit(`/v1/reps/${REP_SCORED}/overview`, MANAGER_A, ORG_A);
+  c("rep overview returns 200", overview.status === 200, `got ${overview.status}`);
+
+  c("rep overview resolves a real name (not the 'Rep' fallback)",
+    overview.data?.rep?.name === "Day238 Scored Rep",
+    `got ${JSON.stringify(overview.data?.rep)}`);
+
   // ── Real seeded UFC rep (read-only) ──────────────────────────────────────
   const { data: ufcRep } = await supa
     .from("reps").select("id,org_id").eq("name", "Nate Diaz").maybeSingle();
@@ -372,10 +384,20 @@ async function main() {
       typeof ufcFeed.data?.weakest_area?.score === "number" &&
       ufcFeed.data.weakest_area.score > 0,
       `got ${ufcFeed.status} ${JSON.stringify(ufcFeed.data?.weakest_area)}`);
+
+    const ufcOverview = await hit(
+      `/v1/reps/${(ufcRep as any).id}/overview`,
+      requester,
+      String((ufcRep as any).org_id)
+    );
+    c("seeded UFC rep overview shows the real name, not 'Rep'",
+      ufcOverview.data?.rep?.name === "Nate Diaz",
+      `got ${JSON.stringify(ufcOverview.data?.rep)}`);
   } else {
     c("seeded UFC rep → 200", false, "Nate Diaz not found — run seed:ufc-story");
     c("seeded UFC rep returns real stage values from rubric", false, "no UFC rep");
     c("seeded UFC rep daily-feed → 200 with a real weakest area", false, "no UFC rep");
+    c("seeded UFC rep overview shows the real name, not 'Rep'", false, "no UFC rep");
   }
 }
 

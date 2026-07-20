@@ -66,6 +66,12 @@ const NON_COLUMN_TOKENS = new Set(["*", "count", "sum", "avg", "min", "max"]);
  * matters as much as the select). Entries are keyed file|table|column so
  * they survive line moves. Removing an entry once fixed is required — a
  * baseline listing drift that no longer exists fails as stale.
+ *
+ * Day 240 cleared all three src/server.ts entries (profiles.id,
+ * profiles.display_name, users.full_name): profiles is keyed by user_id
+ * with the name in full_name, and the `users` fallback was impossible
+ * because that table has no name column — it now reads reps.name, the
+ * name source the rest of the app already uses. 33 → 24 findings.
  */
 const KNOWN_DRIFT = new Set([
   "src/lib/scoring.ts|admin_config|low_score_threshold",
@@ -89,9 +95,6 @@ const KNOWN_DRIFT = new Set([
   "src/routes/dashboard.ts|profiles|display_name",
   "src/routes/dashboard.ts|users|full_name",
   "src/routes/sparring.ts|companies|settings",
-  "src/server.ts|profiles|id",
-  "src/server.ts|profiles|display_name",
-  "src/server.ts|users|full_name",
 ]);
 
 const driftKey = (f: { file: string; table: string; column: string }) =>
