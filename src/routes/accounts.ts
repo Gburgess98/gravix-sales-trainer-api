@@ -304,10 +304,10 @@ router.get('/:id', async (req: Request, res: Response) => {
         .select(`
           id,
           title,
-          score,
+          score:score_overall,
           duration_seconds,
           created_at,
-          rep_id,
+          rep_id:user_id,
           account_id
         `)
         .eq('account_id', account.id)
@@ -437,9 +437,9 @@ router.get('/:id/intelligence-timeline', async (req: Request, res: Response) => 
           .select(`
             id,
             title,
-            score,
+            score:score_overall,
             duration_seconds,
-            rep_id,
+            rep_id:user_id,
             created_at
           `)
           .eq('account_id', account.id)
@@ -802,7 +802,7 @@ router.post('/:id/tasks/generate', async (req: Request, res: Response) => {
 
     const { data: calls } = await supa
       .from('calls')
-      .select('id,score,created_at')
+      .select('id,score:score_overall,created_at')
       .eq('account_id', account.id)
       .order('created_at', { ascending: false })
       .limit(25);
@@ -1838,10 +1838,10 @@ router.get('/:id/rescue-engine', async (req: Request, res: Response) => {
         .from('calls')
         .select(`
           id,
-          score,
+          score:score_overall,
           created_at,
           duration_seconds,
-          rep_id
+          rep_id:user_id
         `)
         .eq('account_id', account.id)
         .order('created_at', { ascending: false })
