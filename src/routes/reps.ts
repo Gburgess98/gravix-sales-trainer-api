@@ -19,6 +19,39 @@ function pct(numer: number, denom: number) {
   return numer / denom;
 }
 
+// Stage scores are not columns on `calls` — these routes used to select
+// intro_score/discovery_score/objection_score/close_score, which do not
+// exist, so every read threw 42703 (Day 238). The scores live in JSON, in
+// three shapes that are all present in live data:
+//   analysis_json.stages[stage].score   (newer scored calls)
+//   rubric.stages[stage].score          (current scoring output)
+//   rubric[stage].score                 (legacy, pre-`stages` nesting)
+// Same precedence as lib/scoring.ts normaliseStages, which treats a
+// missing `stages` wrapper as the stage map itself.
+const STAGE_KEYS = ["intro", "discovery", "objection", "close"] as const;
+type StageKey = (typeof STAGE_KEYS)[number];
+
+// null means "this call carries no score for this stage" — never 0. A
+// missing stage is not a stage scored zero, and callers must not average
+// or rank it as one.
+function stageScore(call: any, stage: StageKey): number | null {
+  const sources = [
+    call?.analysis_json?.stages,
+    call?.rubric?.stages,
+    call?.rubric,
+  ];
+
+  for (const source of sources) {
+    if (!source || typeof source !== "object") continue;
+    const raw = source?.[stage]?.score;
+    if (raw === null || raw === undefined || raw === "") continue;
+    const value = Number(raw);
+    if (Number.isFinite(value)) return value;
+  }
+
+  return null;
+}
+
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -330,7 +363,7 @@ repsRouter.get("/:id/weakness-trends", async (req: Request, res: Response) => {
     const { data: calls, error: callsErr } = await sb
       .from("calls")
       .select(
-        "id,created_at,score_overall,intro_score,discovery_score,objection_score,close_score"
+        "id,created_at,score_overall,rubric,analysis_json"
       )
       .eq("user_id", repId)
       .order("created_at", { ascending: true })
@@ -352,28 +385,24 @@ repsRouter.get("/:id/weakness-trends", async (req: Request, res: Response) => {
       overall: [] as any[],
     };
 
+    // A call with no score for a stage contributes no point to that
+    // stage's series, rather than a zero — plotting or averaging an
+    // absent score as 0 would invent a failing call that never happened.
     for (const call of safeCalls) {
       const date = call.created_at;
 
-      trends.intro.push({
-        date,
-        value: Number(call.intro_score || 0),
-      });
+      const stageSeries: Array<[StageKey, any[]]> = [
+        ["intro", trends.intro],
+        ["discovery", trends.discovery],
+        ["objection", trends.objection_handling],
+        ["close", trends.closing],
+      ];
 
-      trends.discovery.push({
-        date,
-        value: Number(call.discovery_score || 0),
-      });
-
-      trends.objection_handling.push({
-        date,
-        value: Number(call.objection_score || 0),
-      });
-
-      trends.closing.push({
-        date,
-        value: Number(call.close_score || 0),
-      });
+      for (const [stage, series] of stageSeries) {
+        const value = stageScore(call, stage);
+        if (value === null) continue;
+        series.push({ date, value });
+      }
 
       trends.overall.push({
         date,
@@ -572,7 +601,7 @@ repsRouter.get("/:id/daily-feed", async (req: Request, res: Response) => {
     const { data: calls, error: callsErr } = await sb
       .from("calls")
       .select(
-        "id,created_at,score_overall,intro_score,discovery_score,objection_score,close_score"
+        "id,created_at,score_overall,rubric,analysis_json"
       )
       .eq("user_id", repId)
       .order("created_at", { ascending: false })
@@ -588,16 +617,24 @@ repsRouter.get("/:id/daily-feed", async (req: Request, res: Response) => {
 
     const latestCall = safeCalls[0] || null;
 
-    const categoryScores = {
-      intro: Number(latestCall?.intro_score || 0),
-      discovery: Number(latestCall?.discovery_score || 0),
-      objection_handling: Number(latestCall?.objection_score || 0),
-      closing: Number(latestCall?.close_score || 0),
+    // Internal only — never returned. Stages the latest call did not
+    // score stay null so they cannot win "weakest area" on a zero they
+    // never earned.
+    const categoryScores: Record<string, number | null> = {
+      intro: latestCall ? stageScore(latestCall, "intro") : null,
+      discovery: latestCall ? stageScore(latestCall, "discovery") : null,
+      objection_handling: latestCall ? stageScore(latestCall, "objection") : null,
+      closing: latestCall ? stageScore(latestCall, "close") : null,
     };
 
-    const weakestEntry = Object.entries(categoryScores)
+    const scoredCategories = Object.entries(categoryScores)
+      .filter((entry): entry is [string, number] => entry[1] !== null);
+
+    const weakestEntry = scoredCategories
       .sort((a, b) => a[1] - b[1])[0];
 
+    // No stage data at all → weakest_area is null, a shape the response
+    // and every consumer below already handle.
     const weakestArea = weakestEntry
       ? {
           category: weakestEntry[0],
@@ -632,13 +669,22 @@ repsRouter.get("/:id/daily-feed", async (req: Request, res: Response) => {
 
     const regressionWarnings: string[] = [];
 
-    if (categoryScores.objection_handling < 55) {
+    // Guarded against null explicitly: `null < 55` is true in JS, so an
+    // unscored stage would otherwise raise a regression warning about
+    // data that does not exist.
+    if (
+      categoryScores.objection_handling !== null &&
+      categoryScores.objection_handling < 55
+    ) {
       regressionWarnings.push(
         "Objection handling confidence below target"
       );
     }
 
-    if (categoryScores.closing < 55) {
+    if (
+      categoryScores.closing !== null &&
+      categoryScores.closing < 55
+    ) {
       regressionWarnings.push(
         "Closing confidence weakening"
       );
