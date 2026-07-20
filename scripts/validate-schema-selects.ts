@@ -1,7 +1,9 @@
 /**
  * validate-schema-selects.ts
  *
- * Catches Supabase `.select()` column drift against the live database.
+ * Catches Supabase column drift against the live database, on both the read
+ * side (`.select()` strings) and the write side (`.insert()`/`.upsert()`
+ * payload keys).
  *
  * Why this exists: PostgREST select strings are plain strings, so TypeScript
  * cannot check them. A column that does not exist fails at query time with
@@ -26,8 +28,28 @@
  * stays correct for empty tables — unlike sampling a row and reading its
  * keys, which silently sees no columns when a table happens to be empty.
  *
+ * Write payloads (Day 243). Day 242 found three write-side bugs the
+ * select-only scan could not see, one of which — coach_assignments getting
+ * source/meta — made POST /v1/coach/assign answer 400 for every request.
+ * Writes fail loudly at insert time, but this codebase routinely wraps them
+ * in warn-only or try/catch handlers, so they go unnoticed just as easily.
+ * Supported: object literals, array-of-object form, and `.insert(payload)`
+ * where payload is a const object literal bound exactly once in the file
+ * (the shape the dead coach/assign route used). Aliases do NOT apply to
+ * writes — a payload key must be a real column. Nested objects are not
+ * descended into, since a jsonb column's contents are free-form.
+ *
+ * Limitations, reported rather than guessed at: dynamic select arguments
+ * and unresolvable payload identifiers are counted as unverified, spreads
+ * are noted while explicit keys are still checked, computed keys are
+ * skipped, and tables absent from PostgREST are ignored. RPCs and raw SQL
+ * are out of scope. It checks that keys EXIST, not that required columns
+ * are PRESENT — Day 243 hit crm_activities.title/user_id NOT NULL
+ * violations that only surfaced by running the insert.
+ *
  * Usage: npm run validate:schema-selects
- * Exit code 1 if any select names a column its table does not have.
+ * Exit code 1 if any select or write payload names a column its table does
+ * not have.
  */
 
 import "dotenv/config";
@@ -83,12 +105,8 @@ const NON_COLUMN_TOKENS = new Set(["*", "count", "sum", "avg", "min", "max"]);
  * and the call_scores family in calls.ts/crm.ts, where `score` and
  * `total_score` are both the column `overall`. 18 → 13.
  *
- * KNOWN LIMITATION this validator does not cover: insert/upsert payloads.
- * Day 242 found three write-side bugs of exactly this class that the scan
- * cannot see — coach_assignments (source/meta), crm_activities (summary)
- * and call_scores (score) — each silently discarded by a warn-only or
- * try/catch handler. Extending to object keys in .insert()/.upsert() is
- * the obvious next step.
+ * Day 243 added write-payload scanning (see the header) and fixed the four
+ * scoring.ts crm_activities inserts it found. Read baseline unchanged at 13.
  */
 const KNOWN_DRIFT = new Set([
   "src/lib/scoring.ts|admin_config|low_score_threshold",
@@ -107,12 +125,35 @@ const KNOWN_DRIFT = new Set([
 const driftKey = (f: { file: string; table: string; column: string }) =>
   `${f.file}|${f.table}|${f.column}`;
 
+/**
+ * Write-side drift that already existed when payload scanning landed
+ * (Day 243). Same contract as KNOWN_DRIFT: confirmed real, baselined only
+ * so new drift can be gated, and a listed entry that stops reproducing
+ * fails as stale. Keyed file|table|column|op so a read and a write bug on
+ * the same column stay distinct.
+ */
+const KNOWN_WRITE_DRIFT = new Set<string>([
+  // crm_accounts is (id, org_id, name, domain, created_at) — it has no
+  // user_id and no owner column of any kind. These inserts surface the
+  // error, so CRM account creation currently answers 500.
+  //
+  // Deferred rather than patched because every option is a semantic
+  // decision, not a rename: dropping user_id records no owner at all,
+  // and org_id is a different concept, not a substitute. The read side
+  // of the same drift (crm.ts|crm_accounts|user_id) is likewise still
+  // baselined, so the whole ownership model needs deciding at once.
+  "src/routes/crm.ts|crm_accounts|user_id|insert",
+]);
+
+type Op = "select" | "insert" | "upsert";
+
 type Finding = {
   file: string;
   line: number;
   table: string;
   column: string;
   snippet: string;
+  op: Op;
 };
 
 type Skip = {
@@ -121,6 +162,14 @@ type Skip = {
   table: string;
   reason: string;
 };
+
+const writeDriftKey = (f: { file: string; table: string; column: string; op: Op }) =>
+  `${f.file}|${f.table}|${f.column}|${f.op}`;
+
+const isWrite = (f: Finding) => f.op !== "select";
+// Reads and writes carry separate baselines, so route each finding to its own.
+const baselineHas = (f: Finding) =>
+  isWrite(f) ? KNOWN_WRITE_DRIFT.has(writeDriftKey(f)) : KNOWN_DRIFT.has(driftKey(f));
 
 // ── Schema ──────────────────────────────────────────────────────────────────
 
@@ -234,6 +283,137 @@ function readLiteral(src: string, start: number): { raw: string; end: number; qu
   return null;
 }
 
+/**
+ * Read a balanced {...} starting at `start`, which must be an opening brace.
+ * String contents are honoured so a brace inside a literal cannot end it.
+ */
+function readObjectLiteral(src: string, start: number): { body: string; end: number } | null {
+  if (src[start] !== "{") return null;
+  let depth = 0;
+  let i = start;
+  let quote: string | null = null;
+
+  while (i < src.length) {
+    const ch = src[i];
+    if (quote) {
+      if (ch === "\\") { i += 2; continue; }
+      if (ch === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") { quote = ch; i++; continue; }
+    if (ch === "{") depth++;
+    if (ch === "}") {
+      depth--;
+      if (depth === 0) return { body: src.slice(start + 1, i), end: i + 1 };
+    }
+    i++;
+  }
+  return null;
+}
+
+/**
+ * Top-level keys of an object literal body. Nested objects and arrays are
+ * skipped entirely — for a jsonb column like `meta`, only `meta` itself is
+ * a real column and its contents are free-form.
+ */
+function topLevelKeys(body: string): { keys: string[]; hasSpread: boolean; hasComputed: boolean } {
+  const keys: string[] = [];
+  let hasSpread = false;
+  let hasComputed = false;
+
+  let depth = 0;
+  let quote: string | null = null;
+  let atKeyPosition = true;
+  let token = "";
+
+  const flush = () => {
+    const t = token.trim();
+    token = "";
+    if (!t) return;
+    // Shorthand property (`status,`) is a key too.
+    if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(t)) keys.push(t);
+  };
+
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+
+    if (quote) {
+      if (ch === "\\") { i++; continue; }
+      if (ch === quote) quote = null;
+      else if (depth === 0 && atKeyPosition) token += ch;
+      continue;
+    }
+
+    if (ch === '"' || ch === "'" || ch === "`") {
+      // A quoted key at depth 0 — collect its contents, ignore its quotes.
+      if (depth === 0 && atKeyPosition) token = "";
+      quote = ch;
+      continue;
+    }
+
+    if (ch === "{" || ch === "[" || ch === "(") { depth++; continue; }
+    if (ch === "}" || ch === "]" || ch === ")") { depth--; continue; }
+
+    if (depth !== 0) continue;
+
+    if (ch === ":") {
+      // Everything before the colon at depth 0 was the key.
+      const t = token.trim();
+      token = "";
+      atKeyPosition = false;
+      if (!t) continue;
+      if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(t)) keys.push(t);
+      continue;
+    }
+
+    if (ch === ",") {
+      if (atKeyPosition) flush(); // shorthand
+      token = "";
+      atKeyPosition = true;
+      continue;
+    }
+
+    if (atKeyPosition) {
+      if (ch === "." && body.slice(i, i + 3) === "...") { hasSpread = true; atKeyPosition = false; token = ""; i += 2; continue; }
+      if (ch === "[") { hasComputed = true; atKeyPosition = false; token = ""; continue; }
+      token += ch;
+    }
+  }
+  if (atKeyPosition) flush();
+
+  return { keys, hasSpread, hasComputed };
+}
+
+/**
+ * Resolve `.insert(payload)` where payload is a const object literal declared
+ * in the same file. Day 242's dead coach/assign route used exactly this shape
+ * (`const assignmentPayload = {...}` then `.insert(assignmentPayload)`), so
+ * without this the scanner would miss the very bugs that motivated it.
+ */
+function resolveNamedPayload(src: string, name: string, callIndex: number): string | null {
+  // Scope-blind resolution is dangerous: crm.ts has both `const payload = {…}`
+  // and `for (const payload of activityAttempts)`, and matching the first
+  // blindly attributed one payload's keys to three unrelated tables. Resolve
+  // only when the name is bound exactly once in the file, so there is no
+  // other binding it could refer to.
+  const bindingRe = new RegExp(`\\b(?:const|let|var)\\s+${name}\\b`, "g");
+  const bindings = [...src.matchAll(bindingRe)];
+  if (bindings.length !== 1) return null;
+
+  const decl = bindings[0];
+  if (decl.index === undefined || decl.index > callIndex) return null;
+
+  // That single binding must actually be an object literal assignment.
+  const assignRe = new RegExp(`^\\s*(?::[^=]+)?=\\s*\\{`);
+  const after = src.slice(decl.index + decl[0].length);
+  if (!assignRe.test(after)) return null;
+
+  const brace = src.indexOf("{", decl.index + decl[0].length);
+  const obj = readObjectLiteral(src, brace);
+  return obj ? obj.body : null;
+}
+
 /** Split a select list on top-level commas only (parens = embeds). */
 function splitColumns(list: string): string[] {
   const parts: string[] = [];
@@ -316,6 +496,62 @@ function scanFile(
     const limit = nextFrom === -1 ? src.length : nextFrom;
     const window = src.slice(afterFrom, limit);
 
+    // ── Write payloads (Day 243) ─────────────────────────────────────────
+    // Runs before the select branch below, which continues when a chain has
+    // no .select() — an insert-only chain must still be checked.
+    for (const op of ["insert", "upsert"] as const) {
+      const opIdx = window.indexOf(`.${op}(`);
+      if (opIdx === -1) continue;
+
+      let j = afterFrom + opIdx + `.${op}(`.length;
+      while (j < src.length && /\s/.test(src[j])) j++;
+      if (src[j] === "[") { // .insert([{...}]) — array form
+        j++;
+        while (j < src.length && /\s/.test(src[j])) j++;
+      }
+      const opLine = lineOf(src, j);
+
+      let body: string | null = null;
+      if (src[j] === "{") {
+        body = readObjectLiteral(src, j)?.body ?? null;
+      } else {
+        // .insert(identifier) — resolve a const object literal in this file.
+        const ident = /^[A-Za-z_$][A-Za-z0-9_$]*/.exec(src.slice(j, j + 80))?.[0];
+        if (ident) body = resolveNamedPayload(src, ident, j);
+        if (!body) {
+          skips.push({ file: rel, line: opLine, table, reason: `${op} payload is not a resolvable object literal (dynamic)` });
+          continue;
+        }
+      }
+      if (body === null) {
+        skips.push({ file: rel, line: opLine, table, reason: `${op} payload could not be parsed` });
+        continue;
+      }
+
+      const writeKnown = schema.get(table);
+      if (!writeKnown) {
+        skips.push({ file: rel, line: opLine, table, reason: "table not exposed in PostgREST schema (view, RPC or fixture)" });
+        continue;
+      }
+
+      const { keys, hasSpread, hasComputed } = topLevelKeys(body);
+      if (hasSpread) {
+        skips.push({ file: rel, line: opLine, table, reason: `${op} payload contains a spread (explicit keys still checked)` });
+      }
+      if (hasComputed) {
+        skips.push({ file: rel, line: opLine, table, reason: `${op} payload contains a computed key (skipped)` });
+      }
+
+      checked++;
+      const writeSnippet = keys.join(", ").slice(0, 70);
+      for (const key of keys) {
+        // No aliasing on writes — a payload key must be a real column.
+        if (!writeKnown.has(key)) {
+          findings.push({ file: rel, line: opLine, table, column: key, snippet: writeSnippet, op });
+        }
+      }
+    }
+
     const selIdx = window.indexOf(".select(");
     if (selIdx === -1) continue;
 
@@ -351,7 +587,7 @@ function scanFile(
       const column = resolveColumn(entry);
       if (column === null) continue; // embed / keyword / unparseable — never a failure
       if (!known.has(column)) {
-        findings.push({ file: rel, line: selectLine, table, column, snippet });
+        findings.push({ file: rel, line: selectLine, table, column, snippet, op: "select" });
       }
     }
   }
@@ -400,7 +636,7 @@ async function main() {
   let checked = 0;
   for (const file of files) checked += scanFile(file, schema, findings, skips);
 
-  console.log(`  Scanned ${files.length} TypeScript files, ${checked} literal select(s).`);
+  console.log(`  Scanned ${files.length} TypeScript files, ${checked} literal select(s) + write payload(s).`);
 
   // Skips are expected and not failures — printed so the blind spots stay visible.
   if (skips.length) {
@@ -419,18 +655,22 @@ async function main() {
     console.log("        carry stale copies of these selects. Candidates for deletion.");
   }
 
-  // Split findings against the baseline: known debt is reported but does
-  // not fail; anything new does.
-  const newFindings = findings.filter((f) => !KNOWN_DRIFT.has(driftKey(f)));
-  const seenKeys = new Set(findings.map(driftKey));
-  const staleBaseline = [...KNOWN_DRIFT].filter((k) => !seenKeys.has(k));
+  // Split findings against the baselines: known debt is reported but does
+  // not fail; anything new does. Reads and writes are gated separately.
+  const newFindings = findings.filter((f) => !baselineHas(f));
+  const seenReadKeys = new Set(findings.filter((f) => !isWrite(f)).map(driftKey));
+  const seenWriteKeys = new Set(findings.filter(isWrite).map(writeDriftKey));
+  const staleBaseline = [
+    ...[...KNOWN_DRIFT].filter((k) => !seenReadKeys.has(k)),
+    ...[...KNOWN_WRITE_DRIFT].filter((k) => !seenWriteKeys.has(k)),
+  ];
 
   const knownCount = findings.length - newFindings.length;
   if (knownCount) {
     console.log(`\n  Known pre-existing drift (baselined, still real bugs): ${knownCount}`);
     const byFile = new Map<string, number>();
     for (const f of findings) {
-      if (KNOWN_DRIFT.has(driftKey(f))) byFile.set(f.file, (byFile.get(f.file) ?? 0) + 1);
+      if (baselineHas(f)) byFile.set(f.file, (byFile.get(f.file) ?? 0) + 1);
     }
     for (const [file, n] of [...byFile].sort((a, b) => b[1] - a[1])) {
       console.log(`    ${String(n).padStart(3)}  ${file}`);
@@ -441,33 +681,39 @@ async function main() {
   // the code moved). Failing here stops the list quietly rotting into a
   // permanent suppression.
   if (staleBaseline.length) {
-    console.log(`\n  ✗ ${staleBaseline.length} stale baseline entr(y/ies) — drift no longer present, remove from KNOWN_DRIFT:\n`);
+    console.log(`\n  ✗ ${staleBaseline.length} stale baseline entr(y/ies) — drift no longer present, remove from KNOWN_DRIFT/KNOWN_WRITE_DRIFT:\n`);
     for (const k of staleBaseline) console.log(`    ${k}`);
-    console.log(`\n  Schema select validation FAILED\n`);
+    console.log(`\n  Schema validation FAILED\n`);
     process.exit(1);
   }
 
-  if (newFindings.length) {
-    const findings = newFindings; // report only what is new
-    console.log(`\n  ✗ ${findings.length} invalid column reference(s):\n`);
-    // Truncate as well as pad — padEnd alone lets a long value overflow and
-    // shunt every later column out of alignment.
-    const w = (s: string, n: number) => (s.length > n - 2 ? s.slice(0, n - 3) + "…" : s).padEnd(n);
-    console.log(`    ${w("FILE:LINE", 38)}${w("TABLE", 22)}${w("INVALID COLUMN", 26)}SELECT`);
+  // Truncate as well as pad — padEnd alone lets a long value overflow and
+  // shunt every later column out of alignment.
+  const w = (s: string, n: number) => (s.length > n - 2 ? s.slice(0, n - 3) + "…" : s).padEnd(n);
+
+  function reportSection(title: string, rows: Finding[], lastCol: string) {
+    if (!rows.length) return;
+    console.log(`\n  ✗ ${rows.length} ${title}:\n`);
+    console.log(`    ${w("FILE:LINE", 38)}${w("TABLE", 22)}${w("INVALID COLUMN", 26)}${lastCol}`);
     console.log(`    ${"-".repeat(116)}`);
-    for (const f of findings) {
+    for (const f of rows) {
       console.log(`    ${w(`${f.file}:${f.line}`, 38)}${w(f.table, 22)}${w(f.column, 26)}${f.snippet}`);
     }
-    console.log(`\n  Schema select validation FAILED\n`);
+  }
+
+  if (newFindings.length) {
+    reportSection("invalid select(s)", newFindings.filter((f) => !isWrite(f)), "SELECT");
+    reportSection("invalid write payload key(s)", newFindings.filter(isWrite), "PAYLOAD KEYS");
+    console.log(`\n  Schema validation FAILED\n`);
     process.exit(1);
   }
 
   console.log(
     knownCount
-      ? `\n  ✓ no NEW drift (${knownCount} baselined bug(s) outstanding — see KNOWN_DRIFT)`
-      : `\n  ✓ every literal select resolves against the live schema`
+      ? `\n  ✓ no NEW drift (${knownCount} baselined bug(s) outstanding — see KNOWN_DRIFT/KNOWN_WRITE_DRIFT)`
+      : `\n  ✓ every literal select and write payload resolves against the live schema`
   );
-  console.log("  Schema select validation PASSED\n");
+  console.log("  Schema validation PASSED\n");
 }
 
 main().catch((e) => {

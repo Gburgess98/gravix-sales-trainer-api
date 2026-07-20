@@ -1256,9 +1256,14 @@ async function ensureCriticalCallAssignment(args: {
 
     try {
       await svc.from("crm_activities").insert({
+        // crm_activities has no `summary` column, and `title`/`user_id` are
+        // NOT NULL — this insert failed three ways and was never written.
+        // The human-readable string the code already builds goes in `title`,
+        // which is that table's descriptive column (same shape as coach.ts).
         type: "coach_assignment_created",
-        summary: "Auto-created critical call review assignment",
+        title: "Auto-created critical call review assignment",
         org_id: args.orgId ?? null,
+        user_id: args.assigneeUserId,
         rep_id: args.assigneeUserId,
         call_id: args.callId,
         source: args.source,
@@ -1766,9 +1771,11 @@ export async function scoreWithLLM(opts: {
         const summary = `Scored ${Math.round(overall)}`;
 
         await svc.from('crm_activities').insert({
+          // See note above: title/user_id are NOT NULL, no summary column.
           type: 'score',
-          summary,
+          title: summary,
           org_id: (call as any)?.org_id ?? null,
+          user_id: (call as any)?.user_id ?? null,
           rep_id: (call as any)?.user_id ?? null,
           call_id: callId,
           source: 'scoring_engine_cache',
@@ -2034,9 +2041,11 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
       const summary = `Scored ${Math.round(overall)}`;
 
       await svc.from('crm_activities').insert({
+        // See note above: title/user_id are NOT NULL, no summary column.
         type: 'score',
-        summary,
+        title: summary,
         org_id: (call as any)?.org_id ?? null,
+        user_id: (call as any)?.user_id ?? null,
         rep_id: (call as any)?.user_id ?? null,
         call_id: callId,
         source: 'scoring_engine',
@@ -2287,9 +2296,11 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
       const summary = `Scored ${Math.round(overall)}`;
 
       await svc.from('crm_activities').insert({
+        // See note above: title/user_id are NOT NULL, no summary column.
         type: 'score',
-        summary,
+        title: summary,
         org_id: (memoryCall as any)?.org_id ?? null,
+        user_id: (memoryCall as any)?.user_id ?? null,
         rep_id: (memoryCall as any)?.user_id ?? null,
         call_id: opts.callId,
         source: 'scoring_engine_fallback',
