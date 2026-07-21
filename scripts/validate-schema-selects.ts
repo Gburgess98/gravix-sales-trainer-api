@@ -28,12 +28,17 @@
  * stays correct for empty tables — unlike sampling a row and reading its
  * keys, which silently sees no columns when a table happens to be empty.
  *
- * Write payloads (Day 243). Day 242 found three write-side bugs the
- * select-only scan could not see, one of which — coach_assignments getting
- * source/meta — made POST /v1/coach/assign answer 400 for every request.
- * Writes fail loudly at insert time, but this codebase routinely wraps them
- * in warn-only or try/catch handlers, so they go unnoticed just as easily.
- * Supported: object literals, array-of-object form, and `.insert(payload)`
+ * Write payloads (Day 243 insert/upsert, Day 245 update). Day 242 found
+ * three write-side bugs the select-only scan could not see, one of which —
+ * coach_assignments getting source/meta — made POST /v1/coach/assign answer
+ * 400 for every request. Day 244 then found a live 500 in
+ * `.update({ settings })` that insert/upsert scanning still missed, which is
+ * why update is covered too. Writes fail loudly at query time, but this
+ * codebase routinely wraps them in warn-only or try/catch handlers — or does
+ * not check the result at all — so they go unnoticed just as easily as a
+ * swallowed select.
+ * Supported: object literals, array-of-object form (insert/upsert only —
+ * .update() takes a single object), and `.insert(payload)`/`.update(payload)`
  * where payload is a const object literal bound exactly once in the file
  * (the shape the dead coach/assign route used). Aliases do NOT apply to
  * writes — a payload key must be a real column. Nested objects are not
@@ -111,9 +116,12 @@ const NON_COLUMN_TOKENS = new Set(["*", "count", "sum", "avg", "min", "max"]);
  * Day 244 cleared the companies.settings family in admin.ts and
  * sparring.ts — the column is settings_json. GET /v1/admin/persona-config
  * answered a misleading 404, PATCH 500'd, and sparring silently fell back
- * to an empty buyer persona. 13 read -> 9. Note the PATCH also wrote
- * `settings` via .update(), which this validator still does not scan:
- * only .insert()/.upsert() payloads are checked.
+ * to an empty buyer persona. 13 read -> 9.
+ *
+ * Day 245 extended the write scanner to .update() (the gap Day 244 exposed)
+ * and fixed the single finding: validate-user-management.ts reset reps.phone,
+ * but the column is phone_number, so that teardown had silently never run.
+ * Baseline unchanged at 9 read + 3 write.
  */
 const KNOWN_DRIFT = new Set([
   "src/lib/scoring.ts|admin_config|low_score_threshold",
@@ -150,7 +158,7 @@ const KNOWN_WRITE_DRIFT = new Set<string>([
   "src/routes/crm.ts|crm_accounts|user_id|insert",
 ]);
 
-type Op = "select" | "insert" | "upsert";
+type Op = "select" | "insert" | "upsert" | "update";
 
 type Finding = {
   file: string;
@@ -504,13 +512,15 @@ function scanFile(
     // ── Write payloads (Day 243) ─────────────────────────────────────────
     // Runs before the select branch below, which continues when a chain has
     // no .select() — an insert-only chain must still be checked.
-    for (const op of ["insert", "upsert"] as const) {
+    for (const op of ["insert", "upsert", "update"] as const) {
       const opIdx = window.indexOf(`.${op}(`);
       if (opIdx === -1) continue;
 
       let j = afterFrom + opIdx + `.${op}(`.length;
       while (j < src.length && /\s/.test(src[j])) j++;
-      if (src[j] === "[") { // .insert([{...}]) — array form
+      // Array form applies to insert/upsert only; .update() takes a single
+      // object, so an array there is not a payload we should read.
+      if (src[j] === "[" && op !== "update") {
         j++;
         while (j < src.length && /\s/.test(src[j])) j++;
       }

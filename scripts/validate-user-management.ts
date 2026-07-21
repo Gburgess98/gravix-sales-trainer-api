@@ -260,8 +260,15 @@ async function main() {
   } finally {
     process.stdout.write("\n  Cleaning up fixture reps… ");
     await deleteReps(fixtures.map(f => f.id));
-    // Restore George's phone to something clean
-    await supa.from("reps").update({ phone: null, updated_at: new Date().toISOString() }).eq("id", GEORGE_ID);
+    // Restore George's phone to something clean. The column is phone_number —
+    // the API surface calls it "phone" and maps it (routes/users.ts), but this
+    // writes straight to the table. The old `phone` key failed with PGRST204
+    // and the result was never checked, so this teardown silently never ran.
+    const restore = await supa
+      .from("reps")
+      .update({ phone_number: null, updated_at: new Date().toISOString() })
+      .eq("id", GEORGE_ID);
+    if (restore.error) console.warn("phone restore failed:", restore.error.message);
     console.log("done");
   }
 
