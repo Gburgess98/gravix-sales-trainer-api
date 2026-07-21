@@ -988,11 +988,14 @@ async function loadCompanyPersonaProfile(opts: {
 
     const { data, error } = await supa
       .from("companies")
+      // settings_json aliased to settings — the column is settings_json, and
+      // the failed select made this fall through to emptyProfile, so every
+      // sparring session silently ran with no company buyer persona.
       .select(`
         id,
         name,
         industry,
-        settings
+        settings:settings_json
       `)
       .eq("id", opts.companyId)
       .single();

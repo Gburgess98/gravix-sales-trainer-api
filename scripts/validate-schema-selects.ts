@@ -107,6 +107,13 @@ const NON_COLUMN_TOKENS = new Set(["*", "count", "sum", "avg", "min", "max"]);
  *
  * Day 243 added write-payload scanning (see the header) and fixed the four
  * scoring.ts crm_activities inserts it found. Read baseline unchanged at 13.
+ *
+ * Day 244 cleared the companies.settings family in admin.ts and
+ * sparring.ts — the column is settings_json. GET /v1/admin/persona-config
+ * answered a misleading 404, PATCH 500'd, and sparring silently fell back
+ * to an empty buyer persona. 13 read -> 9. Note the PATCH also wrote
+ * `settings` via .update(), which this validator still does not scan:
+ * only .insert()/.upsert() payloads are checked.
  */
 const KNOWN_DRIFT = new Set([
   "src/lib/scoring.ts|admin_config|low_score_threshold",
@@ -115,11 +122,9 @@ const KNOWN_DRIFT = new Set([
   "src/routes/accounts.ts|contacts|company",
   "src/routes/accounts.ts|contacts|role",
   "src/routes/accounts.ts|users|full_name",
-  "src/routes/admin.ts|companies|settings",
   "src/routes/crm.ts|crm_accounts|user_id",
   "src/routes/crm.ts|reps|full_name",
   "src/routes/crm.ts|reps|user_id",
-  "src/routes/sparring.ts|companies|settings",
 ]);
 
 const driftKey = (f: { file: string; table: string; column: string }) =>

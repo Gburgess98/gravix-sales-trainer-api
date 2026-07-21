@@ -907,9 +907,13 @@ adminRouter.get(
         });
       }
 
+      // The column is settings_json (companies has no `settings`). Aliased so
+      // the reads below are unchanged. Previously this 42703'd and the
+      // `if (error || !company)` guard turned it into a misleading 404
+      // company_not_found for a company that exists.
       const { data: company, error } = await supa
         .from("companies")
-        .select("id, name, settings")
+        .select("id, name, settings:settings_json")
         .eq("id", companyId)
         .single();
 
@@ -1000,7 +1004,7 @@ adminRouter.patch(
 
       const { data: existingCompany } = await supa
         .from("companies")
-        .select("settings")
+        .select("settings:settings_json")
         .eq("id", companyId)
         .maybeSingle();
 
@@ -1055,10 +1059,11 @@ adminRouter.patch(
       const { data: updatedCompany, error } = await supa
         .from("companies")
         .update({
-          settings: mergedSettings,
+          // No aliasing on writes — this must be the real column name.
+          settings_json: mergedSettings,
         })
         .eq("id", companyId)
-        .select("id, name, settings")
+        .select("id, name, settings:settings_json")
         .single();
 
       if (error || !updatedCompany) {
