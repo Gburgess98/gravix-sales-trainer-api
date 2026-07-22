@@ -5613,10 +5613,14 @@ router.post("/contacts/:id/notes", async (req, res) => {
     // best-effort rep name lookup (safe if it fails)
     let authorName: string | null = null;
     try {
+      // reps has no full_name or user_id column: the name is `name` and the
+      // table is keyed by `id` (= the requester's user id). Aliased so the
+      // consumer below is unchanged. Previously the select 42703'd, the whole
+      // try block threw, and every note fell back to the "Rep" author name.
       const { data: rep } = await supa
         .from("reps")
-        .select("name, full_name, first_name, last_name, email, user_id, id")
-        .or(`user_id.eq.${authorId},id.eq.${authorId}`)
+        .select("name, full_name:name, first_name, last_name, email, user_id:id, id")
+        .eq("id", authorId)
         .limit(1)
         .maybeSingle();
 

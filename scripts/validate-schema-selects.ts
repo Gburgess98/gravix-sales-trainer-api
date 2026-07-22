@@ -122,6 +122,11 @@ const NON_COLUMN_TOKENS = new Set(["*", "count", "sum", "avg", "min", "max"]);
  * and fixed the single finding: validate-user-management.ts reset reps.phone,
  * but the column is phone_number, so that teardown had silently never run.
  * Baseline unchanged at 9 read + 3 write.
+ *
+ * Day 246 cleared the crm.ts reps pair (create-contact-note author lookup):
+ * reps has no full_name or user_id — the name is `name`, keyed by `id`.
+ * The select 42703'd and the whole try block threw, so every note was
+ * authored "Rep". 9 read -> 7.
  */
 const KNOWN_DRIFT = new Set([
   "src/lib/scoring.ts|admin_config|low_score_threshold",
@@ -131,8 +136,6 @@ const KNOWN_DRIFT = new Set([
   "src/routes/accounts.ts|contacts|role",
   "src/routes/accounts.ts|users|full_name",
   "src/routes/crm.ts|crm_accounts|user_id",
-  "src/routes/crm.ts|reps|full_name",
-  "src/routes/crm.ts|reps|user_id",
 ]);
 
 const driftKey = (f: { file: string; table: string; column: string }) =>
