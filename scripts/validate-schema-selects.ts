@@ -127,6 +127,15 @@ const NON_COLUMN_TOKENS = new Set(["*", "count", "sum", "avg", "min", "max"]);
  * reps has no full_name or user_id — the name is `name`, keyed by `id`.
  * The select 42703'd and the whole try block threw, so every note was
  * authored "Rep". 9 read -> 7.
+ *
+ * Day 247 cleared crm_accounts.user_id (read + insert). crm_accounts has no
+ * user_id or owner column, so the per-user model 42703'd — account creation
+ * answered 500 and account reads returned empty. Product decision: accounts
+ * are org-scoped (org_id is the table's only tenant column), not user-owned.
+ * 7 read + 3 write -> 6 read + 2 write. Company-within-org isolation for
+ * accounts still needs a crm_accounts.company_id column (future migration):
+ * all reps currently share one org, so org scoping isolates orgs, not yet
+ * companies.
  */
 const KNOWN_DRIFT = new Set([
   "src/lib/scoring.ts|admin_config|low_score_threshold",
@@ -135,7 +144,6 @@ const KNOWN_DRIFT = new Set([
   "src/routes/accounts.ts|contacts|company",
   "src/routes/accounts.ts|contacts|role",
   "src/routes/accounts.ts|users|full_name",
-  "src/routes/crm.ts|crm_accounts|user_id",
 ]);
 
 const driftKey = (f: { file: string; table: string; column: string }) =>
@@ -148,18 +156,7 @@ const driftKey = (f: { file: string; table: string; column: string }) =>
  * fails as stale. Keyed file|table|column|op so a read and a write bug on
  * the same column stay distinct.
  */
-const KNOWN_WRITE_DRIFT = new Set<string>([
-  // crm_accounts is (id, org_id, name, domain, created_at) — it has no
-  // user_id and no owner column of any kind. These inserts surface the
-  // error, so CRM account creation currently answers 500.
-  //
-  // Deferred rather than patched because every option is a semantic
-  // decision, not a rename: dropping user_id records no owner at all,
-  // and org_id is a different concept, not a substitute. The read side
-  // of the same drift (crm.ts|crm_accounts|user_id) is likewise still
-  // baselined, so the whole ownership model needs deciding at once.
-  "src/routes/crm.ts|crm_accounts|user_id|insert",
-]);
+const KNOWN_WRITE_DRIFT = new Set<string>([]);
 
 type Op = "select" | "insert" | "upsert" | "update";
 

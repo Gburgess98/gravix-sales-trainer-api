@@ -2268,6 +2268,30 @@ async function getRepContext(userId: string): Promise<RepContext | null> {
   }
 }
 
+// Day 247 — crm_accounts ownership model.
+//
+// crm_accounts is (id, org_id, name, domain, created_at). It has no user_id
+// and no owner column, so the earlier per-user model (`user_id: requester`)
+// referenced a column that does not exist: every account read 42703'd (and
+// was swallowed to empty) and every create answered 500. The MVP decision is
+// that accounts are org-scoped, not user-owned — managers see their org's
+// accounts, and reps reach accounts through contacts/calls/activities.
+//
+// org_id is this table's only tenant column, so it is the scoping key. Note
+// all reps currently share one org (the company bridge on reps is newer than
+// this table), so org scoping does NOT yet isolate companies WITHIN an org —
+// that needs a crm_accounts.company_id column, a deliberate future migration,
+// not something to invent here.
+async function resolveAccountOrgId(req: any, requester: string): Promise<string | null> {
+  const ctx = await getRepContext(requester);
+  if (ctx?.org_id) return ctx.org_id;
+  try {
+    return getOrgIdHeader(req);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Returns the full identity context for a user: tier, company, office, and
  * the partner that owns their company (post-Phase-2-migration).
@@ -5415,7 +5439,7 @@ router.get("/link", async (req, res) => {
               .from("crm_accounts")
               .select("id, name")
               .eq("id", linkRow.account_id)
-              .eq("user_id", requester)
+              .eq("org_id", await resolveAccountOrgId(req, requester))
               .maybeSingle();
             if (!r.error) account = r.data ?? null;
           }
@@ -5524,7 +5548,7 @@ router.get("/link", async (req, res) => {
         .from("crm_accounts")
         .select("id, name")
         .eq("id", (linkRow as any).account_id)
-        .eq("user_id", requester)
+        .eq("org_id", await resolveAccountOrgId(req, requester))
         .maybeSingle();
 
       if (!r.error) account = r.data ?? null;
@@ -6649,10 +6673,11 @@ router.post("/opportunities", async (req, res) => {
 
     // 2) Resolve or create account by name
     if (accountName) {
+      const acctOrgId = await resolveAccountOrgId(req, requester);
       const existingAccount = await supa
         .from("crm_accounts")
-        .select("id, user_id")
-        .eq("user_id", requester)
+        .select("id")
+        .eq("org_id", acctOrgId)
         .eq("name", accountName)
         .maybeSingle();
 
@@ -6670,7 +6695,7 @@ router.post("/opportunities", async (req, res) => {
         const ins = await supa
           .from("crm_accounts")
           .insert({
-            user_id: requester,
+            org_id: acctOrgId,
             name: accountName,
           })
           .select("id")
@@ -7242,10 +7267,11 @@ router.post("/accounts", async (req, res) => {
     const nameNorm = body.name.trim();
 
     // 1) Find existing by (user_id + name)
+    const acctOrgId = await resolveAccountOrgId(req, requester);
     const ex = await supa
       .from("crm_accounts")
       .select("id, name, created_at")
-      .eq("user_id", requester)
+      .eq("org_id", acctOrgId)
       .eq("name", nameNorm)
       .limit(1)
       .maybeSingle();
@@ -7265,7 +7291,7 @@ router.post("/accounts", async (req, res) => {
     // 2) Insert new account
     const ins = await supa
       .from("crm_accounts")
-      .insert({ user_id: requester, name: nameNorm })
+      .insert({ org_id: acctOrgId, name: nameNorm })
       .select("id, name, created_at")
       .maybeSingle();
 
@@ -7371,10 +7397,11 @@ router.post("/accounts/create", async (req, res) => {
 
     // Best-effort: if you later add unique (user_id, domain) or (user_id, name), we can upsert.
     // For now: create + return.
+    const acctOrgId = await resolveAccountOrgId(req, requester);
     const ins = await supa
       .from("crm_accounts")
       .insert({
-        user_id: requester,
+        org_id: acctOrgId,
         name: body.name,
         domain: body.domain ?? null,
       })
