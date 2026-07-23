@@ -314,19 +314,37 @@ async function seedReps(authMap: Map<string, string>): Promise<void> {
   console.log(`${n} upserted`);
 }
 
+// crm_accounts.company_id lands with sql/20260723_crm_accounts_company_scope.sql.
+// Detected via PostgREST's OpenAPI so the seed stamps company_id once the column
+// exists (repairing the demo accounts to their real company, the only place that
+// mapping is known) while still working before the migration is applied.
+async function crmAccountsHasCompanyId(): Promise<boolean> {
+  try {
+    const base = String(process.env.SUPABASE_URL ?? "").replace(/\/$/, "");
+    const key = String(process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SERVICE_KEY ?? "");
+    const res = await fetch(`${base}/rest/v1/`, { headers: { apikey: key, Authorization: `Bearer ${key}` } });
+    const doc: any = await res.json();
+    return Object.prototype.hasOwnProperty.call(doc?.definitions?.crm_accounts?.properties ?? {}, "company_id");
+  } catch {
+    return false;
+  }
+}
+
 async function seedAccounts(): Promise<Record<string, string>> {
   process.stdout.write("  → Accounts... ");
 
+  const hasCompanyId = await crmAccountsHasCompanyId();
   const rows = ACCOUNTS.map((a) => ({
     id:         uid("DEMO_ACCOUNT", a.name),
     org_id:     ORG_ID,
+    ...(hasCompanyId ? { company_id: DEMO_COMPANY_ID } : {}),
     name:       a.name,
     domain:     a.domain,
     created_at: daysAgo(seededInt(a.name, 0, 10, 60)),
   }));
 
   const n = await upsert("crm_accounts", rows, "id");
-  console.log(`${n} upserted`);
+  console.log(`${n} upserted${hasCompanyId ? " (company-scoped)" : " (org-only — migration pending)"}`);
 
   return Object.fromEntries(rows.map((r) => [r.name, r.id]));
 }

@@ -108,7 +108,7 @@ Rejected — requires simultaneous migrations across 12+ files and 3 tables. The
 | `POST /v1/admin/users` shadow-write to `reps` | ⬜ Phase 1 |
 | Name hydration off `profiles` | ⬜ Phase 2 |
 | Admin user list off `users` | ⬜ Phase 2 |
-| CRM org_id → company_id | ⬜ Phase 2 |
+| CRM org_id → company_id | 🟡 Migration written (`20260723`), API company-aware; SQL apply + backfill pending |
 | `users` / `profiles` archived | ⬜ Phase 3 |
 
 ---
@@ -120,3 +120,38 @@ Rejected — requires simultaneous migrations across 12+ files and 3 tables. The
 - [FK_MIGRATION_PLAN.md](FK_MIGRATION_PLAN.md) — FK changes, order, rollback
 - [OWNERSHIP_MIGRATION_PLAN.md](OWNERSHIP_MIGRATION_PLAN.md) — org_id / company_id / partner_id
 - [IDENTITY_ROADMAP.md](IDENTITY_ROADMAP.md) — Phase 1 / 2 / 3 task lists
+
+---
+
+## ADR — CRM account tenant scoping (Day 248)
+
+**Decision:** CRM accounts (`crm_accounts`) are scoped by **company_id**, the tenant
+boundary. Managers see only their company's accounts. `org_id` is kept for legacy /
+backwards compatibility and is still written, but is no longer the isolation key.
+
+**Why:** the table originally had a non-existent `user_id` ownership model (fixed
+Day 247 by falling back to `org_id`). But both demo companies share one org, so
+`org_id` cannot isolate companies within an org. `company_id` is the real boundary
+(the same one `reps` already carries).
+
+**Not user-owned:** accounts have no owner column. Reps reach accounts through
+contacts, calls, activities and opportunities — not ownership.
+
+**Migration:** `sql/20260723_crm_accounts_company_scope.sql` adds `company_id`
+(nullable), an index, and partial unique constraints on `(company_id, lower(name))`
+and `(company_id, lower(domain))`. Nullable and **no SQL backfill**: there is no
+deterministic path from an existing account to exactly one company (only `org_id`,
+which spans two companies), so guessing would invent ownership. Existing rows stay
+`company_id = NULL` and are excluded from company-scoped reads until repaired. The
+demo rows are repaired by re-running `seed:demo` (now stamps `company_id =
+DEMO_COMPANY_ID`). New rows always carry `company_id`.
+
+**API:** `src/routes/crm.ts` resolves the requester's company from rep context and
+feature-detects the column, so the code is correct **before** the migration
+(org-scoped fallback — creation never breaks) and **after** (company-scoped) without
+a redeploy. `company_id` is never derived from a client header — only from
+server-side identity.
+
+**Verify:** `npm run validate:crm-account-ownership` — proves org isolation in
+migration-pending mode, and company isolation (two companies in one org) once the
+SQL is applied.

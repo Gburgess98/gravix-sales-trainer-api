@@ -2268,28 +2268,78 @@ async function getRepContext(userId: string): Promise<RepContext | null> {
   }
 }
 
-// Day 247 — crm_accounts ownership model.
+// Day 247/248 — crm_accounts ownership model.
 //
-// crm_accounts is (id, org_id, name, domain, created_at). It has no user_id
-// and no owner column, so the earlier per-user model (`user_id: requester`)
-// referenced a column that does not exist: every account read 42703'd (and
-// was swallowed to empty) and every create answered 500. The MVP decision is
-// that accounts are org-scoped, not user-owned — managers see their org's
-// accounts, and reps reach accounts through contacts/calls/activities.
+// crm_accounts had no user_id or owner column, so the original per-user model
+// 42703'd (create 500, reads swallowed to empty). Day 247 moved it onto org_id
+// to revive creation; Day 248 makes company_id the real tenant boundary, since
+// both demo companies share one org and org scoping cannot isolate them.
 //
-// org_id is this table's only tenant column, so it is the scoping key. Note
-// all reps currently share one org (the company bridge on reps is newer than
-// this table), so org scoping does NOT yet isolate companies WITHIN an org —
-// that needs a crm_accounts.company_id column, a deliberate future migration,
-// not something to invent here.
-async function resolveAccountOrgId(req: any, requester: string): Promise<string | null> {
-  const ctx = await getRepContext(requester);
-  if (ctx?.org_id) return ctx.org_id;
+// This resolves both keys and feature-detects the company_id column so the
+// code is correct BEFORE and AFTER sql/20260723_crm_accounts_company_scope.sql
+// is applied:
+//   * column present + a company resolved -> company-scoped (the target model)
+//   * otherwise                            -> org-scoped (the Day 247 fallback,
+//                                             so account creation never breaks
+//                                             while the migration is pending)
+// org_id is always written for legacy/backwards compatibility.
+
+type AccountScope = {
+  companyId: string | null;
+  orgId: string | null;
+  companyScoped: boolean;
+};
+
+// Cached once it flips true; while false we re-probe, so applying the migration
+// against the running server upgrades scoping without a restart. Detected via
+// PostgREST's OpenAPI document (the same schema source validate:schema-selects
+// uses) rather than a `.select("company_id")` — that would be a literal read of
+// a column which does not exist until the migration lands, i.e. drift itself.
+let _crmAccountsHasCompanyId: boolean | null = null;
+async function crmAccountsHasCompanyId(): Promise<boolean> {
+  if (_crmAccountsHasCompanyId === true) return true;
   try {
-    return getOrgIdHeader(req);
+    const base = String(process.env.SUPABASE_URL ?? "").replace(/\/$/, "");
+    const key = String(process.env.SUPABASE_SERVICE_ROLE_KEY ?? "");
+    const res = await fetch(`${base}/rest/v1/`, {
+      headers: { apikey: key, Authorization: `Bearer ${key}` },
+    });
+    const doc: any = await res.json();
+    const props = doc?.definitions?.crm_accounts?.properties ?? {};
+    _crmAccountsHasCompanyId = Object.prototype.hasOwnProperty.call(props, "company_id");
   } catch {
-    return null;
+    _crmAccountsHasCompanyId = false;
   }
+  return _crmAccountsHasCompanyId;
+}
+
+async function resolveAccountScope(req: any, requester: string): Promise<AccountScope> {
+  const ctx = await getRepContext(requester);
+  let orgId = ctx?.org_id ?? null;
+  if (!orgId) {
+    try { orgId = getOrgIdHeader(req); } catch { orgId = null; }
+  }
+  const companyId = ctx?.company_id ?? null;
+  const companyScoped = (await crmAccountsHasCompanyId()) && !!companyId;
+  return { companyId, orgId, companyScoped };
+}
+
+// Apply the resolved tenant filter to a crm_accounts query: company_id once the
+// migration is applied, org_id until then. Kept in one place so every read
+// scopes identically.
+function scopeAccountsQuery<T>(query: any, scope: AccountScope): T {
+  return scope.companyScoped
+    ? query.eq("company_id", scope.companyId)
+    : query.eq("org_id", scope.orgId);
+}
+
+// Build a crm_accounts insert payload. org_id is always written; company_id is
+// added only when the column exists and a company resolved — so the object
+// literal at each call site stays schema-valid while the migration is pending.
+function accountInsertPayload(scope: AccountScope, fields: Record<string, unknown>): Record<string, unknown> {
+  const payload: Record<string, unknown> = { org_id: scope.orgId, ...fields };
+  if (scope.companyScoped) payload.company_id = scope.companyId;
+  return payload;
 }
 
 /**
@@ -5435,12 +5485,11 @@ router.get("/link", async (req, res) => {
           }
 
           if (linkRow.account_id) {
-            const r = await supa
-              .from("crm_accounts")
-              .select("id, name")
-              .eq("id", linkRow.account_id)
-              .eq("org_id", await resolveAccountOrgId(req, requester))
-              .maybeSingle();
+            const accScope = await resolveAccountScope(req, requester);
+            const r = await scopeAccountsQuery<any>(
+              supa.from("crm_accounts").select("id, name").eq("id", linkRow.account_id),
+              accScope
+            ).maybeSingle();
             if (!r.error) account = r.data ?? null;
           }
 
@@ -5544,12 +5593,11 @@ router.get("/link", async (req, res) => {
 
     // account_id/opportunity_id are optional and may not exist on older link schemas.
     if ((linkRow as any).account_id) {
-      const r = await supa
-        .from("crm_accounts")
-        .select("id, name")
-        .eq("id", (linkRow as any).account_id)
-        .eq("org_id", await resolveAccountOrgId(req, requester))
-        .maybeSingle();
+      const accScope = await resolveAccountScope(req, requester);
+      const r = await scopeAccountsQuery<any>(
+        supa.from("crm_accounts").select("id, name").eq("id", (linkRow as any).account_id),
+        accScope
+      ).maybeSingle();
 
       if (!r.error) account = r.data ?? null;
     }
@@ -6673,13 +6721,11 @@ router.post("/opportunities", async (req, res) => {
 
     // 2) Resolve or create account by name
     if (accountName) {
-      const acctOrgId = await resolveAccountOrgId(req, requester);
-      const existingAccount = await supa
-        .from("crm_accounts")
-        .select("id")
-        .eq("org_id", acctOrgId)
-        .eq("name", accountName)
-        .maybeSingle();
+      const acctScope = await resolveAccountScope(req, requester);
+      const existingAccount = await scopeAccountsQuery<any>(
+        supa.from("crm_accounts").select("id").eq("name", accountName),
+        acctScope
+      ).maybeSingle();
 
       if (existingAccount.error) {
         const msg = String((existingAccount.error as any)?.message ?? "").toLowerCase();
@@ -6694,10 +6740,7 @@ router.post("/opportunities", async (req, res) => {
       } else {
         const ins = await supa
           .from("crm_accounts")
-          .insert({
-            org_id: acctOrgId,
-            name: accountName,
-          })
+          .insert(accountInsertPayload(acctScope, { name: accountName }))
           .select("id")
           .maybeSingle();
 
@@ -7266,15 +7309,13 @@ router.post("/accounts", async (req, res) => {
     const body = CreateAccountSchema.parse(req.body ?? {});
     const nameNorm = body.name.trim();
 
-    // 1) Find existing by (user_id + name)
-    const acctOrgId = await resolveAccountOrgId(req, requester);
-    const ex = await supa
-      .from("crm_accounts")
-      .select("id, name, created_at")
-      .eq("org_id", acctOrgId)
-      .eq("name", nameNorm)
-      .limit(1)
-      .maybeSingle();
+    // 1) Find existing within the requester's tenant (company once migrated,
+    //    else org), by name.
+    const acctScope = await resolveAccountScope(req, requester);
+    const ex = await scopeAccountsQuery<any>(
+      supa.from("crm_accounts").select("id, name, created_at").eq("name", nameNorm),
+      acctScope
+    ).limit(1).maybeSingle();
 
     if (ex.error) {
       const msg = String((ex.error as any)?.message ?? "").toLowerCase();
@@ -7291,7 +7332,7 @@ router.post("/accounts", async (req, res) => {
     // 2) Insert new account
     const ins = await supa
       .from("crm_accounts")
-      .insert({ org_id: acctOrgId, name: nameNorm })
+      .insert(accountInsertPayload(acctScope, { name: nameNorm }))
       .select("id, name, created_at")
       .maybeSingle();
 
@@ -7397,14 +7438,10 @@ router.post("/accounts/create", async (req, res) => {
 
     // Best-effort: if you later add unique (user_id, domain) or (user_id, name), we can upsert.
     // For now: create + return.
-    const acctOrgId = await resolveAccountOrgId(req, requester);
+    const acctScope = await resolveAccountScope(req, requester);
     const ins = await supa
       .from("crm_accounts")
-      .insert({
-        org_id: acctOrgId,
-        name: body.name,
-        domain: body.domain ?? null,
-      })
+      .insert(accountInsertPayload(acctScope, { name: body.name, domain: body.domain ?? null }))
       .select("id, name, domain")
       .single();
 
