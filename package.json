@@ -50,6 +50,7 @@
     "validate:intelligence-runtime": "tsx scripts/validate-intelligence-runtime-day-221.ts",
     "validate:intelligence-runtime-live": "tsx scripts/validate-intelligence-runtime-live-day-222.ts",
     "validate:ufc-intelligence-seed": "tsx scripts/validate-ufc-intelligence-seed.ts",
+    "validate:ufc-objection-seed": "tsx scripts/validate-ufc-objection-seed.ts",
     "validate:intelligence-objections": "tsx scripts/validate-intelligence-objections-day-236.ts",
     "validate:rep-stage-trends": "tsx scripts/validate-rep-stage-trends-day-238.ts",
     "validate:schema-selects": "tsx scripts/validate-schema-selects.ts",

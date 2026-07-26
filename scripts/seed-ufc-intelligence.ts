@@ -15,6 +15,9 @@
  *      rubric._meta carries genuine provenance — this is the call that shows
  *      "Scored with UFC Sales Scorecard v1 · Company context v1 applied" on
  *      /calls/[id].
+ *   4. Day 252 — a small set of manager-APPROVED Objection Library items (the
+ *      third Intelligence pillar) so /intelligence?tab=objections is not empty
+ *      in the demo. Data only: nothing in any runtime reads these.
  *
  * The Nate Diaz hero call is NEVER touched: it stays at 45 with no provenance,
  * which is exactly the calm default state Day 223 renders for pre-Day-221 calls.
@@ -75,6 +78,11 @@ const DRY_RUN = process.argv.includes("--dry-run");
 const DEMO_COMPANY_ID = process.env.DEMO_COMPANY_ID || "bfb9604e-bc2f-46fa-be97-6461e98e1a19";
 const DANA_EMAIL = "dana.white@ufcelite.demo";
 const SEED_TAG = "ufc-intelligence";
+
+// Deterministic approval timestamp so re-running the seed is byte-identical
+// and the whole Intelligence pillar reads as approved on the same demo date
+// the context was published ("Published 19 Jul 2026").
+export const SEED_APPROVED_AT = "2026-07-19T12:00:00.000Z";
 
 export const SCORECARD_NAME = "UFC Sales Scorecard";
 
@@ -198,6 +206,159 @@ export const CRITERIA = [
 ];
 
 // ---------------------------------------------------------------------------
+// Objection Library — the third Intelligence pillar (Day 236 data layer +
+// Day 250/251 WEB MVP). A small, high-quality set of manager-APPROVED
+// buyer-pushback guidance so /intelligence?tab=objections is not empty in the
+// demo. Categories must be from the API's fixed set (price/timing/authority/
+// trust/competitor/fit/logistics/other). Every item is complete enough to be
+// approved: label + category + ≥1 buyer phrase + approved response + a
+// coaching note. Nothing here couples to scoring, Whisperer or sparring.
+// ---------------------------------------------------------------------------
+export type SeedObjection = {
+  key: string;
+  label: string;
+  category: string;
+  buyer_phrases: string[];
+  approved_response: string;
+  weak_response_patterns: string[];
+  no_go_language: string[];
+  coaching_note: string;
+};
+
+export const OBJECTIONS: SeedObjection[] = [
+  {
+    key: "too-expensive",
+    label: "Too expensive",
+    category: "price",
+    buyer_phrases: ["That's too expensive", "Your price is too high", "We don't have the budget"],
+    approved_response:
+      "Acknowledge the concern, re-anchor to the cost of missed conversions and rep inconsistency, then ask which outcome matters most: lower cost today or higher conversion over the next quarter.",
+    weak_response_patterns: ["Discounting immediately", "Defending the price", 'Saying "but it\'s AI"'],
+    no_go_language: ["It's cheap compared to hiring", "You can't afford not to"],
+    coaching_note: "Coach the rep to connect price back to revenue leakage and manager visibility.",
+  },
+  {
+    key: "need-to-think",
+    label: "Need to think about it",
+    category: "timing",
+    buyer_phrases: ["I need to think about it", "Let me sleep on it", "I'll come back to you"],
+    approved_response:
+      "Respect the pause, then ask what specifically they need to think through: fit, cost, implementation, or internal buy-in.",
+    weak_response_patterns: [
+      "Accepting the stall with no next step",
+      "Sending a vague follow-up",
+      "Pushing harder without diagnosing the concern",
+    ],
+    no_go_language: ["What's there to think about?", "This offer won't be here forever"],
+    coaching_note: "Coach the rep to turn vague delay into a named decision blocker.",
+  },
+  {
+    key: "send-info",
+    label: "Send me more information",
+    category: "timing",
+    buyer_phrases: ["Can you send me some info?", "Just email me the details", "Send over a deck"],
+    approved_response:
+      "Agree to send a summary, then ask what they want the information to help them decide and book a specific follow-up.",
+    weak_response_patterns: [
+      "Sending information without a meeting",
+      "Ending the call too quickly",
+      "Not qualifying the decision criteria",
+    ],
+    no_go_language: ["Sure, I'll send everything over", "Have a read and let me know"],
+    coaching_note: "Coach the rep to keep control of the next step.",
+  },
+  {
+    key: "speak-with-partner",
+    label: "Need to speak with my partner",
+    category: "authority",
+    buyer_phrases: [
+      "I need to speak with my partner",
+      "I need to run this by my manager",
+      "I need to check with the team",
+    ],
+    approved_response:
+      "Acknowledge the need for buy-in, then ask who else is involved and what they will care about most.",
+    weak_response_patterns: [
+      "Treating it as a final no",
+      "Failing to map the decision group",
+      "Not offering to join the next conversation",
+    ],
+    no_go_language: ["You can decide this yourself", "Just convince them"],
+    coaching_note: "Coach the rep to identify stakeholders and create a multi-person next step.",
+  },
+  {
+    key: "already-have-training",
+    label: "We already have training",
+    category: "competitor",
+    buyer_phrases: [
+      "We already have sales training",
+      "We have a manager coaching calls already",
+      "We use another tool for this",
+    ],
+    approved_response:
+      "Position Gravix as reinforcement and visibility, not a replacement. Ask how consistently coaching happens today and how managers know it is working.",
+    weak_response_patterns: [
+      "Attacking the existing solution",
+      "Pretending Gravix replaces managers",
+      "Ignoring the current process",
+    ],
+    no_go_language: ["Your current training probably isn't working", "This replaces your manager"],
+    coaching_note: "Coach the rep to uncover gaps in consistency, speed, and accountability.",
+  },
+  {
+    key: "not-right-time",
+    label: "Not the right time",
+    category: "timing",
+    buyer_phrases: ["Now isn't the right time", "Maybe next quarter", "We're too busy right now"],
+    approved_response:
+      "Acknowledge timing, then ask what needs to change before it becomes the right time and whether the current problem is costing them while they wait.",
+    weak_response_patterns: [
+      "Accepting next quarter with no date",
+      "Failing to quantify urgency",
+      "Ending without a reactivation plan",
+    ],
+    no_go_language: ["There's never a perfect time", "You're making excuses"],
+    coaching_note: "Coach the rep to create a timed re-entry point and quantify delay cost.",
+  },
+  {
+    key: "distrust-ai",
+    label: "I don't trust AI coaching",
+    category: "trust",
+    buyer_phrases: [
+      "I don't trust AI to coach my team",
+      "AI feedback can be generic",
+      "How do I know it's accurate?",
+    ],
+    approved_response:
+      "Agree that generic AI feedback is not enough, then explain that Gravix uses company context, scorecards, evidence, and manager-controlled standards.",
+    weak_response_patterns: ["Overpromising accuracy", "Dismissing the concern", 'Saying "AI is the future"'],
+    no_go_language: ["The AI is always right", "Managers won't need to check it"],
+    coaching_note: "Coach the rep to position AI as evidence-based support, not unchecked authority.",
+  },
+  {
+    key: "team-fit",
+    label: "Not sure it fits our team",
+    category: "fit",
+    buyer_phrases: [
+      "I'm not sure this fits our team",
+      "Our sales process is different",
+      "We're not a typical sales team",
+    ],
+    approved_response:
+      "Agree that fit matters, then ask what makes their process different and show how Context and Scorecards adapt the review to their standards.",
+    weak_response_patterns: ["Forcing a generic pitch", "Ignoring their process", "Claiming it works for everyone"],
+    no_go_language: ["Every sales team is basically the same", "It works out of the box for anyone"],
+    coaching_note: "Coach the rep to use difference as a discovery path, not an objection to overcome blindly.",
+  },
+];
+
+// Deterministic id per objection (same uid scheme as the other seeded assets),
+// so re-running upserts the same rows and never duplicates.
+export function objectionId(key: string): string {
+  return uid("UFC_INTEL", `objection-${key}`);
+}
+
+// ---------------------------------------------------------------------------
 // Proof call — a real-looking demo call that exercises the scorecard.
 // ---------------------------------------------------------------------------
 // Day 172 demo convention: the human-facing label lives in calls.filename —
@@ -287,6 +448,7 @@ async function main() {
     console.log(`  Would publish context v1 (${compiled.length} chars compiled).`);
     console.log(`  Would activate "${SCORECARD_NAME}" v1 with ${CRITERIA.length} criteria.`);
     console.log(`  Would seed + score proof call ${IDS.proofCall} ("${PROOF_CALL_TITLE}").`);
+    console.log(`  Would seed ${OBJECTIONS.length} approved objections (${[...new Set(OBJECTIONS.map((o) => o.category))].sort().join(", ")}).`);
     console.log("\n  Dry run — nothing written.");
     return;
   }
@@ -447,6 +609,37 @@ async function main() {
   }
   console.log(`  ✓ Proof call scored ${scored.overall}/100 — "${PROOF_CALL_TITLE}"`);
   console.log(`      _meta: ${meta.scorecard_name} v${meta.scorecard_version} · ${meta.scorecard_source} · context v${meta.context_version}`);
+
+  // ── 4. Objection Library — approved buyer-pushback guidance ───────────────
+  // Upsert on the deterministic id: re-running refreshes the same rows and
+  // never duplicates. Nothing is deleted, so manager-created objections (and
+  // the Day 251 archived QA item) are left untouched — the unique live-label
+  // index only bites if a manager separately created a LIVE item with one of
+  // these labels, which the demo company never does.
+  const objectionRows = OBJECTIONS.map((o) => ({
+    id: objectionId(o.key),
+    company_id: DEMO_COMPANY_ID,
+    label: o.label,
+    category: o.category,
+    status: "approved",
+    buyer_phrases: o.buyer_phrases,
+    why_it_matters: null,
+    approved_response: o.approved_response,
+    weak_response_patterns: o.weak_response_patterns,
+    no_go_language: o.no_go_language,
+    coaching_note: o.coaching_note,
+    created_by: dana,
+    updated_by: dana,
+    approved_by: dana,
+    approved_at: SEED_APPROVED_AT,
+    updated_at: SEED_APPROVED_AT,
+  }));
+  const { error: objErr } = await supa
+    .from("objection_library_items")
+    .upsert(objectionRows, { onConflict: "id" });
+  if (objErr) throw new Error(`objection seed failed: ${objErr.message}`);
+  const cats = [...new Set(OBJECTIONS.map((o) => o.category))].sort();
+  console.log(`  ✓ Objection Library: ${OBJECTIONS.length} approved objections (${cats.join(", ")})`);
 
   console.log("\n  UFC Intelligence seed complete.");
   console.log(`  Review the proof call at /calls/${IDS.proofCall}`);
