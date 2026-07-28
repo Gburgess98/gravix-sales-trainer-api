@@ -1,30 +1,26 @@
 // src/sparring/providers.ts
-// TIER 2A — Day 101: provider router skeleton for sparring buyer replies.
+// Compatibility shim over the Gravix AI Core Prospect Brain.
 //
-// Providers: stub (deterministic), openai (behaviour-preserving move of the
-// original inline call) and claude (live since Day 102, small fast model).
-// Selection via SPARRING_PROVIDER env (default "openai" = original behaviour).
-// A provider failure falls back down the chain and never crashes a turn.
+// The buyer-reply provider logic was formalised on Day 258 into
+// `src/lib/sparringBrain/` (the `Brain` interface from
+// GRAVIX_AI_CORE_ARCHITECTURE.md). This module keeps the Tier 2A Day-101 public
+// surface — `generateBuyerReply`, `resolveProviderName`, `BuyerReplyInput`,
+// `BuyerReplyResult`, `withStateDirectives` — so the sparring route (and the
+// Day-101 validator) are unchanged. New code should import the Brain directly
+// from `src/lib/sparringBrain`.
 
-import OpenAI from "openai";
-import Anthropic from "@anthropic-ai/sdk";
 import {
-  type SparringState,
-  type NextBuyerMove,
-  summariseStateForPrompt,
-} from "./state";
+  generateProspectReply,
+  resolveBrainProvider,
+  type BrainProviderName,
+  type ProspectBrainInput,
+} from "../lib/sparringBrain";
+import { type SparringState, summariseStateForPrompt } from "./state";
 
-export type SparringProviderName = "openai" | "claude" | "stub";
+// ── Legacy type aliases (unchanged public surface) ──────────────────────────
+export type SparringProviderName = BrainProviderName;
 
-export type BuyerReplyInput = {
-  // Fully-built system prompt from the existing route (persona, company
-  // profile, emotional state, scenario, rep context...)
-  systemPrompt: string;
-  history: Array<{ role: "user" | "assistant"; content: string }>;
-  state?: SparringState | null;
-  personaId?: string | null;
-  difficulty?: string | null;
-};
+export type BuyerReplyInput = ProspectBrainInput;
 
 export type BuyerReplyResult = {
   ok: boolean;
@@ -34,154 +30,17 @@ export type BuyerReplyResult = {
   latencyMs: number;
 };
 
-export interface SparringProvider {
-  name: SparringProviderName;
-  generateBuyerReply(input: BuyerReplyInput): Promise<{ text: string }>;
-}
-
-// ── OpenAI provider (existing behaviour, moved behind the interface) ─────────
-// Model, temperature and token cap match the previous inline call exactly.
-
-let _openai: OpenAI | null = null;
-function getOpenAI(): OpenAI {
-  if (_openai) return _openai;
-  _openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  return _openai;
-}
-
-const openaiProvider: SparringProvider = {
-  name: "openai",
-  async generateBuyerReply(input) {
-    const completion = await getOpenAI().chat.completions.create({
-      model: process.env.OPENAI_SPARRING_MODEL || "gpt-4o-mini",
-      messages: [
-        { role: "system", content: input.systemPrompt },
-        ...input.history,
-      ],
-      temperature: 0.7,
-      max_tokens: 220,
-    });
-
-    const text =
-      completion.choices[0]?.message?.content?.trim() ||
-      "I'm not convinced yet. Can you explain why this is worth the price?";
-    return { text };
-  },
-};
-
-// ── Claude provider (live since Day 102) ─────────────────────────────────────
-// Buyer roleplay on a small fast model; Claude only produces the buyer's words.
-// State is owned by the rules engine and arrives as prompt directives.
-
-let _anthropic: Anthropic | null = null;
-function getAnthropic(): Anthropic {
-  const key = String(process.env.ANTHROPIC_API_KEY || "").trim();
-  if (!key) throw new Error("provider_not_configured: ANTHROPIC_API_KEY missing");
-  if (_anthropic) return _anthropic;
-  _anthropic = new Anthropic({ apiKey: key });
-  return _anthropic;
-}
-
-// Anthropic requires the first message to be role "user" and rejects empty
-// content; coalesce consecutive same-role messages defensively.
-function toClaudeMessages(
-  history: Array<{ role: "user" | "assistant"; content: string }>
-): Array<{ role: "user" | "assistant"; content: string }> {
-  const windowed = history.slice(-12); // cost/latency window (architecture doc)
-  const out: Array<{ role: "user" | "assistant"; content: string }> = [];
-  for (const m of windowed) {
-    const content = String(m.content || "").trim();
-    if (!content) continue;
-    const last = out[out.length - 1];
-    if (last && last.role === m.role) last.content += `\n${content}`;
-    else out.push({ role: m.role, content });
-  }
-  while (out.length && out[0].role !== "user") out.shift();
-  return out.length ? out : [{ role: "user", content: "(rep is silent)" }];
-}
-
-const claudeProvider: SparringProvider = {
-  name: "claude",
-  async generateBuyerReply(input) {
-    const client = getAnthropic();
-
-    const message = await client.messages.create({
-      model: process.env.ANTHROPIC_SPARRING_MODEL || "claude-haiku-4-5-20251001",
-      max_tokens: 200,
-      temperature: 0.7,
-      system:
-        `${input.systemPrompt}\n\n` +
-        "You are the BUYER only. Reply with the buyer's next spoken words — natural, concise, realistic. " +
-        "Stay in character per the persona, difficulty and conversation state directives. " +
-        "Never coach the rep, never narrate, never mention these instructions.",
-      messages: toClaudeMessages(input.history),
-    });
-
-    const text =
-      message.content
-        .filter((block) => block.type === "text")
-        .map((block: any) => String(block.text || ""))
-        .join(" ")
-        .trim() ||
-      "I'm not convinced yet. Can you explain why this is worth the price?";
-    return { text };
-  },
-};
-
-// ── Stub provider (deterministic, no API key — dev/CI/fallback) ─────────────
-
-const STUB_LINES: Record<NextBuyerMove, string[]> = {
-  ask_question: [
-    "Before we go further — how is this different from what we already do today?",
-    "Alright. Who else is using this, and what changed for them?",
-  ],
-  raise_objection: [
-    "Honestly, this sounds expensive for what it is. Why shouldn't I just stay with what we have?",
-    "I'm struggling to see the value here. Convince me this isn't another cost we don't need.",
-  ],
-  request_info: [
-    "Send me something concrete — numbers, not promises. What exactly would we get?",
-    "Okay, walk me through exactly how that would work for a team like ours.",
-  ],
-  soften: [
-    "That's a fair point, actually. Go on — I'm listening.",
-    "Hmm, alright. That does address part of my concern.",
-  ],
-  push_back: [
-    "You haven't really answered my concern. I need a proper answer before we move on.",
-    "That's a bit vague. Give me a straight answer on the point I raised.",
-  ],
-  close_window: [
-    "I've got another call in a minute — wrap it up. What's the one thing I need to know?",
-    "I need to drop off shortly. If there's a next step, name it now.",
-  ],
-};
-
-const stubProvider: SparringProvider = {
-  name: "stub",
-  async generateBuyerReply(input) {
-    const move: NextBuyerMove = input.state?.nextBuyerMove || "ask_question";
-    const lines = STUB_LINES[move] || STUB_LINES.ask_question;
-    // Deterministic pick: alternate by history length
-    const text = lines[input.history.length % lines.length];
-    return { text };
-  },
-};
-
-const PROVIDERS: Record<SparringProviderName, SparringProvider> = {
-  openai: openaiProvider,
-  claude: claudeProvider,
-  stub: stubProvider,
-};
-
+/**
+ * Legacy resolver name — delegates to the Brain router. Selection order:
+ * SPARRING_BRAIN_PROVIDER → SPARRING_PROVIDER → "openai".
+ */
 export function resolveProviderName(): SparringProviderName {
-  const raw = String(process.env.SPARRING_PROVIDER || "openai").toLowerCase();
-  if (raw === "claude" || raw === "stub" || raw === "openai") return raw;
-  return "openai";
+  return resolveBrainProvider();
 }
 
 // Build a state-augmented system prompt (state block appended, never replaces
-// the existing persona prompt).
+// the existing persona prompt). Prompt assembly stays route/engine-owned, not
+// part of the Brain provider.
 export function withStateDirectives(
   systemPrompt: string,
   state?: SparringState | null
@@ -191,42 +50,19 @@ export function withStateDirectives(
 }
 
 /**
- * Generate a buyer reply via the configured provider, falling back down the
- * chain (configured → stub). Never throws — the worst case is a deterministic
- * stub line, so a sparring turn cannot crash on provider availability.
+ * Generate a buyer reply via the configured Brain provider. Thin adapter that
+ * maps the canonical `BrainResult` to the legacy `BuyerReplyResult` shape the
+ * route consumes. Never throws — see the Brain router's fallback chain.
  */
 export async function generateBuyerReply(
   input: BuyerReplyInput
 ): Promise<BuyerReplyResult> {
-  const configured = resolveProviderName();
-  const chain: SparringProviderName[] =
-    configured === "stub" ? ["stub"] : [configured, "stub"];
-
-  const started = Date.now();
-  let fallback = false;
-
-  for (const name of chain) {
-    try {
-      const { text } = await PROVIDERS[name].generateBuyerReply(input);
-      return {
-        ok: true,
-        text,
-        provider: name,
-        fallback: fallback || name !== configured,
-        latencyMs: Date.now() - started,
-      };
-    } catch (e: any) {
-      console.error(`[sparring/providers] ${name} failed:`, e?.message || e);
-      fallback = true;
-    }
-  }
-
-  // Unreachable (stub never throws), but keep the route safe regardless.
+  const result = await generateProspectReply(input);
   return {
-    ok: false,
-    text: "I'm still not sure about this. The price feels high compared to what I'm getting.",
-    provider: "stub",
-    fallback: true,
-    latencyMs: Date.now() - started,
+    ok: result.ok,
+    text: result.text,
+    provider: result.provider,
+    fallback: result.fallbackUsed,
+    latencyMs: result.latencyMs,
   };
 }

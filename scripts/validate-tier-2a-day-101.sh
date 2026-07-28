@@ -6,6 +6,10 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STATE="$ROOT/src/sparring/state.ts"
 PROVIDERS="$ROOT/src/sparring/providers.ts"
 ROUTE="$ROOT/src/routes/sparring.ts"
+# Day 258: the buyer-reply providers were formalised into the AI Core Brain
+# module. providers.ts remains as a compatibility shim; the provider definitions
+# (openai/claude/stub) and env resolution now live here.
+BRAIN="$ROOT/src/lib/sparringBrain"
 
 fail=0
 check() {
@@ -28,13 +32,13 @@ grep -q "export function clampState" "$STATE" 2>/dev/null && \
 grep -q "export function summariseStateForPrompt" "$STATE" 2>/dev/null
 check "stage/objection/clamp/prompt helpers exist" $?
 
-grep -q '"openai"' "$PROVIDERS" 2>/dev/null && grep -q '"claude"' "$PROVIDERS" 2>/dev/null && grep -q '"stub"' "$PROVIDERS" 2>/dev/null
+grep -rq '"openai"' "$BRAIN" 2>/dev/null && grep -rq '"claude"' "$BRAIN" 2>/dev/null && grep -rq '"stub"' "$BRAIN" 2>/dev/null
 check "providers openai/claude/stub exist" $?
 
-grep -q "SPARRING_PROVIDER" "$PROVIDERS" 2>/dev/null
+grep -rq "SPARRING_PROVIDER" "$BRAIN" 2>/dev/null
 check "SPARRING_PROVIDER env referenced" $?
 
-grep -q "provider_not_configured" "$PROVIDERS" 2>/dev/null
+grep -rq "provider_not_configured" "$BRAIN" 2>/dev/null
 check "claude returns not_configured (Day 102 pending)" $?
 
 grep -q "'/sessions/:id/messages'" "$ROUTE" 2>/dev/null
