@@ -72,28 +72,29 @@ async function main() {
   const openaiLib = read("src/lib/openai.ts");
   check("scoring AI_MODEL default is gpt-4o-mini", /AI_MODEL\s*=\s*process\.env\.AI_MODEL\s*\|\|\s*["']gpt-4o-mini["']/.test(openaiLib));
 
-  // ── Scoring-stub honesty: env must not exist, doc must not claim it live ───
-  const scoringStubEnvInCode =
-    /process\.env\.SCORING_PROVIDER/.test(read("src/lib/scoring.ts")) ||
-    /process\.env\.SCORING_MODE\b/.test(read("src/lib/scoring.ts"));
-  check("SCORING_PROVIDER/SCORING_MODE env is genuinely absent from code", scoringStubEnvInCode === false);
+  // ── Scoring-stub reality (Day 261): SCORING_PROVIDER=stub is implemented ────
+  const scoringSrc = read("src/lib/scoring.ts");
+  const scoringProviderEnvWired = /process\.env\.SCORING_PROVIDER/.test(scoringSrc);
+  check("SCORING_PROVIDER scoring switch is wired in code", scoringProviderEnvWired === true);
+  check("no SCORING_MODE env crept in (SCORING_PROVIDER is the switch)", /process\.env\.SCORING_MODE\b/.test(scoringSrc) === false);
 
   // ── Docs: AI_PROVIDER_CONFIG.md content assertions ─────────────────────────
   const doc = read("AI_PROVIDER_CONFIG.md").toLowerCase();
 
   check("doc explains Claude app vs Anthropic API billing separation",
     (doc.includes("claude app") || doc.includes("claude.ai")) && doc.includes("console") && doc.includes("credit"));
-  check("doc includes a no-cost QA mode with stub", doc.includes("no-cost qa") && doc.includes("sparring_brain_provider=stub"));
+  check("doc includes a no-cost QA mode with stub brain + stub scoring",
+    doc.includes("no-cost qa") && doc.includes("sparring_brain_provider=stub") && doc.includes("scoring_provider=stub"));
   check("doc states OpenAI is the default/baseline", doc.includes("openai") && doc.includes("default"));
   check("doc does NOT claim Claude is the default or live-proven",
     !/claude[^\n]*\b(is (the )?default|is now default|proven live|live-proven)\b/.test(doc));
 
-  // Doc must present SCORING_PROVIDER=stub as future, never as implemented — only
-  // enforced while the env is genuinely absent from code (kept honest together).
-  if (scoringStubEnvInCode === false) {
-    const claimsImplemented = /scoring_provider=stub[^\n]*\b(implemented|available|supported|works today|is wired)\b/.test(doc);
-    check("doc does NOT claim SCORING_PROVIDER=stub is implemented", claimsImplemented === false);
-    check("doc lists SCORING_PROVIDER=stub under future/not-implemented", doc.includes("scoring_provider=stub") && (doc.includes("future") || doc.includes("not implemented")));
+  // Docs and code must agree: if the env is wired, the doc must present stub as a
+  // real option, not park it under "future / not implemented".
+  if (scoringProviderEnvWired) {
+    const docBody = read("AI_PROVIDER_CONFIG.md");
+    const futureSectionParksStub = /SCORING_PROVIDER=stub[^\n]*\b(NOT implemented|not wired|Proposed Day)\b/.test(docBody);
+    check("doc does NOT still park SCORING_PROVIDER=stub as unimplemented", futureSectionParksStub === false);
   }
 
   // ── Sanity: default provider export unchanged in code ──────────────────────

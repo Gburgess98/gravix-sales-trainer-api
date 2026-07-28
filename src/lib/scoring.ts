@@ -908,6 +908,34 @@ export function heuristicScoreFallback(): LlmScore {
   };
 }
 
+// --- SCORING PROVIDER (Day 261) ---
+// A first-class no-cost scoring switch, separate from the sparring Brain. The
+// default path is unchanged (OpenAI); the `stub` provider makes NO paid LLM call
+// and returns a deterministic score. It only governs whether a paid model is
+// called — persistence side effects remain gated by SKIP_SCORING_SIDE_EFFECTS.
+export type ScoringProviderName = "openai" | "stub";
+
+export const STUB_SCORING_MODEL = "stub:v1";
+
+/**
+ * Resolve the scoring provider from SCORING_PROVIDER. Default "openai";
+ * anything other than "stub" (unset, invalid, empty) resolves to "openai" so a
+ * misconfiguration never silently disables real scoring in production.
+ */
+export function resolveScoringProvider(): ScoringProviderName {
+  const raw = String(process.env.SCORING_PROVIDER || "openai").trim().toLowerCase();
+  return raw === "stub" ? "stub" : "openai";
+}
+
+/**
+ * Deterministic, no-LLM score marked as the stub provider. Reuses the existing
+ * heuristic fallback body (fixed four-stage shape) and stamps the stub model so
+ * provenance is unambiguous. No OpenAI/Anthropic call, no API key required.
+ */
+export function buildStubScore(): LlmScore {
+  return { ...heuristicScoreFallback(), model: STUB_SCORING_MODEL };
+}
+
 // --- SCORING THRESHOLD HELPERS ---
 async function getScoringThresholds(supabase: SupabaseClient): Promise<{
   low: number;
@@ -1905,30 +1933,45 @@ ${knowledge.playbookText || "None"}
 Relevant rep memory:
 ${knowledge.repMemoryText || "None"}${contextBlock}`;
 
-    const openai = getOpenAI();
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), OPENAI_TIMEOUT_MS);
+    // Day 261 — scoring provider switch. Default "openai" is byte-identical to
+    // the previous behaviour; "stub" skips the paid LLM call entirely and uses a
+    // deterministic heuristic-derived score. Side effects stay gated by
+    // SKIP_SCORING_SIDE_EFFECTS below (this switch only prevents paid calls).
+    const scoringProvider = resolveScoringProvider();
 
-    const llmStart = Date.now();
-    const resp = await openai.chat.completions.create(
-      {
-        model: AI_MODEL,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user },
-        ],
-        response_format: { type: "json_schema", json_schema: JSON_SCHEMA as any },
-        temperature: 0,
-      },
-      { signal: ctrl.signal }
-    );
-    clearTimeout(timer);
-    console.log("[perf] llm_ms", Date.now() - llmStart, { callId });
+    let validated: Omit<LlmScore, "voice">;
+    let scoredModel: string;
+    if (scoringProvider === "stub") {
+      validated = buildStubScore();
+      scoredModel = STUB_SCORING_MODEL;
+    } else {
+      const openai = getOpenAI();
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), OPENAI_TIMEOUT_MS);
 
-    const raw = resp.choices?.[0]?.message?.content;
-    if (!raw) throw new Error("no_model_content");
+      const llmStart = Date.now();
+      const resp = await openai.chat.completions.create(
+        {
+          model: AI_MODEL,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user },
+          ],
+          response_format: { type: "json_schema", json_schema: JSON_SCHEMA as any },
+          temperature: 0,
+        },
+        { signal: ctrl.signal }
+      );
+      clearTimeout(timer);
+      console.log("[perf] llm_ms", Date.now() - llmStart, { callId });
 
-    const validated = parseAndValidateScoreResponse(raw);
+      const raw = resp.choices?.[0]?.message?.content;
+      if (!raw) throw new Error("no_model_content");
+
+      validated = parseAndValidateScoreResponse(raw);
+      scoredModel = AI_MODEL;
+    }
+
     const voice = computeVoiceScore(
       deterministic.transcript,
       (call as any)?.duration_sec ?? null
@@ -1936,9 +1979,15 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
     const thresholds = await getScoringThresholds(supabase);
     const parsed: LlmScore = {
       ...validated,
-      model: AI_MODEL,
+      model: scoredModel,
       voice,
     };
+
+    // Provider-aware model version for provenance (openai path unchanged).
+    const scoringModelVersion =
+      scoringProvider === "stub"
+        ? `${STUB_SCORING_MODEL}:${SCORING_PROMPT_VERSION}:${RUBRIC_VERSION}`
+        : SCORING_MODEL_VERSION;
 
     const transcriptSegments = cleanedSegments;
 
@@ -1980,12 +2029,13 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
       callSha256: ((call as any)?.sha256 as string | null) ?? null,
       transcriptHash: deterministic.transcriptHash,
       transcriptPresent: Boolean(deterministic.transcript),
-      modelVersion: SCORING_MODEL_VERSION,
+      modelVersion: scoringModelVersion,
       resolvedContext,
       resolvedScorecard,
     });
 
     (rubric as any)._meta.voice = voice;
+    (rubric as any)._meta.scoring_provider = scoringProvider;
 
     // Persist latest on calls
     const dbWriteStart = Date.now();
@@ -2011,14 +2061,14 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
           segments: cleanedSegments,
         },
       },
-      ai_model: SCORING_MODEL_VERSION,
+      ai_model: scoringModelVersion,
       rubric_version: RUBRIC_VERSION,
       scored_at: new Date().toISOString(),
     });
 
     console.log("[perf] db_write_ms", Date.now() - dbWriteStart, { callId, path: "llm" });
     // History row (non-blocking)
-    await writeScoreHistory(supabase, callId, SCORING_MODEL_VERSION, parsed.overall, rubric);
+    await writeScoreHistory(supabase, callId, scoringModelVersion, parsed.overall, rubric);
 
     await writeScoreCache(supabase, {
       cacheKey: deterministic.key,

@@ -60,23 +60,33 @@ concern from the sparring brain and is configured independently.
 
 | Env | Meaning | Default |
 |---|---|---|
+| `SCORING_PROVIDER` | scoring provider select: `openai` \| `stub` (Day 261) | `openai` |
 | `OPENAI_API_KEY` | required for the live scoring LLM call (and embeddings) | — |
 | `AI_MODEL` | **the actual scoring model env** | `gpt-4o-mini` |
 | `OPENAI_TIMEOUT_MS` | scoring LLM timeout | `8000` |
 | `SKIP_SCORING_SIDE_EFFECTS` | when `=1`, skips a **subset** of scoring persistence side effects | off |
 
+- **`SCORING_PROVIDER` (Day 261, implemented):** `openai` (default) is the
+  unchanged production path. `stub` makes **no** paid LLM call and returns a
+  deterministic score (`buildStubScore()` → model tag **`stub:v1`**), stamped in
+  `rubric._meta.scoring_provider`. Anything other than `stub` (unset, invalid)
+  resolves to `openai`, so a misconfiguration never silently disables real
+  scoring. **This switch only prevents paid calls** — it does *not* skip DB /
+  Slack / assignment side effects; those stay gated by `SKIP_SCORING_SIDE_EFFECTS`
+  (see §5).
 - Scoring runs `gpt-4o-mini` at `temperature: 0` (deterministic) against a JSON
   schema.
-- **No-cost degrade:** if the LLM call fails — including when `OPENAI_API_KEY` is
-  missing — scoring falls back to `heuristicScoreFallback()` (model tag
-  `heuristic:v1`), a pure no-LLM heuristic. So scoring **degrades**, it does not
-  hard-crash, when OpenAI is unavailable.
+- **No-cost degrade (still present):** even on the `openai` path, if the LLM call
+  fails — including when `OPENAI_API_KEY` is missing — scoring falls back to
+  `heuristicScoreFallback()` (model tag `heuristic:v1`). `stub` is the *explicit*
+  no-cost switch; the heuristic fallback is the *implicit* safety net.
 - `callLLM()` in `src/lib/llm.ts` and embeddings (`src/lib/embeddings.ts`) also
   use OpenAI; embeddings need `OPENAI_API_KEY`.
 
-> **Naming note (do not confuse):** the scoring model env is **`AI_MODEL`**, not
-> `SCORING_MODEL`. There is **no** `SCORING_MODEL`, `SCORING_PROVIDER`, or
-> `SCORING_MODE` env in the code today (see Future).
+> **Naming note (do not confuse):** the scoring *model* env is **`AI_MODEL`**, not
+> `SCORING_MODEL` — there is still no `SCORING_MODEL` env. The scoring *provider*
+> env is **`SCORING_PROVIDER`** (`openai`|`stub`, Day 261). There is no
+> `SCORING_MODE` env.
 
 ### 2.3 No voice providers in brain/scoring
 
@@ -109,19 +119,21 @@ production baseline.
 
 ```
 SPARRING_BRAIN_PROVIDER=stub
+SCORING_PROVIDER=stub
 SKIP_SCORING_SIDE_EFFECTS=1
 # OPENAI_API_KEY may be ABSENT
 # ANTHROPIC_API_KEY may be ABSENT
 ```
 
 - Sparring brain → deterministic `stub`, no LLM, no key required.
-- Scoring → with no `OPENAI_API_KEY`, the live call throws and scoring degrades to
-  the `heuristic:v1` fallback (no paid call). `SKIP_SCORING_SIDE_EFFECTS=1`
-  suppresses a subset of persistence writes.
-- **Caveat (honest):** there is no first-class `SCORING_PROVIDER=stub` yet, so the
-  scoring path reaches the no-cost heuristic by *failing over* rather than by a
-  clean "stub" switch. See Future. The Day-260 validator and the Day-258 brain
-  validator both run in this keyless mode.
+- Scoring → `SCORING_PROVIDER=stub` returns a deterministic `stub:v1` score with
+  **no** paid call and no key required (Day 261) — a clean explicit switch rather
+  than failing over to the heuristic.
+- `SKIP_SCORING_SIDE_EFFECTS=1` separately suppresses a subset of persistence
+  writes. **Note:** `SCORING_PROVIDER=stub` prevents the *paid call*; it does not
+  by itself skip DB/side-effect writes — set both for a fully inert QA run. Point
+  QA at a seeded/throwaway DB, since the score cache key is provider-agnostic.
+- The Day-261, Day-260 and Day-258 validators all run in this keyless mode.
 
 ### C. Future Claude brain trial (behind the flag, not default)
 
@@ -142,9 +154,11 @@ turn passes `validate:sparring-brain-claude-parity`.
 
 ## 4. Future (NOT implemented — do not document as live)
 
-- **`SCORING_PROVIDER=stub` / a first-class scoring stub** — a clean no-cost
-  scoring switch that returns deterministic scores *and* skips the DB write,
-  instead of relying on LLM-failure → heuristic fallback. Proposed Day 261/262.
+- **`SCORING_PROVIDER=stub` — DONE (Day 261).** A first-class no-cost scoring
+  switch (see §2.2). A follow-up could let `stub` also auto-skip side effects
+  (today it only prevents paid calls; pair it with `SKIP_SCORING_SIDE_EFFECTS=1`),
+  and add a provider dimension to the score cache key so stub and openai results
+  never share a namespace. Proposed Day 262.
 - **`SCORING_MODEL` alias** — today the env is `AI_MODEL`; a rename/alias could
   align naming with `SPARRING_BRAIN_PROVIDER`. Not wired yet.
 - **Claude as default sparring brain** — gated on Console billing + live parity.
@@ -159,5 +173,12 @@ turn passes `validate:sparring-brain-claude-parity`.
 statically enforces the cost-safe invariants above: default brain resolves to
 OpenAI, the stub runs with no keys, an invalid provider never becomes Claude,
 Claude is not default, no voice imports in brain/scoring, scoring default stays
-`gpt-4o-mini`, and this doc keeps its billing-separation / no-cost-QA content and
-does not over-claim unimplemented features. It makes **no paid calls**.
+`gpt-4o-mini`, and this doc keeps its billing-separation / no-cost-QA content. It
+makes **no paid calls**.
+
+`npm run validate:scoring-provider-stub` (`scripts/validate-scoring-provider-stub-day-261.ts`)
+guards the scoring switch: default resolves `openai`, `SCORING_PROVIDER=stub`
+yields a deterministic keyless `stub:v1` score with the fixed four-stage shape,
+the stub branch makes no paid call, provenance is stamped, and
+`SKIP_SCORING_SIDE_EFFECTS` stays the independent side-effect guard. Also
+**no paid calls**.
