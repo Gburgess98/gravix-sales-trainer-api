@@ -91,6 +91,7 @@
     "validate-tier-2a-day-106": "bash scripts/validate-tier-2a-day-106.sh",
     "validate:sparring-state": "tsx scripts/validate-sparring-state.ts",
     "validate:sparring-brain-provider": "tsx scripts/validate-sparring-brain-provider-day-258.ts",
-    "validate:sparring-brain-claude-parity": "tsx scripts/validate-sparring-brain-claude-parity-day-259.ts"
+    "validate:sparring-brain-claude-parity": "tsx scripts/validate-sparring-brain-claude-parity-day-259.ts",
+    "validate:ai-provider-config": "tsx scripts/validate-ai-provider-config-day-260.ts"
   }
 }
