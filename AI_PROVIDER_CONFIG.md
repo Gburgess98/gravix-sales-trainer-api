@@ -131,9 +131,12 @@ SKIP_SCORING_SIDE_EFFECTS=1
   than failing over to the heuristic.
 - `SKIP_SCORING_SIDE_EFFECTS=1` separately suppresses a subset of persistence
   writes. **Note:** `SCORING_PROVIDER=stub` prevents the *paid call*; it does not
-  by itself skip DB/side-effect writes — set both for a fully inert QA run. Point
-  QA at a seeded/throwaway DB, since the score cache key is provider-agnostic.
-- The Day-261, Day-260 and Day-258 validators all run in this keyless mode.
+  by itself skip DB/side-effect writes — set both for a fully inert QA run.
+- **Cache isolation (Day 262):** the score cache key is namespaced by provider —
+  a `stub` score is written under a `provider=stub` segment, so stub QA can never
+  reuse or overwrite a production (`openai`) cache entry, and vice versa. The
+  `openai`/default cache namespace is unchanged (byte-identical).
+- The Day-262, Day-261, Day-260 and Day-258 validators all run in this keyless mode.
 
 ### C. Future Claude brain trial (behind the flag, not default)
 
@@ -154,11 +157,11 @@ turn passes `validate:sparring-brain-claude-parity`.
 
 ## 4. Future (NOT implemented — do not document as live)
 
-- **`SCORING_PROVIDER=stub` — DONE (Day 261).** A first-class no-cost scoring
-  switch (see §2.2). A follow-up could let `stub` also auto-skip side effects
-  (today it only prevents paid calls; pair it with `SKIP_SCORING_SIDE_EFFECTS=1`),
-  and add a provider dimension to the score cache key so stub and openai results
-  never share a namespace. Proposed Day 262.
+- **`SCORING_PROVIDER=stub` — DONE (Day 261); cache isolation DONE (Day 262).**
+  A first-class no-cost scoring switch (§2.2) whose results live in a separate
+  `provider=stub` cache namespace. A remaining follow-up could let `stub` also
+  auto-skip side effects (today it only prevents paid calls; pair it with
+  `SKIP_SCORING_SIDE_EFFECTS=1`).
 - **`SCORING_MODEL` alias** — today the env is `AI_MODEL`; a rename/alias could
   align naming with `SPARRING_BRAIN_PROVIDER`. Not wired yet.
 - **Claude as default sparring brain** — gated on Console billing + live parity.
@@ -182,3 +185,10 @@ yields a deterministic keyless `stub:v1` score with the fixed four-stage shape,
 the stub branch makes no paid call, provenance is stamped, and
 `SKIP_SCORING_SIDE_EFFECTS` stays the independent side-effect guard. Also
 **no paid calls**.
+
+`npm run validate:score-cache-provider-isolation`
+(`scripts/validate-score-cache-provider-isolation-day-262.ts`) guards the cache
+namespace: the `openai`/default key is byte-identical to the pre-Day-262 key, the
+`stub` key differs and carries a `provider=stub` segment, context/scorecard
+version segments still differentiate, and an invalid provider cannot collide with
+the stub namespace. Pure key construction — **no paid calls**.

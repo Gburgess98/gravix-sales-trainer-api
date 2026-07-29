@@ -747,6 +747,13 @@ export function buildDeterministicPromptKey(params: {
   // follow the 8-hex transcriptHash, which can never contain "|").
   contextVersion?: number | null;
   scorecardCacheKey?: string | null;
+  // Day 262 — scoring provider isolation. The default/openai provider is
+  // omitted so the production cache namespace stays byte-identical (the Day 221
+  // guarantee); only a non-default provider (stub) appends a segment. This keeps
+  // no-cost QA scores in a separate namespace that can never collide with — or
+  // pollute — production entries. Provider values ("openai"/"stub") contain no
+  // "|", so the join stays unambiguous.
+  scoringProvider?: ScoringProviderName | null;
 }) {
   const transcript = normaliseTranscriptForDeterminism(params.transcript || "");
   const transcriptHash = stableHash(transcript || params.sha256 || params.callId);
@@ -763,6 +770,9 @@ export function buildDeterministicPromptKey(params: {
   }
   if (params.scorecardCacheKey && params.scorecardCacheKey !== GRAVIX_DEFAULT_SCORECARD_KEY) {
     parts.push(`scorecard=${params.scorecardCacheKey}`);
+  }
+  if (params.scoringProvider && params.scoringProvider !== "openai") {
+    parts.push(`provider=${params.scoringProvider}`);
   }
   return {
     transcript,
@@ -1690,6 +1700,11 @@ export async function scoreWithLLM(opts: {
       : [];
     const cleanedSegments = storedSegments.length > 0 ? storedSegments : buildSegments(cleanedTranscript);
 
+    // Day 262 — resolve the scoring provider up-front so it namespaces the cache
+    // key (stub QA can never collide with production). Default "openai" is a no-op
+    // on the key, so the production namespace is unchanged.
+    const scoringProvider = resolveScoringProvider();
+
     const deterministic = buildDeterministicPromptKey({
       callId,
       filename: (call as any)?.filename ?? null,
@@ -1697,6 +1712,7 @@ export async function scoreWithLLM(opts: {
       transcript: cleanedTranscript,
       contextVersion: resolvedContext?.context_version ?? null,
       scorecardCacheKey: resolvedScorecard.cache_key,
+      scoringProvider,
     });
 
     const cached = await readScoreCache(supabase, deterministic.key);
@@ -1933,12 +1949,11 @@ ${knowledge.playbookText || "None"}
 Relevant rep memory:
 ${knowledge.repMemoryText || "None"}${contextBlock}`;
 
-    // Day 261 — scoring provider switch. Default "openai" is byte-identical to
-    // the previous behaviour; "stub" skips the paid LLM call entirely and uses a
-    // deterministic heuristic-derived score. Side effects stay gated by
-    // SKIP_SCORING_SIDE_EFFECTS below (this switch only prevents paid calls).
-    const scoringProvider = resolveScoringProvider();
-
+    // Day 261 — scoring provider switch (resolved above, Day 262). Default
+    // "openai" is byte-identical to the previous behaviour; "stub" skips the paid
+    // LLM call entirely and uses a deterministic heuristic-derived score. Side
+    // effects stay gated by SKIP_SCORING_SIDE_EFFECTS below (this switch only
+    // prevents paid calls).
     let validated: Omit<LlmScore, "voice">;
     let scoredModel: string;
     if (scoringProvider === "stub") {
