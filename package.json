@@ -94,6 +94,7 @@
     "validate:sparring-brain-claude-parity": "tsx scripts/validate-sparring-brain-claude-parity-day-259.ts",
     "validate:ai-provider-config": "tsx scripts/validate-ai-provider-config-day-260.ts",
     "validate:scoring-provider-stub": "tsx scripts/validate-scoring-provider-stub-day-261.ts",
-    "validate:score-cache-provider-isolation": "tsx scripts/validate-score-cache-provider-isolation-day-262.ts"
+    "validate:score-cache-provider-isolation": "tsx scripts/validate-score-cache-provider-isolation-day-262.ts",
+    "validate:scoring-v2-golden-dataset": "tsx scripts/validate-scoring-v2-golden-dataset.ts"
   }
 }
