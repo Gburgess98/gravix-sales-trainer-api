@@ -95,6 +95,7 @@
     "validate:ai-provider-config": "tsx scripts/validate-ai-provider-config-day-260.ts",
     "validate:scoring-provider-stub": "tsx scripts/validate-scoring-provider-stub-day-261.ts",
     "validate:score-cache-provider-isolation": "tsx scripts/validate-score-cache-provider-isolation-day-262.ts",
-    "validate:scoring-v2-golden-dataset": "tsx scripts/validate-scoring-v2-golden-dataset.ts"
+    "validate:scoring-v2-golden-dataset": "tsx scripts/validate-scoring-v2-golden-dataset.ts",
+    "validate:scoring-v2-harness": "tsx scripts/validate-scoring-v2-harness-day-266.ts"
   }
 }

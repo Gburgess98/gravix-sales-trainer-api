@@ -1,0 +1,1555 @@
+{
+  "contract": "SCORING_OUTPUT_CONTRACT_V2",
+  "dataset_version": "candidate-v1",
+  "generated_by": "test/harness/build-candidate-results.ts (deterministic; no LLM)",
+  "stage_score_projection_policy": "authoritative_v2",
+  "candidates": [
+    {
+      "call_id": "golden-001-strong-discovery",
+      "note": "authored candidate (deterministic build from golden; no LLM)",
+      "v2": {
+        "contract_version": "v2",
+        "overall_score": 83,
+        "summary": "Disciplined discovery-led call: a time-boxed agenda and credibility were set, current process, the cost of guesswork and the decision route were all uncovered, and a dated demo was booked with the decision maker. No pricing objection surfaced.",
+        "stages": [
+          {
+            "stage": "intro",
+            "score": 78,
+            "weight": 20,
+            "status": "pass",
+            "notes": "Keep leading with a time-boxed agenda and a credibility anchor before discovery.",
+            "criteria": [
+              {
+                "criterion_id": "golden-001-strong-discovery::intro::set-agenda-and-establish-credibility",
+                "label": "Set agenda and establish credibility",
+                "stage": "intro",
+                "score": 78,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "standard",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "I want to keep this to fifteen minutes: understand how you review calls at UFC Elite today, and if it's a fit, agree a next step. Sound fair?",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 0,
+                    "speaker": "rep"
+                  },
+                  {
+                    "quote": "we work with twelve combat-sports gyms on exactly this, so I've seen how messy call reviews get at your scale.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 2,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Keep leading with a time-boxed agenda and a credibility anchor before discovery.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "discovery",
+            "score": 90,
+            "weight": 30,
+            "status": "pass",
+            "notes": "Excellent: current process, cost of guesswork and the decision route were all uncovered before pitching.",
+            "criteria": [
+              {
+                "criterion_id": "golden-001-strong-discovery::discovery::uncover-pain-current-process-and-decision-route",
+                "label": "Uncover pain, current process and decision route",
+                "stage": "discovery",
+                "score": 90,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "My managers listen to a few calls when they can, but it's ad hoc.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 5,
+                    "speaker": "buyer"
+                  },
+                  {
+                    "quote": "We see the number at the end of the month and guess.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 7,
+                    "speaker": "buyer"
+                  },
+                  {
+                    "quote": "That'd be me and my operations partner, Dana. She controls the budget.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 9,
+                    "speaker": "buyer"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Excellent: current process, cost of guesswork and the decision route were all uncovered before pitching.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "objection",
+            "score": null,
+            "weight": 30,
+            "status": "not_observed",
+            "notes": "No pricing or value objection surfaced on this call; nothing to handle.",
+            "criteria": [
+              {
+                "criterion_id": "golden-001-strong-discovery::objection::isolate-price-concern-and-reframe-value",
+                "label": "Isolate price concern and reframe value",
+                "stage": "objection",
+                "score": null,
+                "status": "not_observed",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "No pricing or value objection surfaced on this call; nothing to handle.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "close",
+            "score": 78,
+            "weight": 20,
+            "status": "pass",
+            "notes": "Strong: a dated demo was secured with the named decision maker present.",
+            "criteria": [
+              {
+                "criterion_id": "golden-001-strong-discovery::close::secure-clear-next-step-and-commitment",
+                "label": "Secure clear next step and commitment",
+                "stage": "close",
+                "score": 78,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "would it make sense to get you and Dana on a short demo next Tuesday?",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 10,
+                    "speaker": "rep"
+                  },
+                  {
+                    "quote": "Tuesday works. Send the invite for 2pm.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 11,
+                    "speaker": "buyer"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Strong: a dated demo was secured with the named decision maker present.",
+                "suggested_drill": null
+              }
+            ]
+          }
+        ],
+        "objection_matches": [],
+        "confidence": {
+          "level": "high",
+          "value": 0.9
+        },
+        "degraded_score": false,
+        "degraded_reason": null,
+        "voice": {
+          "clarity": 72,
+          "confidence": 70,
+          "filler_density": 30,
+          "pace": 65,
+          "overall": 70
+        },
+        "provenance": {
+          "scoring_provider": "openai",
+          "scoring_model": "gpt-4o-mini",
+          "scorecard_source": "company_default",
+          "scorecard_id": "sc-ufc-001",
+          "scorecard_version_id": "scv-ufc-001-v1",
+          "scorecard_version": 1,
+          "context_version": 1,
+          "prompt_version": "scoring-prompt-v2",
+          "rubric_version": "v2",
+          "cache_key_version": "v2"
+        },
+        "trend_delta": 5,
+        "v1_projection": {
+          "overall": 83,
+          "summary": "Disciplined discovery-led call: a time-boxed agenda and credibility were set, current process, the cost of guesswork and the decision route were all uncovered, and a dated demo was booked with the decision maker. No pricing objection surfaced.",
+          "stages": {
+            "intro": {
+              "score": 78,
+              "notes": "Keep leading with a time-boxed agenda and a credibility anchor before discovery."
+            },
+            "discovery": {
+              "score": 90,
+              "notes": "Excellent: current process, cost of guesswork and the decision route were all uncovered before pitching."
+            },
+            "objection": {
+              "score": 83,
+              "notes": "Not assessed on this call."
+            },
+            "close": {
+              "score": 78,
+              "notes": "Strong: a dated demo was secured with the named decision maker present."
+            }
+          },
+          "moments": [
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "I want to keep this to fifteen minutes: understand how you review calls at UFC Elite today, and if it's a fit, agree a next step. Sound fair?",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "we work with twelve combat-sports gyms on exactly this, so I've seen how messy call reviews get at your scale.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "My managers listen to a few calls when they can, but it's ad hoc.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "We see the number at the end of the month and guess.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "That'd be me and my operations partner, Dana. She controls the budget.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "closing_attempt",
+              "text": "would it make sense to get you and Dana on a short demo next Tuesday?",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "closing_attempt",
+              "text": "Tuesday works. Send the invite for 2pm.",
+              "severity": "low"
+            }
+          ],
+          "suggestions": [
+            "Keep leading with a time-boxed agenda and a credibility anchor before discovery.",
+            "Excellent: current process, cost of guesswork and the decision route were all uncovered before pitching.",
+            "No pricing or value objection surfaced on this call; nothing to handle.",
+            "Strong: a dated demo was secured with the named decision maker present."
+          ],
+          "voice": {
+            "clarity": 72,
+            "confidence": 70,
+            "filler_density": 30,
+            "pace": 65,
+            "overall": 70
+          },
+          "rubric": {
+            "_meta": {
+              "rubric_version": "v2",
+              "prompt_version": "scoring-prompt-v2",
+              "model_version": "gpt-4o-mini",
+              "scoring_model_version": "gpt-4o-mini:v2:v2",
+              "scorecard_name": "UFC Sales Scorecard",
+              "scorecard_source": "company_default",
+              "context_version": 1,
+              "transcript_present": true,
+              "scoring_provider": "openai",
+              "contract_version": "v2",
+              "confidence": {
+                "level": "high",
+                "value": 0.9
+              },
+              "degraded_score": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "call_id": "golden-002-price-objection-handled",
+      "note": "authored candidate (deterministic build from golden; no LLM)",
+      "v2": {
+        "contract_version": "v2",
+        "overall_score": 82,
+        "summary": "Textbook price-objection handling: agenda and credibility set, pain and decision route uncovered, the price objection isolated with a question and reframed on recovered revenue, and a dated demo committed with the co-owner. The reference example for the objection stage.",
+        "stages": [
+          {
+            "stage": "intro",
+            "score": 78,
+            "weight": 20,
+            "status": "pass",
+            "notes": "Keep pairing a crisp agenda with a proof-at-scale credibility line.",
+            "criteria": [
+              {
+                "criterion_id": "golden-002-price-objection-handled::intro::set-agenda-and-establish-credibility",
+                "label": "Set agenda and establish credibility",
+                "stage": "intro",
+                "score": 78,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "standard",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "Agenda: I'll learn how your team sells, show how we'd help, and we'll agree a next step if it fits.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 0,
+                    "speaker": "rep"
+                  },
+                  {
+                    "quote": "We run this with a dozen combat-sports gyms, so the playbook is proven at your scale.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 2,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Keep pairing a crisp agenda with a proof-at-scale credibility line.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "discovery",
+            "score": 78,
+            "weight": 30,
+            "status": "pass",
+            "notes": "Good pain and decision route; could quantify the lost momentum in numbers to go from strong to excellent.",
+            "criteria": [
+              {
+                "criterion_id": "golden-002-price-objection-handled::discovery::uncover-pain-current-process-and-decision-route",
+                "label": "Uncover pain, current process and decision route",
+                "stage": "discovery",
+                "score": 78,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "Reviews are patchy, and we lose momentum when price comes up.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 5,
+                    "speaker": "buyer"
+                  },
+                  {
+                    "quote": "Me and my co-owner.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 7,
+                    "speaker": "buyer"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Good pain and decision route; could quantify the lost momentum in numbers to go from strong to excellent.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "objection",
+            "score": 90,
+            "weight": 30,
+            "status": "pass",
+            "notes": "Model example: isolate the concern with a question, then reframe on recovered revenue rather than discounting.",
+            "criteria": [
+              {
+                "criterion_id": "golden-002-price-objection-handled::objection::isolate-price-concern-and-reframe-value",
+                "label": "Isolate price concern and reframe value",
+                "stage": "objection",
+                "score": 90,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "Honestly though, that's too expensive for where we are.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 8,
+                    "speaker": "buyer"
+                  },
+                  {
+                    "quote": "is it the price itself, or whether the return justifies it? Because if each rep recovers even two lost members a month, the tool pays for itself several times over.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 9,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Model example: isolate the concern with a question, then reframe on recovered revenue rather than discounting.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "close",
+            "score": 78,
+            "weight": 20,
+            "status": "pass",
+            "notes": "Strong close: dated slot with the decision maker committed.",
+            "criteria": [
+              {
+                "criterion_id": "golden-002-price-objection-handled::close::secure-clear-next-step-and-commitment",
+                "label": "Secure clear next step and commitment",
+                "stage": "close",
+                "score": 78,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "let's get your co-owner on a thirty-minute demo Thursday at 10am to see it live.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 11,
+                    "speaker": "rep"
+                  },
+                  {
+                    "quote": "Thursday at 10 works, book it.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 12,
+                    "speaker": "buyer"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Strong close: dated slot with the decision maker committed.",
+                "suggested_drill": null
+              }
+            ]
+          }
+        ],
+        "objection_matches": [
+          {
+            "detected_text": "Honestly though, that's too expensive for where we are.",
+            "objection_item_id": null,
+            "objection_item_key": "too-expensive",
+            "objection_label": "Too expensive",
+            "category": "price",
+            "handled": "handled",
+            "evidence": {
+              "quote": "Honestly though, that's too expensive for where we are.",
+              "start_sec": null,
+              "end_sec": null,
+              "segment_index": 8,
+              "speaker": "buyer"
+            }
+          }
+        ],
+        "confidence": {
+          "level": "high",
+          "value": 0.9
+        },
+        "degraded_score": false,
+        "degraded_reason": null,
+        "voice": {
+          "clarity": 72,
+          "confidence": 70,
+          "filler_density": 30,
+          "pace": 65,
+          "overall": 70
+        },
+        "provenance": {
+          "scoring_provider": "openai",
+          "scoring_model": "gpt-4o-mini",
+          "scorecard_source": "company_default",
+          "scorecard_id": "sc-ufc-001",
+          "scorecard_version_id": "scv-ufc-001-v1",
+          "scorecard_version": 1,
+          "context_version": 1,
+          "prompt_version": "scoring-prompt-v2",
+          "rubric_version": "v2",
+          "cache_key_version": "v2"
+        },
+        "trend_delta": 5,
+        "v1_projection": {
+          "overall": 82,
+          "summary": "Textbook price-objection handling: agenda and credibility set, pain and decision route uncovered, the price objection isolated with a question and reframed on recovered revenue, and a dated demo committed with the co-owner. The reference example for the objection stage.",
+          "stages": {
+            "intro": {
+              "score": 78,
+              "notes": "Keep pairing a crisp agenda with a proof-at-scale credibility line."
+            },
+            "discovery": {
+              "score": 78,
+              "notes": "Good pain and decision route; could quantify the lost momentum in numbers to go from strong to excellent."
+            },
+            "objection": {
+              "score": 90,
+              "notes": "Model example: isolate the concern with a question, then reframe on recovered revenue rather than discounting."
+            },
+            "close": {
+              "score": 78,
+              "notes": "Strong close: dated slot with the decision maker committed."
+            }
+          },
+          "moments": [
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "Agenda: I'll learn how your team sells, show how we'd help, and we'll agree a next step if it fits.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "We run this with a dozen combat-sports gyms, so the playbook is proven at your scale.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "Reviews are patchy, and we lose momentum when price comes up.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "Me and my co-owner.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "Honestly though, that's too expensive for where we are.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "is it the price itself, or whether the return justifies it? Because if each rep recovers even two lost members a month, the tool pays for itself several times over.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "closing_attempt",
+              "text": "let's get your co-owner on a thirty-minute demo Thursday at 10am to see it live.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "closing_attempt",
+              "text": "Thursday at 10 works, book it.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "objection",
+              "text": "Honestly though, that's too expensive for where we are.",
+              "severity": "medium"
+            }
+          ],
+          "suggestions": [
+            "Keep pairing a crisp agenda with a proof-at-scale credibility line.",
+            "Good pain and decision route; could quantify the lost momentum in numbers to go from strong to excellent.",
+            "Model example: isolate the concern with a question, then reframe on recovered revenue rather than discounting.",
+            "Strong close: dated slot with the decision maker committed."
+          ],
+          "voice": {
+            "clarity": 72,
+            "confidence": 70,
+            "filler_density": 30,
+            "pace": 65,
+            "overall": 70
+          },
+          "rubric": {
+            "_meta": {
+              "rubric_version": "v2",
+              "prompt_version": "scoring-prompt-v2",
+              "model_version": "gpt-4o-mini",
+              "scoring_model_version": "gpt-4o-mini:v2:v2",
+              "scorecard_name": "UFC Sales Scorecard",
+              "scorecard_source": "company_default",
+              "context_version": 1,
+              "transcript_present": true,
+              "scoring_provider": "openai",
+              "contract_version": "v2",
+              "confidence": {
+                "level": "high",
+                "value": 0.9
+              },
+              "degraded_score": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "call_id": "golden-003-timing-authority-stall",
+      "note": "authored candidate (deterministic build from golden; no LLM)",
+      "v2": {
+        "contract_version": "v2",
+        "overall_score": 46,
+        "summary": "Weak call: no real agenda or credibility, shallow discovery with no decision route, and both the authority and timing stalls accepted with no diagnosis or next step. Closed with an undated 'I'll follow up'. Priority coaching on objection handling and closing.",
+        "stages": [
+          {
+            "stage": "intro",
+            "score": 60,
+            "weight": 20,
+            "status": "partial",
+            "notes": "Opened with a loose purpose but set no time-boxed agenda and gave no credibility anchor before launching into the pitch.",
+            "criteria": [
+              {
+                "criterion_id": "golden-003-timing-authority-stall::intro::set-agenda-and-establish-credibility",
+                "label": "Set agenda and establish credibility",
+                "stage": "intro",
+                "score": 60,
+                "status": "partial",
+                "weight": 100,
+                "emphasis": "standard",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "I'll walk you through what we do and see if it's useful.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 0,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": "Opened with a loose purpose but set no time-boxed agenda and gave no credibility anchor before launching into the pitch.",
+                "points_lost": 8,
+                "coaching_action": "Open with a structured agenda and a proof point relevant to the buyer's world before pitching.",
+                "suggested_drill": {
+                  "key": "intro",
+                  "title": "Call Opening & Credibility Drill"
+                }
+              }
+            ]
+          },
+          {
+            "stage": "discovery",
+            "score": 60,
+            "weight": 30,
+            "status": "partial",
+            "notes": "Uncovered only that coaching is informal; never quantified the cost of that gap and never identified who signs off, so the decision route stayed unknown.",
+            "criteria": [
+              {
+                "criterion_id": "golden-003-timing-authority-stall::discovery::uncover-pain-current-process-and-decision-route",
+                "label": "Uncover pain, current process and decision route",
+                "stage": "discovery",
+                "score": 60,
+                "status": "partial",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "We do a bit here and there, nothing formal.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 5,
+                    "speaker": "buyer"
+                  }
+                ],
+                "why_points_lost": "Uncovered only that coaching is informal; never quantified the cost of that gap and never identified who signs off, so the decision route stayed unknown.",
+                "points_lost": 12,
+                "coaching_action": "Ask for the cost of the current gap and the decision route before moving toward a pitch.",
+                "suggested_drill": {
+                  "key": "discovery",
+                  "title": "Discovery Depth Drill"
+                }
+              }
+            ]
+          },
+          {
+            "stage": "objection",
+            "score": 40,
+            "weight": 30,
+            "status": "fail",
+            "notes": "Accepted the 'speak with my partner' authority stall and the 'need to think about it' timing stall with no diagnosis of the real blocker and no attempt to isolate or reframe the concern.",
+            "criteria": [
+              {
+                "criterion_id": "golden-003-timing-authority-stall::objection::isolate-price-concern-and-reframe-value",
+                "label": "Isolate price concern and reframe value",
+                "stage": "objection",
+                "score": 40,
+                "status": "fail",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "I'd need to speak with my partner before anything, and honestly I need to think about it.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 7,
+                    "speaker": "buyer"
+                  },
+                  {
+                    "quote": "Of course, totally understand. No pressure at all.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 8,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": "Accepted the 'speak with my partner' authority stall and the 'need to think about it' timing stall with no diagnosis of the real blocker and no attempt to isolate or reframe the concern.",
+                "points_lost": 18,
+                "coaching_action": "Turn a vague stall into a named decision blocker and offer to include the partner rather than accepting the delay.",
+                "suggested_drill": {
+                  "key": "objection",
+                  "title": "Objection Handling Drill"
+                }
+              }
+            ]
+          },
+          {
+            "stage": "close",
+            "score": 22,
+            "weight": 20,
+            "status": "fail",
+            "notes": "Closed with 'I'll follow up sometime next week' — no date, no owner and no commitment from the buyer.",
+            "criteria": [
+              {
+                "criterion_id": "golden-003-timing-authority-stall::close::secure-clear-next-step-and-commitment",
+                "label": "Secure clear next step and commitment",
+                "stage": "close",
+                "score": 22,
+                "status": "fail",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "Sounds good, I'll follow up sometime next week.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 10,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": "Closed with 'I'll follow up sometime next week' — no date, no owner and no commitment from the buyer.",
+                "points_lost": 16,
+                "coaching_action": "Lock a specific dated next step with the named decision maker before ending the call.",
+                "suggested_drill": {
+                  "key": "close",
+                  "title": "Closing & Next-Step Drill"
+                }
+              }
+            ]
+          }
+        ],
+        "objection_matches": [
+          {
+            "detected_text": "I'd need to speak with my partner before anything, and honestly I need to think about it.",
+            "objection_item_id": null,
+            "objection_item_key": "speak-with-partner",
+            "objection_label": "Need to speak with my partner",
+            "category": "authority",
+            "handled": "missed",
+            "evidence": {
+              "quote": "I'd need to speak with my partner before anything, and honestly I need to think about it.",
+              "start_sec": null,
+              "end_sec": null,
+              "segment_index": 7,
+              "speaker": "buyer"
+            }
+          },
+          {
+            "detected_text": "I'd need to speak with my partner before anything, and honestly I need to think about it.",
+            "objection_item_id": null,
+            "objection_item_key": "need-to-think",
+            "objection_label": "Need to think about it",
+            "category": "timing",
+            "handled": "missed",
+            "evidence": {
+              "quote": "honestly I need to think about it.",
+              "start_sec": null,
+              "end_sec": null,
+              "segment_index": 7,
+              "speaker": "buyer"
+            }
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "value": 0.7
+        },
+        "degraded_score": false,
+        "degraded_reason": null,
+        "voice": {
+          "clarity": 72,
+          "confidence": 70,
+          "filler_density": 30,
+          "pace": 65,
+          "overall": 70
+        },
+        "provenance": {
+          "scoring_provider": "openai",
+          "scoring_model": "gpt-4o-mini",
+          "scorecard_source": "company_default",
+          "scorecard_id": "sc-ufc-001",
+          "scorecard_version_id": "scv-ufc-001-v1",
+          "scorecard_version": 1,
+          "context_version": 1,
+          "prompt_version": "scoring-prompt-v2",
+          "rubric_version": "v2",
+          "cache_key_version": "v2"
+        },
+        "trend_delta": -6,
+        "v1_projection": {
+          "overall": 46,
+          "summary": "Weak call: no real agenda or credibility, shallow discovery with no decision route, and both the authority and timing stalls accepted with no diagnosis or next step. Closed with an undated 'I'll follow up'. Priority coaching on objection handling and closing.",
+          "stages": {
+            "intro": {
+              "score": 60,
+              "notes": "Opened with a loose purpose but set no time-boxed agenda and gave no credibility anchor before launching into the pitch."
+            },
+            "discovery": {
+              "score": 60,
+              "notes": "Uncovered only that coaching is informal; never quantified the cost of that gap and never identified who signs off, so the decision route stayed unknown."
+            },
+            "objection": {
+              "score": 40,
+              "notes": "Accepted the 'speak with my partner' authority stall and the 'need to think about it' timing stall with no diagnosis of the real blocker and no attempt to isolate or reframe the concern."
+            },
+            "close": {
+              "score": 22,
+              "notes": "Closed with 'I'll follow up sometime next week' — no date, no owner and no commitment from the buyer."
+            }
+          },
+          "moments": [
+            {
+              "timestamp": null,
+              "type": "mistake",
+              "text": "I'll walk you through what we do and see if it's useful.",
+              "severity": "medium"
+            },
+            {
+              "timestamp": null,
+              "type": "mistake",
+              "text": "We do a bit here and there, nothing formal.",
+              "severity": "medium"
+            },
+            {
+              "timestamp": null,
+              "type": "mistake",
+              "text": "I'd need to speak with my partner before anything, and honestly I need to think about it.",
+              "severity": "high"
+            },
+            {
+              "timestamp": null,
+              "type": "mistake",
+              "text": "Of course, totally understand. No pressure at all.",
+              "severity": "high"
+            },
+            {
+              "timestamp": null,
+              "type": "closing_attempt",
+              "text": "Sounds good, I'll follow up sometime next week.",
+              "severity": "high"
+            },
+            {
+              "timestamp": null,
+              "type": "objection",
+              "text": "I'd need to speak with my partner before anything, and honestly I need to think about it.",
+              "severity": "medium"
+            },
+            {
+              "timestamp": null,
+              "type": "objection",
+              "text": "I'd need to speak with my partner before anything, and honestly I need to think about it.",
+              "severity": "medium"
+            }
+          ],
+          "suggestions": [
+            "Open with a structured agenda and a proof point relevant to the buyer's world before pitching.",
+            "Ask for the cost of the current gap and the decision route before moving toward a pitch.",
+            "Turn a vague stall into a named decision blocker and offer to include the partner rather than accepting the delay.",
+            "Lock a specific dated next step with the named decision maker before ending the call."
+          ],
+          "voice": {
+            "clarity": 72,
+            "confidence": 70,
+            "filler_density": 30,
+            "pace": 65,
+            "overall": 70
+          },
+          "rubric": {
+            "_meta": {
+              "rubric_version": "v2",
+              "prompt_version": "scoring-prompt-v2",
+              "model_version": "gpt-4o-mini",
+              "scoring_model_version": "gpt-4o-mini:v2:v2",
+              "scorecard_name": "UFC Sales Scorecard",
+              "scorecard_source": "company_default",
+              "context_version": 1,
+              "transcript_present": true,
+              "scoring_provider": "openai",
+              "contract_version": "v2",
+              "confidence": {
+                "level": "medium",
+                "value": 0.7
+              },
+              "degraded_score": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "call_id": "golden-004-weak-close",
+      "note": "authored candidate (deterministic build from golden; no LLM)",
+      "v2": {
+        "contract_version": "v2",
+        "overall_score": 61,
+        "summary": "Strong opening and discovery undone by the back half: the timing objection was only partly reframed and the call closed on 'I'll send some info over and circle back' with no date. Coaching should target objection isolation and closing on a dated next step.",
+        "stages": [
+          {
+            "stage": "intro",
+            "score": 78,
+            "weight": 20,
+            "status": "pass",
+            "notes": "Solid agenda and credibility opening; maintain.",
+            "criteria": [
+              {
+                "criterion_id": "golden-004-weak-close::intro::set-agenda-and-establish-credibility",
+                "label": "Set agenda and establish credibility",
+                "stage": "intro",
+                "score": 78,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "standard",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "Plan for today: I'll learn how your team runs deals, show you how we'd help, and we'll agree whether there's a next step. Good?",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 0,
+                    "speaker": "rep"
+                  },
+                  {
+                    "quote": "We do this for a dozen gyms your size, so I know the pattern well.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 2,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Solid agenda and credibility opening; maintain.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "discovery",
+            "score": 78,
+            "weight": 30,
+            "status": "pass",
+            "notes": "Good: specific failure point and clear decision route surfaced.",
+            "criteria": [
+              {
+                "criterion_id": "golden-004-weak-close::discovery::uncover-pain-current-process-and-decision-route",
+                "label": "Uncover pain, current process and decision route",
+                "stage": "discovery",
+                "score": 78,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "They're strong on the intro but they fold the second someone mentions price. We lose a lot at that point.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 5,
+                    "speaker": "buyer"
+                  },
+                  {
+                    "quote": "That's me, I sign off.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 7,
+                    "speaker": "buyer"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Good: specific failure point and clear decision route surfaced.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "objection",
+            "score": 60,
+            "weight": 30,
+            "status": "partial",
+            "notes": "Reframed the timing concern reasonably but never isolated it as the real objection or put concrete numbers to the revenue leak, so it stayed a soft 'maybe'.",
+            "criteria": [
+              {
+                "criterion_id": "golden-004-weak-close::objection::isolate-price-concern-and-reframe-value",
+                "label": "Isolate price concern and reframe value",
+                "stage": "objection",
+                "score": 60,
+                "status": "partial",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "It sounds decent but is now really the right time? We're mid-season.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 8,
+                    "speaker": "buyer"
+                  },
+                  {
+                    "quote": "even mid-season the calls are still happening, so the leak is happening now too. Worth seeing the numbers?",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 9,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": "Reframed the timing concern reasonably but never isolated it as the real objection or put concrete numbers to the revenue leak, so it stayed a soft 'maybe'.",
+                "points_lost": 12,
+                "coaching_action": "Isolate the concern first, then quantify the cost of waiting with real figures.",
+                "suggested_drill": {
+                  "key": "objection",
+                  "title": "Objection Handling Drill"
+                }
+              }
+            ]
+          },
+          {
+            "stage": "close",
+            "score": 22,
+            "weight": 20,
+            "status": "fail",
+            "notes": "Ended with 'I'll send some info over and circle back' — no dated next step, no commitment, and the buyer's soft 'maybe' was never converted.",
+            "criteria": [
+              {
+                "criterion_id": "golden-004-weak-close::close::secure-clear-next-step-and-commitment",
+                "label": "Secure clear next step and commitment",
+                "stage": "close",
+                "score": 22,
+                "status": "fail",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "Great, I'll send some info over and circle back.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 11,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": "Ended with 'I'll send some info over and circle back' — no dated next step, no commitment, and the buyer's soft 'maybe' was never converted.",
+                "points_lost": 16,
+                "coaching_action": "Convert the 'maybe' into a dated next step instead of defaulting to sending information.",
+                "suggested_drill": {
+                  "key": "close",
+                  "title": "Closing & Next-Step Drill"
+                }
+              }
+            ]
+          }
+        ],
+        "objection_matches": [
+          {
+            "detected_text": "It sounds decent but is now really the right time? We're mid-season.",
+            "objection_item_id": null,
+            "objection_item_key": "not-right-time",
+            "objection_label": "Not the right time",
+            "category": "timing",
+            "handled": "partially",
+            "evidence": {
+              "quote": "is now really the right time? We're mid-season.",
+              "start_sec": null,
+              "end_sec": null,
+              "segment_index": 8,
+              "speaker": "buyer"
+            }
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "value": 0.7
+        },
+        "degraded_score": false,
+        "degraded_reason": null,
+        "voice": {
+          "clarity": 72,
+          "confidence": 70,
+          "filler_density": 30,
+          "pace": 65,
+          "overall": 70
+        },
+        "provenance": {
+          "scoring_provider": "openai",
+          "scoring_model": "gpt-4o-mini",
+          "scorecard_source": "company_default",
+          "scorecard_id": "sc-ufc-001",
+          "scorecard_version_id": "scv-ufc-001-v1",
+          "scorecard_version": 1,
+          "context_version": 1,
+          "prompt_version": "scoring-prompt-v2",
+          "rubric_version": "v2",
+          "cache_key_version": "v2"
+        },
+        "trend_delta": -1,
+        "v1_projection": {
+          "overall": 61,
+          "summary": "Strong opening and discovery undone by the back half: the timing objection was only partly reframed and the call closed on 'I'll send some info over and circle back' with no date. Coaching should target objection isolation and closing on a dated next step.",
+          "stages": {
+            "intro": {
+              "score": 78,
+              "notes": "Solid agenda and credibility opening; maintain."
+            },
+            "discovery": {
+              "score": 78,
+              "notes": "Good: specific failure point and clear decision route surfaced."
+            },
+            "objection": {
+              "score": 60,
+              "notes": "Reframed the timing concern reasonably but never isolated it as the real objection or put concrete numbers to the revenue leak, so it stayed a soft 'maybe'."
+            },
+            "close": {
+              "score": 22,
+              "notes": "Ended with 'I'll send some info over and circle back' — no dated next step, no commitment, and the buyer's soft 'maybe' was never converted."
+            }
+          },
+          "moments": [
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "Plan for today: I'll learn how your team runs deals, show you how we'd help, and we'll agree whether there's a next step. Good?",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "We do this for a dozen gyms your size, so I know the pattern well.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "They're strong on the intro but they fold the second someone mentions price. We lose a lot at that point.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "That's me, I sign off.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "mistake",
+              "text": "It sounds decent but is now really the right time? We're mid-season.",
+              "severity": "medium"
+            },
+            {
+              "timestamp": null,
+              "type": "mistake",
+              "text": "even mid-season the calls are still happening, so the leak is happening now too. Worth seeing the numbers?",
+              "severity": "medium"
+            },
+            {
+              "timestamp": null,
+              "type": "closing_attempt",
+              "text": "Great, I'll send some info over and circle back.",
+              "severity": "high"
+            },
+            {
+              "timestamp": null,
+              "type": "objection",
+              "text": "It sounds decent but is now really the right time? We're mid-season.",
+              "severity": "medium"
+            }
+          ],
+          "suggestions": [
+            "Solid agenda and credibility opening; maintain.",
+            "Good: specific failure point and clear decision route surfaced.",
+            "Isolate the concern first, then quantify the cost of waiting with real figures.",
+            "Convert the 'maybe' into a dated next step instead of defaulting to sending information."
+          ],
+          "voice": {
+            "clarity": 72,
+            "confidence": 70,
+            "filler_density": 30,
+            "pace": 65,
+            "overall": 70
+          },
+          "rubric": {
+            "_meta": {
+              "rubric_version": "v2",
+              "prompt_version": "scoring-prompt-v2",
+              "model_version": "gpt-4o-mini",
+              "scoring_model_version": "gpt-4o-mini:v2:v2",
+              "scorecard_name": "UFC Sales Scorecard",
+              "scorecard_source": "company_default",
+              "context_version": 1,
+              "transcript_present": true,
+              "scoring_provider": "openai",
+              "contract_version": "v2",
+              "confidence": {
+                "level": "medium",
+                "value": 0.7
+              },
+              "degraded_score": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "call_id": "golden-005-trust-ai-scepticism",
+      "note": "authored candidate (deterministic build from golden; no LLM)",
+      "v2": {
+        "contract_version": "v2",
+        "overall_score": 64,
+        "summary": "Trust objection well pre-empted and partly addressed with a human-in-the-loop framing, but no proof point closed it out; discovery skipped cost and decision route, and the pilot was proposed without a date. A mixed call with clear next-step and proof-point coaching.",
+        "stages": [
+          {
+            "stage": "intro",
+            "score": 78,
+            "weight": 20,
+            "status": "pass",
+            "notes": "Good: pre-empted the AI scepticism with a transparency-led credibility line.",
+            "criteria": [
+              {
+                "criterion_id": "golden-005-trust-ai-scepticism::intro::set-agenda-and-establish-credibility",
+                "label": "Set agenda and establish credibility",
+                "stage": "intro",
+                "score": 78,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "standard",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "Quick agenda: understand how you coach reps now, show how our AI review works, and see if a trial makes sense.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 0,
+                    "speaker": "rep"
+                  },
+                  {
+                    "quote": "We work with several gyms who felt the same, so I'll show you exactly how it scores, not a black box.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 2,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Good: pre-empted the AI scepticism with a transparency-led credibility line.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "discovery",
+            "score": 60,
+            "weight": 30,
+            "status": "partial",
+            "notes": "Got the current process but never quantified the cost of inconsistent coaching and never established who signs off, so the decision route was missed.",
+            "criteria": [
+              {
+                "criterion_id": "golden-005-trust-ai-scepticism::discovery::uncover-pain-current-process-and-decision-route",
+                "label": "Uncover pain, current process and decision route",
+                "stage": "discovery",
+                "score": 60,
+                "status": "partial",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "My head of sales listens back occasionally, but it's inconsistent.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 5,
+                    "speaker": "buyer"
+                  }
+                ],
+                "why_points_lost": "Got the current process but never quantified the cost of inconsistent coaching and never established who signs off, so the decision route was missed.",
+                "points_lost": 12,
+                "coaching_action": "Probe the cost of inconsistent coaching and confirm the decision maker before pitching.",
+                "suggested_drill": {
+                  "key": "discovery",
+                  "title": "Discovery Depth Drill"
+                }
+              }
+            ]
+          },
+          {
+            "stage": "objection",
+            "score": 60,
+            "weight": 30,
+            "status": "partial",
+            "notes": "Acknowledged the AI-trust concern and gave a good human-in-the-loop reassurance, but offered no concrete proof, reference or trial evidence, so the scepticism was softened rather than resolved.",
+            "criteria": [
+              {
+                "criterion_id": "golden-005-trust-ai-scepticism::objection::isolate-price-concern-and-reframe-value",
+                "label": "Isolate price concern and reframe value",
+                "stage": "objection",
+                "score": 60,
+                "status": "partial",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "I don't trust AI coaching. It doesn't get the nuance of a real sales conversation.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 7,
+                    "speaker": "buyer"
+                  },
+                  {
+                    "quote": "it flags the moments to review and always shows the transcript quote behind every score, so a human makes the call.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 8,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": "Acknowledged the AI-trust concern and gave a good human-in-the-loop reassurance, but offered no concrete proof, reference or trial evidence, so the scepticism was softened rather than resolved.",
+                "points_lost": 12,
+                "coaching_action": "Back the reassurance with a proof point or reference, then confirm the concern is fully resolved before advancing.",
+                "suggested_drill": {
+                  "key": "objection",
+                  "title": "Objection Handling Drill"
+                }
+              }
+            ]
+          },
+          {
+            "stage": "close",
+            "score": 60,
+            "weight": 20,
+            "status": "partial",
+            "notes": "Proposed a concrete pilot but did not lock a date or a named decision, leaving it at 'I'll consider a pilot'.",
+            "criteria": [
+              {
+                "criterion_id": "golden-005-trust-ai-scepticism::close::secure-clear-next-step-and-commitment",
+                "label": "Secure clear next step and commitment",
+                "stage": "close",
+                "score": 60,
+                "status": "partial",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "evidence": [
+                  {
+                    "quote": "Would you be open to a short pilot on ten real calls so you can judge the scores yourself?",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 10,
+                    "speaker": "rep"
+                  },
+                  {
+                    "quote": "Send me something and I'll consider a pilot.",
+                    "start_sec": null,
+                    "end_sec": null,
+                    "segment_index": 11,
+                    "speaker": "buyer"
+                  }
+                ],
+                "why_points_lost": "Proposed a concrete pilot but did not lock a date or a named decision, leaving it at 'I'll consider a pilot'.",
+                "points_lost": 8,
+                "coaching_action": "Attach a date and an owner to the pilot before ending the call.",
+                "suggested_drill": {
+                  "key": "close",
+                  "title": "Closing & Next-Step Drill"
+                }
+              }
+            ]
+          }
+        ],
+        "objection_matches": [
+          {
+            "detected_text": "I don't trust AI coaching. It doesn't get the nuance of a real sales conversation.",
+            "objection_item_id": null,
+            "objection_item_key": "distrust-ai",
+            "objection_label": "I don't trust AI coaching",
+            "category": "trust",
+            "handled": "partially",
+            "evidence": {
+              "quote": "I don't trust AI coaching. It doesn't get the nuance of a real sales conversation.",
+              "start_sec": null,
+              "end_sec": null,
+              "segment_index": 7,
+              "speaker": "buyer"
+            }
+          }
+        ],
+        "confidence": {
+          "level": "medium",
+          "value": 0.7
+        },
+        "degraded_score": false,
+        "degraded_reason": null,
+        "voice": {
+          "clarity": 72,
+          "confidence": 70,
+          "filler_density": 30,
+          "pace": 65,
+          "overall": 70
+        },
+        "provenance": {
+          "scoring_provider": "openai",
+          "scoring_model": "gpt-4o-mini",
+          "scorecard_source": "company_default",
+          "scorecard_id": "sc-ufc-001",
+          "scorecard_version_id": "scv-ufc-001-v1",
+          "scorecard_version": 1,
+          "context_version": 1,
+          "prompt_version": "scoring-prompt-v2",
+          "rubric_version": "v2",
+          "cache_key_version": "v2"
+        },
+        "trend_delta": -1,
+        "v1_projection": {
+          "overall": 64,
+          "summary": "Trust objection well pre-empted and partly addressed with a human-in-the-loop framing, but no proof point closed it out; discovery skipped cost and decision route, and the pilot was proposed without a date. A mixed call with clear next-step and proof-point coaching.",
+          "stages": {
+            "intro": {
+              "score": 78,
+              "notes": "Good: pre-empted the AI scepticism with a transparency-led credibility line."
+            },
+            "discovery": {
+              "score": 60,
+              "notes": "Got the current process but never quantified the cost of inconsistent coaching and never established who signs off, so the decision route was missed."
+            },
+            "objection": {
+              "score": 60,
+              "notes": "Acknowledged the AI-trust concern and gave a good human-in-the-loop reassurance, but offered no concrete proof, reference or trial evidence, so the scepticism was softened rather than resolved."
+            },
+            "close": {
+              "score": 60,
+              "notes": "Proposed a concrete pilot but did not lock a date or a named decision, leaving it at 'I'll consider a pilot'."
+            }
+          },
+          "moments": [
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "Quick agenda: understand how you coach reps now, show how our AI review works, and see if a trial makes sense.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "highlight",
+              "text": "We work with several gyms who felt the same, so I'll show you exactly how it scores, not a black box.",
+              "severity": "low"
+            },
+            {
+              "timestamp": null,
+              "type": "mistake",
+              "text": "My head of sales listens back occasionally, but it's inconsistent.",
+              "severity": "medium"
+            },
+            {
+              "timestamp": null,
+              "type": "mistake",
+              "text": "I don't trust AI coaching. It doesn't get the nuance of a real sales conversation.",
+              "severity": "medium"
+            },
+            {
+              "timestamp": null,
+              "type": "mistake",
+              "text": "it flags the moments to review and always shows the transcript quote behind every score, so a human makes the call.",
+              "severity": "medium"
+            },
+            {
+              "timestamp": null,
+              "type": "closing_attempt",
+              "text": "Would you be open to a short pilot on ten real calls so you can judge the scores yourself?",
+              "severity": "medium"
+            },
+            {
+              "timestamp": null,
+              "type": "closing_attempt",
+              "text": "Send me something and I'll consider a pilot.",
+              "severity": "medium"
+            },
+            {
+              "timestamp": null,
+              "type": "objection",
+              "text": "I don't trust AI coaching. It doesn't get the nuance of a real sales conversation.",
+              "severity": "medium"
+            }
+          ],
+          "suggestions": [
+            "Good: pre-empted the AI scepticism with a transparency-led credibility line.",
+            "Probe the cost of inconsistent coaching and confirm the decision maker before pitching.",
+            "Back the reassurance with a proof point or reference, then confirm the concern is fully resolved before advancing.",
+            "Attach a date and an owner to the pilot before ending the call."
+          ],
+          "voice": {
+            "clarity": 72,
+            "confidence": 70,
+            "filler_density": 30,
+            "pace": 65,
+            "overall": 70
+          },
+          "rubric": {
+            "_meta": {
+              "rubric_version": "v2",
+              "prompt_version": "scoring-prompt-v2",
+              "model_version": "gpt-4o-mini",
+              "scoring_model_version": "gpt-4o-mini:v2:v2",
+              "scorecard_name": "UFC Sales Scorecard",
+              "scorecard_source": "company_default",
+              "context_version": 1,
+              "transcript_present": true,
+              "scoring_provider": "openai",
+              "contract_version": "v2",
+              "confidence": {
+                "level": "medium",
+                "value": 0.7
+              },
+              "degraded_score": false
+            }
+          }
+        }
+      }
+    }
+  ]
+}
