@@ -23,6 +23,27 @@ import {
   type ResolvedContext,
   type ResolvedScorecard,
 } from "./intelligenceRuntime";
+// Day 269 — Scoring v2 runtime (Day 267), wired in behind SCORING_CONTRACT.
+// Reused verbatim: no second parser/projector/roll-up is defined here.
+import {
+  resolveCriteriaSpec,
+  buildScoringV2Prompt,
+  buildScoreCacheKeyV2,
+  parseAndValidateScoreV2,
+  projectScoreV2ToV1,
+  projectionPolicyFor,
+  buildStubScoreV2,
+  buildFallbackScoreV2,
+  buildFullTranscript,
+  scoringModelVersionV2,
+  HEURISTIC_SCORING_MODEL,
+  SCORING_PROMPT_VERSION_V2,
+  RUBRIC_VERSION_V2,
+  CACHE_KEY_VERSION_V2,
+  type ScoreV2,
+  type ScoreV1Projection,
+  type TranscriptSegment,
+} from "./scoringV2";
 async function getScoringKnowledgeContext(
   supabase: SupabaseClient,
   args: {
@@ -946,6 +967,136 @@ export function buildStubScore(): LlmScore {
   return { ...heuristicScoreFallback(), model: STUB_SCORING_MODEL };
 }
 
+// --- SCORING CONTRACT (Day 269) ---
+// Off-by-default output-contract switch, ORTHOGONAL to SCORING_PROVIDER. Only the
+// exact value "v2" opts in; missing/empty/invalid/anything-else resolves to "v1"
+// so a misconfiguration can never silently change production output. No aliases
+// (true/enabled/latest are NOT accepted). Rollback = unset or SCORING_CONTRACT=v1.
+export type ScoringContract = "v1" | "v2";
+
+export function resolveScoringContract(): ScoringContract {
+  const raw = String(process.env.SCORING_CONTRACT || "v1").trim().toLowerCase();
+  return raw === "v2" ? "v2" : "v1";
+}
+
+/**
+ * Additive rubric._meta keys for a v2 result, so the legacy provenance reader
+ * (WEB getScoringProvenance, which reads rubric._meta) agrees with
+ * analysis_json.v2. Applied ONLY on the v2 path; the v1 _meta is untouched.
+ */
+function v2RubricMetaOverrides(scoreV2: ScoreV2, scoringModelVersion: string): Record<string, any> {
+  return {
+    scoring_contract: "v2",
+    contract_version: "v2",
+    rubric_version: RUBRIC_VERSION_V2,
+    prompt_version: SCORING_PROMPT_VERSION_V2,
+    model_version: scoreV2.provenance.scoring_model,
+    scoring_model_version: scoringModelVersion,
+    cache_key_version: CACHE_KEY_VERSION_V2,
+    criteria_version: scoreV2.provenance.criteria_version,
+    confidence: scoreV2.confidence,
+    degraded_score: scoreV2.degraded_score,
+    degraded_reason: scoreV2.degraded_reason,
+  };
+}
+
+export interface ScoringV2ComputeResult {
+  scoreV2: ScoreV2;
+  projection: ScoreV1Projection;
+  validated: Omit<LlmScore, "voice">;
+  scoredModel: string;
+  scoringModelVersion: string;
+}
+
+/**
+ * Hermetic v2 orchestration seam (Day 269). PURE: no network, no DB. Given the
+ * resolved scoring inputs and a RAW model response (or null for stub/failure),
+ * it runs the Day-267 PRODUCTION functions — resolveCriteriaSpec →
+ * parseAndValidateScoreV2 / buildStubScoreV2 / buildFallbackScoreV2 →
+ * projectScoreV2ToV1 — and returns both the full ScoreV2 and the v1-shaped
+ * projection. scoreWithLLM calls this on the v2 branch; the Day-269 validator
+ * calls it directly with mocked raw JSON (no OpenAI, no paid call). Failure and
+ * no-transcript cases degrade honestly rather than throwing.
+ */
+export function computeScoringV2Result(args: {
+  scoringProvider: ScoringProviderName;
+  resolvedScorecard: ResolvedScorecard;
+  resolvedContext: ResolvedContext | null;
+  transcript: string;
+  segments: TranscriptSegment[];
+  voice: VoiceScore;
+  raw: string | null;
+  priorAverage?: number | null;
+}): ScoringV2ComputeResult {
+  const spec = resolveCriteriaSpec(args.resolvedScorecard);
+  const fullTranscript =
+    args.transcript && args.transcript.trim() ? args.transcript : buildFullTranscript(args.segments);
+  const baseCtx = {
+    spec,
+    resolvedScorecard: args.resolvedScorecard,
+    resolvedContext: args.resolvedContext,
+    voice: args.voice,
+  };
+  const specEmpty = spec.stages.every((s) => s.criteria.length === 0);
+  const hasTranscript = Boolean(fullTranscript && fullTranscript.trim());
+
+  let scoreV2: ScoreV2;
+  let scoredModel: string;
+
+  if (specEmpty) {
+    // Malformed/empty active scorecard — never send an undefined criteria
+    // contract to the model; degrade honestly.
+    scoredModel = HEURISTIC_SCORING_MODEL;
+    scoreV2 = buildFallbackScoreV2(baseCtx, "insufficient_evidence");
+  } else if (args.scoringProvider === "stub") {
+    scoredModel = STUB_SCORING_MODEL;
+    scoreV2 = buildStubScoreV2(baseCtx);
+  } else if (!hasTranscript) {
+    scoredModel = HEURISTIC_SCORING_MODEL;
+    scoreV2 = buildFallbackScoreV2(baseCtx, "no_transcript");
+  } else if (!args.raw) {
+    // OpenAI returned nothing / the call failed upstream.
+    scoredModel = HEURISTIC_SCORING_MODEL;
+    scoreV2 = buildFallbackScoreV2(baseCtx, "invalid_model_output");
+  } else {
+    try {
+      scoreV2 = parseAndValidateScoreV2(args.raw, {
+        spec,
+        resolvedScorecard: args.resolvedScorecard,
+        resolvedContext: args.resolvedContext,
+        segments: args.segments,
+        fullTranscript,
+        voice: args.voice,
+        scoringProvider: "openai",
+        scoringModel: AI_MODEL,
+        priorAverage: args.priorAverage ?? null,
+      });
+      scoredModel = AI_MODEL;
+    } catch {
+      // Invalid or ungrounded model output — never persist it as a real score.
+      scoredModel = HEURISTIC_SCORING_MODEL;
+      scoreV2 = buildFallbackScoreV2(baseCtx, "invalid_model_output");
+    }
+  }
+
+  const projection = projectScoreV2ToV1(scoreV2, { policy: projectionPolicyFor(spec.source) });
+  const validated: Omit<LlmScore, "voice"> = {
+    model: scoredModel,
+    overall: projection.overall,
+    summary: projection.summary,
+    stages: projection.stages as unknown as CallAnalysisStages,
+    moments: projection.moments,
+    suggestions: projection.suggestions,
+  };
+  return {
+    scoreV2,
+    projection,
+    validated,
+    scoredModel,
+    scoringModelVersion: scoringModelVersionV2(scoredModel),
+  };
+}
+
 // --- SCORING THRESHOLD HELPERS ---
 async function getScoringThresholds(supabase: SupabaseClient): Promise<{
   low: number;
@@ -1705,19 +1856,42 @@ export async function scoreWithLLM(opts: {
     // on the key, so the production namespace is unchanged.
     const scoringProvider = resolveScoringProvider();
 
-    const deterministic = buildDeterministicPromptKey({
-      callId,
-      filename: (call as any)?.filename ?? null,
-      sha256: ((call as any)?.sha256 as string | null) ?? null,
-      transcript: cleanedTranscript,
-      contextVersion: resolvedContext?.context_version ?? null,
-      scorecardCacheKey: resolvedScorecard.cache_key,
-      scoringProvider,
-    });
+    // Day 269 — output contract switch, orthogonal to the provider. Off ("v1")
+    // by default: the branch below is byte-identical to the pre-Day-269 path.
+    const scoringContract = resolveScoringContract();
+
+    // v1 → the existing deterministic key (byte-identical). v2 → a separate
+    // namespace (cachever=v2 + v2 prompt/rubric markers) that can never read a v1
+    // entry, with the Day-262 provider segment still stacking for stub isolation.
+    const deterministic =
+      scoringContract === "v2"
+        ? buildScoreCacheKeyV2({
+            callId,
+            filename: (call as any)?.filename ?? null,
+            sha256: ((call as any)?.sha256 as string | null) ?? null,
+            transcript: cleanedTranscript,
+            contextVersion: resolvedContext?.context_version ?? null,
+            scorecardCacheKey: resolvedScorecard.cache_key,
+            scoringProvider,
+            scoringModel: scoringProvider === "stub" ? STUB_SCORING_MODEL : AI_MODEL,
+          })
+        : buildDeterministicPromptKey({
+            callId,
+            filename: (call as any)?.filename ?? null,
+            sha256: ((call as any)?.sha256 as string | null) ?? null,
+            transcript: cleanedTranscript,
+            contextVersion: resolvedContext?.context_version ?? null,
+            scorecardCacheKey: resolvedScorecard.cache_key,
+            scoringProvider,
+          });
 
     const cached = await readScoreCache(supabase, deterministic.key);
     if (cached) {
       const cachedScore = normaliseStoredScore(cached);
+      // Day 269 — a v2 cache entry carries the full ScoreV2 alongside the v1
+      // projection; restore it so a cache hit returns both. v1 entries have no
+      // `.v2`, so this stays null and the block is byte-identical for v1.
+      const cachedV2: ScoreV2 | null = (cached as any)?.v2 ?? null;
       const cachedModelVersion = String(cachedScore.model || SCORING_MODEL_VERSION);
       const voice = cachedScore.voice ?? computeVoiceScore(
         deterministic.transcript,
@@ -1770,6 +1944,12 @@ export async function scoreWithLLM(opts: {
       });
 
       (rubric as any)._meta.voice = voice;
+      if (cachedV2) {
+        Object.assign(
+          (rubric as any)._meta,
+          v2RubricMetaOverrides(cachedV2, scoringModelVersionV2(cachedV2?.provenance?.scoring_model ?? cachedModelVersion))
+        );
+      }
 
       const dbWriteStart = Date.now();
       await updateCallScoreRow(supabase, callId, {
@@ -1793,8 +1973,9 @@ export async function scoreWithLLM(opts: {
             text: cleanedTranscript,
             segments: cleanedSegments,
           },
+          ...(cachedV2 ? { v2: cachedV2 } : {}),
         },
-        ai_model: cachedModelVersion,
+        ai_model: cachedV2 ? scoringModelVersionV2(cachedV2?.provenance?.scoring_model ?? cachedModelVersion) : cachedModelVersion,
         rubric_version: RUBRIC_VERSION,
         scored_at: new Date().toISOString(),
       });
@@ -1956,7 +2137,71 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
     // prevents paid calls).
     let validated: Omit<LlmScore, "voice">;
     let scoredModel: string;
-    if (scoringProvider === "stub") {
+    // Day 269 — the full validated v2 result, attached to analysis_json.v2 and
+    // the cache. Stays null on the v1 path (contract === "v1"), which keeps every
+    // persistence/cache/return site below byte-identical to before.
+    let scoreV2: ScoreV2 | null = null;
+
+    if (scoringContract === "v2") {
+      // Provider still selects openai|stub; contract selects the OUTPUT shape.
+      // The v2 prompt/parser/projection are the Day-267 production functions via
+      // computeScoringV2Result; no second parser is defined here.
+      const v2Voice = computeVoiceScore(deterministic.transcript, (call as any)?.duration_sec ?? null);
+      let rawV2: string | null = null;
+      if (scoringProvider !== "stub") {
+        // Named `openaiClient` (not `openai`) so the Day-261 stub-branch guard —
+        // which locates the getOpenAI client init in the v1 non-stub branch —
+        // keeps pointing at that branch. This v2 call is itself guarded by
+        // `scoringProvider !== "stub"`, so v2+stub still makes no paid call.
+        try {
+          const openaiClient = getOpenAI();
+          const spec = resolveCriteriaSpec(resolvedScorecard);
+          const v2Prompt = buildScoringV2Prompt({
+            spec,
+            segments: cleanedSegments as unknown as TranscriptSegment[],
+            scorecardName: resolvedScorecard.scorecard_name,
+            contextBlock: resolvedContext?.compiled_context,
+          });
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), OPENAI_TIMEOUT_MS);
+          const llmStart = Date.now();
+          const resp = await openaiClient.chat.completions.create(
+            {
+              model: AI_MODEL,
+              messages: [
+                { role: "system", content: v2Prompt.system },
+                { role: "user", content: v2Prompt.user },
+              ],
+              response_format: { type: "json_object" },
+              temperature: 0,
+            },
+            { signal: ctrl.signal }
+          );
+          clearTimeout(timer);
+          console.log("[perf] llm_ms", Date.now() - llmStart, { callId, contract: "v2" });
+          rawV2 = resp.choices?.[0]?.message?.content ?? null;
+        } catch (e: any) {
+          // A network/timeout failure degrades to an honest v2 result rather than
+          // masquerading as a full model score (computeScoringV2Result maps a null
+          // raw to a degraded "invalid_model_output").
+          console.warn("[scoreWithLLM] v2 openai call failed, degrading:", e?.message || e);
+          rawV2 = null;
+        }
+      }
+      const v2Result = computeScoringV2Result({
+        scoringProvider,
+        resolvedScorecard,
+        resolvedContext,
+        transcript: deterministic.transcript,
+        segments: cleanedSegments as unknown as TranscriptSegment[],
+        voice: v2Voice,
+        raw: rawV2,
+        priorAverage: null,
+      });
+      validated = v2Result.validated;
+      scoredModel = v2Result.scoredModel;
+      scoreV2 = v2Result.scoreV2;
+    } else if (scoringProvider === "stub") {
       validated = buildStubScore();
       scoredModel = STUB_SCORING_MODEL;
     } else {
@@ -1998,11 +2243,26 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
       voice,
     };
 
-    // Provider-aware model version for provenance (openai path unchanged).
+    // Provider-aware model version for provenance (openai path unchanged). On the
+    // v2 path the version carries the v2 prompt/rubric markers.
     const scoringModelVersion =
-      scoringProvider === "stub"
-        ? `${STUB_SCORING_MODEL}:${SCORING_PROMPT_VERSION}:${RUBRIC_VERSION}`
-        : SCORING_MODEL_VERSION;
+      scoringContract === "v2"
+        ? scoringModelVersionV2(scoredModel)
+        : scoringProvider === "stub"
+          ? `${STUB_SCORING_MODEL}:${SCORING_PROMPT_VERSION}:${RUBRIC_VERSION}`
+          : SCORING_MODEL_VERSION;
+
+    // Day 269 — observability (no transcript text, no evidence quotes, no secrets).
+    console.log("[score] scored", {
+      callId,
+      contract: scoringContract,
+      provider: scoringProvider,
+      prompt_version: scoringContract === "v2" ? SCORING_PROMPT_VERSION_V2 : SCORING_PROMPT_VERSION,
+      rubric_version: scoringContract === "v2" ? RUBRIC_VERSION_V2 : RUBRIC_VERSION,
+      cache_key_version: scoringContract === "v2" ? CACHE_KEY_VERSION_V2 : "v1",
+      degraded: scoreV2 ? scoreV2.degraded_score : false,
+      degraded_reason: scoreV2 ? scoreV2.degraded_reason : null,
+    });
 
     const transcriptSegments = cleanedSegments;
 
@@ -2051,6 +2311,11 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
 
     (rubric as any)._meta.voice = voice;
     (rubric as any)._meta.scoring_provider = scoringProvider;
+    // Day 269 — stamp v2 provenance into _meta so the legacy WEB provenance reader
+    // agrees with analysis_json.v2. No-op on the v1 path (scoreV2 === null).
+    if (scoreV2) {
+      Object.assign((rubric as any)._meta, v2RubricMetaOverrides(scoreV2, scoringModelVersion));
+    }
 
     // Persist latest on calls
     const dbWriteStart = Date.now();
@@ -2075,6 +2340,9 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
           text: cleanedTranscript,
           segments: cleanedSegments,
         },
+        // Day 269 — the complete validated ScoreV2 (Day-268 UI reads this).
+        // Top-level v1 fields above are untouched; old readers ignore `.v2`.
+        ...(scoreV2 ? { v2: scoreV2 } : {}),
       },
       ai_model: scoringModelVersion,
       rubric_version: RUBRIC_VERSION,
@@ -2089,7 +2357,9 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
       cacheKey: deterministic.key,
       callSha256: ((call as any)?.sha256 as string | null) ?? null,
       transcriptHash: deterministic.transcriptHash,
-      result: parsed,
+      // v2 stores the ScoreV2 alongside the v1 projection so a cache hit restores
+      // both (Day 269). v1 stores exactly `parsed` as before.
+      result: scoreV2 ? ({ ...parsed, v2: scoreV2 } as any) : parsed,
     });
 
     // CRM Activity: record a score event (best-effort; non-blocking)

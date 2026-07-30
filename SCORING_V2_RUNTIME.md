@@ -50,9 +50,99 @@ v2 is adopted (a later day, with the Day-268 UI), the changes there are:
 4. persist the v2 object under `analysis_json.v2` and the v1 projection
    (`projectScoreV2ToV1`) exactly where the v1 shape lands today.
 
-Day 267 delivers and proves steps 1–4 as pure functions; it does not wire them
-into `scoreWithLLM`, so production behaviour and the provider default are
-unchanged. Adoption is a small, reversible follow-up.
+Day 267 delivered steps 1–4 as pure functions. **Day 269 wired them into
+`scoreWithLLM` behind the off-by-default `SCORING_CONTRACT` switch** — see the
+Day-269 section below.
+
+---
+
+## Day 269 — off-by-default production wiring
+
+`scoreWithLLM` now selects the OUTPUT contract from `SCORING_CONTRACT`, a switch
+**orthogonal** to `SCORING_PROVIDER`. **No environment is enabled**; the default
+is `v1` and rollback is one env value.
+
+### `SCORING_CONTRACT` values
+- `v2` (exact, case/space-insensitive) → the v2 contract.
+- unset · empty · `v1` · any other value (`true`, `enabled`, `latest`, `v3`, …)
+  → `v1`. No aliases. `resolveScoringContract()` never throws.
+
+### Off (`v1`) — the default, byte-identical
+Every v1 line is re-added verbatim inside a guard that is false when the contract
+is `v1`: the cache key is `buildDeterministicPromptKey` with identical args (a
+frozen-key gate asserts byte-identity), the v1 stub/OpenAI branches and
+`parseAndValidateScoreResponse` are unchanged, `scoringModelVersion` is the same
+v1 expression, and persistence writes the same `analysis_json`/`rubric._meta` and
+caches the same `result: parsed`. No `analysis_json.v2`, no v2 `_meta`.
+
+### On (`v2`)
+1. cache key → `buildScoreCacheKeyV2` (namespace `cachever=v2`, v2 prompt/rubric
+   markers, Day-262 `provider=stub` segment still stacks);
+2. resolve criteria via `resolveCriteriaSpec` (custom snapshot → custom criteria;
+   built-in → `gravix-default-criteria-v1`; empty/malformed → degraded
+   `insufficient_evidence`);
+3. provider stays selected by `SCORING_PROVIDER`: `openai` builds the v2 prompt
+   (`buildScoringV2Prompt`, `response_format: json_object`) and parses the raw
+   through `parseAndValidateScoreV2`; `stub` uses `buildStubScoreV2` (no call);
+4. deterministic roll-ups + `projectScoreV2ToV1` produce the v1-shaped result;
+5. persist: the four v1 top-level fields untouched **plus** the full `ScoreV2`
+   under `analysis_json.v2`, with `rubric._meta` stamped to agree
+   (`contract_version`, `rubric_version=v2`, `prompt_version=scoring-prompt-v2`,
+   `cache_key_version=v2`, confidence, degraded).
+
+All of steps 1–5 run through one exported, hermetic seam,
+`computeScoringV2Result(...)` (pure: no network, no DB) — the same function the
+Day-269 validator drives with mocked raw JSON and `SCORING_PROVIDER=stub`.
+
+### Provider ⟂ contract (independent dimensions)
+`provider ∈ {openai, stub}` × `contract ∈ {v1, v2}`. `SCORING_CONTRACT` never
+changes the provider; Claude is not added; no provider default changes.
+
+### v2 failure handling (honest degradation)
+Malformed/ungrounded model output or an OpenAI network failure → the Day-267
+fallback with `degraded_score=true` and a specific reason
+(`invalid_model_output`), never a result that looks fully model-scored. No
+transcript → `no_transcript`. Invalid v2 is never persisted as a real score.
+
+### Cache isolation
+v1 keys are byte-identical (no `cachever`); v2 can never read a v1 entry; openai-v2
+≠ stub-v2; custom-scorecard and context-versioned v2 each get their own namespace.
+A v2 cache entry stores `{ ...v1Projection, v2: ScoreV2 }` so a cache hit restores
+both. No manual purge — the version bump self-isolates.
+
+### Side effects
+Unchanged: 3 `updateCallScoreRow` / 2 `writeScoreCache` sites (no extra write from
+the projection), `SKIP_SCORING_SIDE_EFFECTS` still gates Slack/email/rep-memory,
+and stub/mocked validation touches neither DB nor network.
+
+### Observability
+One structured `[score] scored` log per run: `contract`, `provider`,
+`prompt_version`, `rubric_version`, `cache_key_version`, `degraded`,
+`degraded_reason`. No transcript text, no evidence quotes, no secrets.
+
+### Validation
+`npm run validate:scoring-v2-production-wiring`
+(`scripts/validate-scoring-v2-production-wiring-day-269.ts`, no network/DB/paid)
+— resolver, v1 byte-identity, 6-way cache isolation, provider⟂contract, the
+production seam (stub + mocked OpenAI through the Day-266 gates), honest
+degradation, the persisted shape + Day-268 integration fixture
+(`test/fixtures/scoring-v2/production-persisted-day-269.json`), static wiring
+invariants, and non-vacuity. Day 265–267 validators run unchanged.
+
+### Rollout / rollback
+- **Do not enable globally.** First prove in a controlled local/staging run:
+  `SCORING_CONTRACT=v2 SCORING_PROVIDER=stub` (no cost), then
+  `SCORING_CONTRACT=v2 SCORING_PROVIDER=openai` against **mocked** responses.
+- A **real paid OpenAI** proof requires explicit approval (Day 270).
+- **Rollback** = unset `SCORING_CONTRACT` or set `SCORING_CONTRACT=v1`. Because the
+  v1 path is byte-identical and v2 lives in a separate cache namespace, rollback is
+  inert — no migration, no cache purge, no provider change.
+
+### Day 270 hand-off
+Controlled staging activation proof: enable `SCORING_CONTRACT=v2` in a single
+staging environment, score a known call with the stub then a mocked/real
+(approved) OpenAI response, and confirm end-to-end that `analysis_json.v2`
+persists and the Day-268 UI renders it — without touching production defaults.
 
 ---
 
@@ -215,7 +305,9 @@ regression. Self-check: the runtime opens no DB/network/SDK handle.
 
 ## Rollback
 
-Delete `src/lib/scoringV2.ts`, `scripts/validate-scoring-output-v2-day-267.ts`
-and the `validate:scoring-output-v2` package script, or `git revert` the Day-267
-commit. Because nothing in `scoreWithLLM`/the v1 cache namespace/the DB changed,
-rollback is inert — no data migration, no cache invalidation, no provider change.
+Since Day 269, `scoreWithLLM` is wired but **off by default** — the primary
+rollback is operational: unset `SCORING_CONTRACT` (or set it to `v1`). The v1 path
+is byte-identical and v2 uses a separate cache namespace, so this is inert — no
+migration, no cache purge, no provider change (see the Day-269 section). To remove
+the code entirely, `git revert` the Day-267 + Day-269 commits; nothing in the DB
+schema changed.
