@@ -1,0 +1,301 @@
+{
+  "note": "Day 270 test-only — full persisted CALL ROW after a v2 score with a MOCKED OpenAI response (no network). Used to prove the shape validator; staging proof itself is stub-only.",
+  "call": {
+    "id": "staging-day270-mock-openai-fixture",
+    "score_overall": 73,
+    "ai_model": "gpt-4o-mini:scoring-prompt-v2:v2",
+    "rubric": {
+      "intro": {
+        "score": 80,
+        "notes": "Keep the crisp agenda."
+      },
+      "discovery": {
+        "score": 60,
+        "notes": "Current process found, decision route not."
+      },
+      "objection": {
+        "score": 73,
+        "notes": "Not assessed on this call."
+      },
+      "close": {
+        "score": 78,
+        "notes": "Lock the date."
+      },
+      "_meta": {
+        "rubric_version": "v2",
+        "prompt_version": "scoring-prompt-v2",
+        "model_version": "gpt-4o-mini",
+        "scoring_model_version": "gpt-4o-mini:scoring-prompt-v2:v2",
+        "scorecard_name": "Gravix default rubric",
+        "scorecard_source": "gravix_default",
+        "scoring_provider": "openai",
+        "transcript_present": true,
+        "voice": {
+          "clarity": 60,
+          "confidence": 55,
+          "filler_density": 0,
+          "pace": 50,
+          "overall": 55
+        },
+        "scoring_contract": "v2",
+        "contract_version": "v2",
+        "cache_key_version": "v2",
+        "criteria_version": "gravix-default-criteria-v1",
+        "confidence": {
+          "level": "medium",
+          "value": 0.72
+        },
+        "degraded_score": false,
+        "degraded_reason": null
+      }
+    },
+    "analysis_json": {
+      "overall": 73,
+      "summary": "Good structure with a soft discovery.",
+      "stages": {
+        "intro": {
+          "score": 80,
+          "notes": "Keep the crisp agenda."
+        },
+        "discovery": {
+          "score": 60,
+          "notes": "Current process found, decision route not."
+        },
+        "objection": {
+          "score": 73,
+          "notes": "Not assessed on this call."
+        },
+        "close": {
+          "score": 78,
+          "notes": "Lock the date."
+        }
+      },
+      "moments": [
+        {
+          "timestamp": 0,
+          "type": "highlight",
+          "text": "let's keep this to fifteen minutes and agree a next step.",
+          "severity": "low"
+        },
+        {
+          "timestamp": 5,
+          "type": "mistake",
+          "text": "We review calls manually right now.",
+          "severity": "medium"
+        },
+        {
+          "timestamp": 16,
+          "type": "closing_attempt",
+          "text": "Shall we get a follow-up in the diary for Thursday?",
+          "severity": "low"
+        }
+      ],
+      "suggestions": [
+        "Keep the crisp agenda.",
+        "Map the buying group.",
+        "None surfaced.",
+        "Lock the date."
+      ],
+      "voice": {
+        "clarity": 60,
+        "confidence": 55,
+        "filler_density": 0,
+        "pace": 50,
+        "overall": 55
+      },
+      "transcript": {
+        "text": "Thanks for the time, let's keep this to fifteen minutes and agree a next step.\nSure. We review calls manually right now.\nWe work with twelve gyms on exactly this problem.\nShall we get a follow-up in the diary for Thursday?",
+        "segments": [
+          {
+            "idx": 0,
+            "speaker": "rep",
+            "start_sec": 0,
+            "end_sec": 5,
+            "text": "Thanks for the time, let's keep this to fifteen minutes and agree a next step."
+          },
+          {
+            "idx": 1,
+            "speaker": "buyer",
+            "start_sec": 5,
+            "end_sec": 10,
+            "text": "Sure. We review calls manually right now."
+          },
+          {
+            "idx": 2,
+            "speaker": "rep",
+            "start_sec": 10,
+            "end_sec": 16,
+            "text": "We work with twelve gyms on exactly this problem."
+          },
+          {
+            "idx": 3,
+            "speaker": "rep",
+            "start_sec": 16,
+            "end_sec": 22,
+            "text": "Shall we get a follow-up in the diary for Thursday?"
+          }
+        ]
+      },
+      "v2": {
+        "contract_version": "v2",
+        "overall_score": 73,
+        "summary": "Good structure with a soft discovery.",
+        "stages": [
+          {
+            "stage": "intro",
+            "score": 80,
+            "weight": 25,
+            "status": "pass",
+            "notes": "Keep the crisp agenda.",
+            "criteria": [
+              {
+                "criterion_id": "gravix_default:intro:set-agenda-and-establish-credibility",
+                "label": "Set agenda and establish credibility",
+                "stage": "intro",
+                "score": 80,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "standard",
+                "pass_fail": false,
+                "critical": false,
+                "evidence": [
+                  {
+                    "quote": "let's keep this to fifteen minutes and agree a next step.",
+                    "segment_index": 0,
+                    "start_sec": 0,
+                    "end_sec": 5,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Keep the crisp agenda.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "discovery",
+            "score": 60,
+            "weight": 25,
+            "status": "partial",
+            "notes": "Current process found, decision route not.",
+            "criteria": [
+              {
+                "criterion_id": "gravix_default:discovery:uncover-pain-current-process-and-decision-route",
+                "label": "Uncover pain, current process and decision route",
+                "stage": "discovery",
+                "score": 60,
+                "status": "partial",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "critical": false,
+                "evidence": [
+                  {
+                    "quote": "We review calls manually right now.",
+                    "segment_index": 1,
+                    "start_sec": 5,
+                    "end_sec": 10,
+                    "speaker": "buyer"
+                  }
+                ],
+                "why_points_lost": "Current process found, decision route not.",
+                "points_lost": 10,
+                "coaching_action": "Map the buying group.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "objection",
+            "score": null,
+            "weight": 25,
+            "status": "not_observed",
+            "notes": "None surfaced.",
+            "criteria": [
+              {
+                "criterion_id": "gravix_default:objection:isolate-the-objection-and-reframe-value",
+                "label": "Isolate the objection and reframe value",
+                "stage": "objection",
+                "score": null,
+                "status": "not_observed",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "critical": false,
+                "evidence": [],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "None surfaced.",
+                "suggested_drill": null
+              }
+            ]
+          },
+          {
+            "stage": "close",
+            "score": 78,
+            "weight": 25,
+            "status": "pass",
+            "notes": "Lock the date.",
+            "criteria": [
+              {
+                "criterion_id": "gravix_default:close:secure-clear-next-step-and-commitment",
+                "label": "Secure clear next step and commitment",
+                "stage": "close",
+                "score": 78,
+                "status": "pass",
+                "weight": 100,
+                "emphasis": "high",
+                "pass_fail": false,
+                "critical": false,
+                "evidence": [
+                  {
+                    "quote": "Shall we get a follow-up in the diary for Thursday?",
+                    "segment_index": 3,
+                    "start_sec": 16,
+                    "end_sec": 22,
+                    "speaker": "rep"
+                  }
+                ],
+                "why_points_lost": null,
+                "points_lost": null,
+                "coaching_action": "Lock the date.",
+                "suggested_drill": null
+              }
+            ]
+          }
+        ],
+        "objection_matches": [],
+        "confidence": {
+          "level": "medium",
+          "value": 0.72
+        },
+        "degraded_score": false,
+        "degraded_reason": null,
+        "voice": {
+          "clarity": 60,
+          "confidence": 55,
+          "filler_density": 0,
+          "pace": 50,
+          "overall": 55
+        },
+        "provenance": {
+          "scoring_provider": "openai",
+          "scoring_model": "gpt-4o-mini",
+          "scorecard_source": "gravix_default",
+          "scorecard_id": null,
+          "scorecard_version_id": null,
+          "scorecard_version": null,
+          "scorecard_name": "Gravix default rubric",
+          "context_version": null,
+          "prompt_version": "scoring-prompt-v2",
+          "rubric_version": "v2",
+          "cache_key_version": "v2",
+          "criteria_version": "gravix-default-criteria-v1"
+        },
+        "trend_delta": 0
+      }
+    }
+  }
+}
