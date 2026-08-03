@@ -40,6 +40,13 @@ DB/network**:
 
 To run the real proof, supply a confirmed staging target and follow §2–§6.
 
+**Day 271 update:** the staging-environment foundation + safety guard now exist —
+see `STAGING_ENVIRONMENT.md` (architecture, resource names, env-var names,
+schema/seed process, isolation validator `npm run validate:staging-environment`,
+and the operator's manual provisioning steps). Cloud resources are **not yet
+created** (no authenticated cloud org was confirmable in the workspace), so the
+live proof still awaits the operator provisioning staging per that document.
+
 ---
 
 ## §1. Preconditions

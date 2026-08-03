@@ -99,6 +99,7 @@
     "validate:scoring-v2-harness": "tsx scripts/validate-scoring-v2-harness-day-266.ts",
     "validate:scoring-output-v2": "tsx scripts/validate-scoring-output-v2-day-267.ts",
     "validate:scoring-v2-production-wiring": "tsx scripts/validate-scoring-v2-production-wiring-day-269.ts",
-    "validate:scoring-v2-staging-activation": "tsx scripts/validate-scoring-v2-staging-activation-day-270.ts"
+    "validate:scoring-v2-staging-activation": "tsx scripts/validate-scoring-v2-staging-activation-day-270.ts",
+    "validate:staging-environment": "tsx scripts/validate-staging-environment-day-271.ts"
   }
 }
