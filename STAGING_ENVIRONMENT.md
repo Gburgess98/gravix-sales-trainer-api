@@ -122,11 +122,27 @@ Use existing seed tooling against the staging project. Suggested labelled record
 (no real customer data, no real emails/phones/recordings):
 
 - company `Gravix Staging QA`
-- manager `Dana Staging`, rep `Jamie Staging` (controlled QA aliases only)
 - UFC/default scorecard + the 8 approved Objection Library items
 - **`DAY272_SCORING_V2_STUB_PROOF`** — dedicated call with transcript + segments,
   known stage content, no customer info (the Day-272 stub-proof fixture)
 - **`DAY272_V1_FALLBACK_PROOF`** — a v1-only call for the fallback UI proof
+
+### QA login identities (Day 273 — supported Admin Auth API only)
+
+`sql/seed/staging-day272-fixtures.sql` seeds **only** the synthetic tenant + call
+fixtures. It no longer writes `auth.users` or `public.profiles` directly: those
+hand-written rows were malformed for GoTrue ("Database error loading user").
+Provision disposable QA logins through the supported Supabase Admin Auth API:
+
+```bash
+APP_ENV=staging EXPECTED_STAGING_SUPABASE_REF=<ref> STAGING_QA_PASSWORD=… \
+  npm run staging:qa -- create      # auth user + profile + reps tenant bridge
+… npm run staging:qa -- verify      # sign-in (staging issuer) + tenant-scoped read
+… npm run staging:qa -- delete      # teardown (auth id + profile cascade + rep)
+```
+
+Offline check: `npm run validate:staging-qa-identity`. Full details in
+`STAGING_QA_IDENTITY_RUNBOOK.md`.
 
 ---
 
@@ -156,6 +172,8 @@ network-free self-test lane.
 - WEB: page loads, auth + API calls hit only staging endpoints (browser network
   log shows no production hosts), no console errors, staging marker visible,
   desktop + mobile usable.
+- QA login: `npm run staging:qa -- verify` proves password sign-in from the
+  staging issuer + tenant-scoped fixture access (Day 273; no secrets printed).
 
 ## Rollback / deletion
 

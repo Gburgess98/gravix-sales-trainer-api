@@ -2,6 +2,17 @@
 -- STAGING ONLY. Do NOT run against production. All data below is synthetic
 -- (deterministic 0000…-2711/2722 UUIDs, no real customer/user/email/recording).
 -- Idempotent: safe to re-run. No secrets.
+--
+-- Day 273 — This seed no longer writes auth.users directly. Hand-crafted
+-- auth.users rows are malformed for GoTrue (missing the fields the Auth service
+-- populates), which made admin list/read fail with "Database error loading user".
+-- LOGIN identities are now provisioned exclusively through the supported Supabase
+-- Admin Auth API by `scripts/provision-staging-qa.ts`
+-- (`npm run staging:qa -- create`), which creates the auth user and then upserts
+-- its public.profiles row and public.reps tenant bridge into the org/company
+-- below. This file seeds only the synthetic tenant + call fixtures, none of which
+-- foreign-key to auth.users (only public.profiles.user_id does), so it is safe to
+-- run without any auth rows present.
 
 begin;
 
@@ -20,19 +31,11 @@ values ('00000000-2711-0000-0000-000000000003',
         'Gravix Staging QA', 'gravix-staging-qa')
 on conflict (id) do nothing;
 
--- People (synthetic QA identities; controlled QA emails only) -----------------
--- Synthetic auth users (profiles.user_id FKs to auth.users). Minimal rows; these
--- are fixtures and are NOT expected to log in interactively.
-insert into auth.users (id, instance_id, aud, role, email, created_at, updated_at)
-values ('00000000-2711-0000-0000-00000000000a','00000000-0000-0000-0000-000000000000','authenticated','authenticated','dana.staging@gravix.invalid', now(), now()),
-       ('00000000-2711-0000-0000-00000000000b','00000000-0000-0000-0000-000000000000','authenticated','authenticated','jamie.staging@gravix.invalid', now(), now())
-on conflict (id) do nothing;
-
-insert into public.profiles (user_id, role, email, full_name)
-values ('00000000-2711-0000-0000-00000000000a', 'manager', 'dana.staging@gravix.invalid', 'Dana Staging'),
-       ('00000000-2711-0000-0000-00000000000b', 'rep',     'jamie.staging@gravix.invalid', 'Jamie Staging')
-on conflict (user_id) do nothing;
-
+-- People (synthetic tenant data; NOT login identities) ------------------------
+-- The synthetic call-owner rep below is pure tenant data and does NOT foreign-key
+-- to auth.users. Interactive QA logins (auth user + profile + rep bridge) are
+-- provisioned separately via scripts/provision-staging-qa.ts (Admin Auth API),
+-- never by hand-written auth.users / profiles rows here (Day 273).
 insert into public.reps (id, org_id, company_id, tier, name, display_name, first_name, last_name, email)
 values ('00000000-2711-0000-0000-00000000000c',
         '00000000-2711-0000-0000-000000000002',
