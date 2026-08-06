@@ -10,3 +10,6 @@ dist/
 *.wav
 *.mp3
 sample_call.wav/
+
+# supabase CLI project link (must not be committed)
+supabase/.temp/
