@@ -46,7 +46,7 @@ insert into public.calls (
   id, user_id, org_id, company_id, filename, title, status,
   storage_path, audio_path, transcript, analysis_json, created_at
 ) values (
-  '00000000-2722-0000-0000-000000000001',
+  '00000000-2722-4000-8000-000000000001',
   '00000000-2711-0000-0000-00000000000b',
   '00000000-2711-0000-0000-000000000002',
   '00000000-2711-0000-0000-000000000003',
@@ -75,7 +75,7 @@ insert into public.calls (
   id, user_id, org_id, company_id, filename, title, status,
   storage_path, audio_path, transcript, score_overall, ai_model, rubric, analysis_json, scored_at, created_at
 ) values (
-  '00000000-2722-0000-0000-000000000002',
+  '00000000-2722-4000-8000-000000000002',
   '00000000-2711-0000-0000-00000000000b',
   '00000000-2711-0000-0000-000000000002',
   '00000000-2711-0000-0000-000000000003',
