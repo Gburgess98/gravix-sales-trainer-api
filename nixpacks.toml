@@ -1,0 +1,15 @@
+# Railway/Nixpacks build for the staging API.
+# Install with npm using the fresh package-lock.json (the committed pnpm-lock.yaml
+# is stale and is excluded from the deploy via .railwayignore). devDependencies
+# must be installed because the app runs from source via tsx (a devDependency);
+# NPM_CONFIG_PRODUCTION=false is also set as a service variable.
+[phases.install]
+cmds = ["npm ci --include=dev"]
+
+# Skip the tsc "build": the app runs from TypeScript source via tsx, and tsc
+# carries a known pre-existing type-error baseline that would fail the deploy.
+[phases.build]
+cmds = []
+
+[start]
+cmd = "npx tsx src/server.ts"

@@ -4,3 +4,6 @@ dist
 .env
 sample_call.wav
 supabase/.temp
+# Stale pnpm-lock.yaml (May) is out of sync with package.json; exclude it so the
+# builder uses the fresh package-lock.json via npm instead of frozen pnpm.
+pnpm-lock.yaml
