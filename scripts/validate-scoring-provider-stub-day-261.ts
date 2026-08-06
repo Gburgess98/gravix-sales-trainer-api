@@ -89,6 +89,18 @@ async function main() {
   const resolveBody = src.slice(src.indexOf("export function resolveScoringProvider"), src.indexOf("export function buildStubScore"));
   check("provider resolver does NOT read SKIP_SCORING_SIDE_EFFECTS (independent)", !/SKIP_SCORING_SIDE_EFFECTS/.test(resolveBody));
   check("stub branch does not force-skip side effects itself", !/scoringProvider\s*===\s*["']stub["'][\s\S]{0,400}SKIP_SCORING_SIDE_EFFECTS/.test(src));
+  check(
+    "stub skips embedding-backed knowledge searches",
+    /scoringProvider\s*===\s*["']stub["']\s*\?\s*\{\s*playbookText:\s*["']["'],\s*repMemoryText:\s*["']["']\s*\}/.test(src)
+  );
+  check(
+    "side-effect guard blocks automatic critical assignments",
+    /ensureCriticalCallAssignment[\s\S]{0,700}if\s*\(SKIP_SCORING_SIDE_EFFECTS\)[\s\S]{0,160}side_effects_disabled/.test(src)
+  );
+  check(
+    "side-effect guard blocks review-flag activity writes",
+    (src.match(/!SKIP_SCORING_SIDE_EFFECTS\s*&&\s*reviewFlags\.length\s*>\s*0/g) || []).length === 2
+  );
 
   console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${failures} failure(s). No paid calls made.`);
   process.exit(failures === 0 ? 0 : 1);

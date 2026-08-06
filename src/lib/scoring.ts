@@ -1278,6 +1278,10 @@ async function ensureCriticalCallAssignment(args: {
   reviewFlags: Array<{ type: string; severity: "low" | "critical"; section: string; score: number; timestamp?: number | null }>;
   source: "scoring_engine" | "scoring_engine_fallback";
 }) {
+  if (SKIP_SCORING_SIDE_EFFECTS) {
+    return { ok: true, skipped: true, reason: "side_effects_disabled" };
+  }
+
   const hasCriticalFlag = args.reviewFlags.some(f => f.severity === "critical");
 
   if (
@@ -2090,11 +2094,16 @@ export async function scoreWithLLM(opts: {
       };
     }
 
-    const knowledge = await getScoringKnowledgeContext(supabase, {
-      companyId: (call as any)?.org_id ?? null,
-      userId: String((call as any)?.user_id ?? ""),
-      transcript: cleanedTranscript,
-    });
+    // The deterministic stub must be genuinely network-free. Knowledge search
+    // uses embeddings, so skip it entirely when the stub provider is selected.
+    const knowledge =
+      scoringProvider === "stub"
+        ? { playbookText: "", repMemoryText: "" }
+        : await getScoringKnowledgeContext(supabase, {
+            companyId: (call as any)?.org_id ?? null,
+            userId: String((call as any)?.user_id ?? ""),
+            transcript: cleanedTranscript,
+          });
     // Build prompt
     const userLines = [
       `CALL META: filename="${call.filename || call.id}"`,
@@ -2402,7 +2411,7 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
 
     // CRM Activity: review_flag (structured fallback)
     try {
-      if (reviewFlags.length > 0) {
+      if (!SKIP_SCORING_SIDE_EFFECTS && reviewFlags.length > 0) {
         const svc = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
         await svc.from('crm_activities').insert(
@@ -2657,7 +2666,7 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
 
     // CRM Activity: review_flag (structured + analytics-ready)
     try {
-      if (reviewFlags.length > 0) {
+      if (!SKIP_SCORING_SIDE_EFFECTS && reviewFlags.length > 0) {
         const svc = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
         await svc.from('crm_activities').insert(
