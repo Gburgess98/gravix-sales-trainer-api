@@ -8,7 +8,7 @@ import { createClient } from "@supabase/supabase-js";
 
 import { randomUUID } from "crypto";
 import { postSlack, postAssignNotification /* , postScoreSummary */ } from "./lib/slack";
-import { scoreWithLLM } from "./lib/scoring";
+import { scoreWithLLM, resolveScoringContract, resolveScoringProvider } from "./lib/scoring";
 import { cleanTranscript, buildSegments } from "./lib/transcript";
 
 import { securityHeaders } from "./middleware/security";
@@ -1028,10 +1028,22 @@ app.post(
 
 // --- Health & Version ---
 app.get("/v1/version", (_req, res) => {
+  // Safe, non-secret deploy marker. `app_env` proves which environment this is
+  // (invisible/absent in production); the scoring block reports the resolved
+  // runtime config so staging isolation can be verified without any secret.
   res.json({
     ok: true,
-    version: process.env.GIT_SHA || "dev",
+    version:
+      process.env.RAILWAY_GIT_COMMIT_SHA ||
+      process.env.GIT_SHA ||
+      "dev",
     buildTime: process.env.BUILD_TIME || null,
+    app_env: process.env.APP_ENV || null,
+    scoring: {
+      contract: resolveScoringContract(),
+      provider: resolveScoringProvider(),
+      side_effects_disabled: process.env.SKIP_SCORING_SIDE_EFFECTS === "1",
+    },
   });
 });
 
