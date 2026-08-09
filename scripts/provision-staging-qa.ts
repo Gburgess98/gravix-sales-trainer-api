@@ -237,6 +237,20 @@ function guardOrExit(env: ReturnType<typeof readEnv>): void {
 
 /** Find an existing QA auth user id by email (paged admin listing). */
 async function findAuthUserId(admin: SupabaseClient, email: string): Promise<string | null> {
+  // Prefer the application-owned profile bridge. Older malformed auth.users seed
+  // rows can make GoTrue's global listUsers endpoint fail before it reaches the
+  // valid disposable QA identity, while profiles.user_id gives us its exact ID.
+  const { data: profile } = await admin
+    .from("profiles")
+    .select("user_id")
+    .eq("email", email)
+    .maybeSingle();
+  if (profile?.user_id) {
+    const { data, error } = await admin.auth.admin.getUserById(profile.user_id);
+    const foundEmail = (data?.user?.email || "").toLowerCase();
+    if (!error && foundEmail === email.toLowerCase()) return profile.user_id;
+  }
+
   let page = 1;
   // eslint-disable-next-line no-constant-condition
   while (true) {
