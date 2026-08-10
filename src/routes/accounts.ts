@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { logAuditEvent, AUDIT_ACTIONS } from '../lib/audit.ts';
 
@@ -8,6 +8,24 @@ const supa = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_ROLE_KEY!
 );
+
+// Day 278 — reject a non-UUID path parameter with a stable 400 *before* any DB
+// query, so a bad account/task id can't reach Postgres and surface as a 500 with
+// "invalid input syntax for type uuid" (which leaks the DB type and turns a client
+// mistake into a server error). Mirrors the Calls detail route's UUID_RE guard.
+// Registered as router.param so it covers every Accounts route with an :id / :taskId
+// path segment. Valid-id resolution and tenant isolation are unchanged.
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function requireUuidParam(req: Request, res: Response, next: NextFunction, value: string) {
+  if (!UUID_RE.test(String(value ?? ''))) {
+    return res.status(400).json({ ok: false, error: 'invalid id' });
+  }
+  next();
+}
+router.param('id', requireUuidParam);
+router.param('taskId', requireUuidParam);
 
 function getUserId(req: Request) {
   return String(

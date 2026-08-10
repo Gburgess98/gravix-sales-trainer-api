@@ -194,9 +194,29 @@ export function redact(v: string | null | undefined): string {
   return v && String(v).trim() ? "«set»" : "«unset»";
 }
 
+export interface PresenceState {
+  authPresent: boolean;
+  repPresent: boolean;
+  profilePresent: boolean;
+}
+
+/**
+ * Day 278 — pure teardown verdict. A completed teardown must leave NOTHING behind:
+ * no Auth identity, no reps bridge, no profile row. Returns `absent:true` only when
+ * all three are gone, and names whatever remains. Kept pure so the validator can
+ * prove the check fails non-vacuously for a simulated present state.
+ */
+export function evaluateTeardown(state: PresenceState): { absent: boolean; remaining: string[] } {
+  const remaining: string[] = [];
+  if (state.authPresent) remaining.push("auth identity");
+  if (state.repPresent) remaining.push("reps bridge");
+  if (state.profilePresent) remaining.push("profiles row");
+  return { absent: remaining.length === 0, remaining };
+}
+
 // ── CLI (side-effecting; not imported by the validator) ────────────────────────
 
-type Action = "create" | "verify" | "status" | "delete";
+type Action = "create" | "verify" | "status" | "delete" | "teardown";
 
 function readEnv() {
   const url = process.env.SUPABASE_URL || "";
@@ -395,10 +415,41 @@ async function deleteIdentity(admin: SupabaseClient, env: ReturnType<typeof read
   }
 }
 
+/** Read the current presence of all three artefacts (used by teardown). */
+async function probePresence(admin: SupabaseClient, email: string): Promise<PresenceState> {
+  const authId = await findAuthUserId(admin, email);
+  const { data: rep } = await admin.from("reps").select("id").eq("email", email).maybeSingle();
+  let profilePresent = false;
+  if (authId) {
+    const { data: prof } = await admin.from("profiles").select("user_id").eq("user_id", authId).maybeSingle();
+    profilePresent = !!prof;
+  }
+  return { authPresent: !!authId, repPresent: !!rep, profilePresent };
+}
+
+/**
+ * Day 278 — teardown discipline. Always `delete`, then re-check and FAIL VISIBLY
+ * (exit 1) if anything remains. This is the command an audit runs at the end so a
+ * disposable identity is never silently left behind.
+ */
+async function teardownIdentity(admin: SupabaseClient, env: ReturnType<typeof readEnv>): Promise<void> {
+  await deleteIdentity(admin, env);
+  const state = await probePresence(admin, env.email);
+  const verdict = evaluateTeardown(state);
+  console.log(
+    `  Post-delete presence: auth=${state.authPresent} reps=${state.repPresent} profile=${state.profilePresent}`
+  );
+  if (verdict.absent) {
+    console.log("  ✓ TEARDOWN VERIFIED — identity absent (auth + reps + profile all gone)");
+  } else {
+    die(`TEARDOWN INCOMPLETE — still present: ${verdict.remaining.join(", ")}`);
+  }
+}
+
 async function main() {
   const action = (process.argv[2] || "").toLowerCase() as Action;
-  if (!["create", "verify", "status", "delete"].includes(action)) {
-    die("Usage: npm run staging:qa -- <create|verify|status|delete>");
+  if (!["create", "verify", "status", "delete", "teardown"].includes(action)) {
+    die("Usage: npm run staging:qa -- <create|verify|status|delete|teardown>");
   }
 
   const env = readEnv();
@@ -420,6 +471,7 @@ async function main() {
     else if (action === "verify") await verifyIdentity(admin, env);
     else if (action === "status") await statusIdentity(admin, env);
     else if (action === "delete") await deleteIdentity(admin, env);
+    else if (action === "teardown") await teardownIdentity(admin, env);
     console.log("\n  ✓ Done.\n");
   } catch (err) {
     die(err instanceof Error ? err.message : String(err));

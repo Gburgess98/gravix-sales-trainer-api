@@ -4,6 +4,8 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import { createClient } from "@supabase/supabase-js";
 
 import { randomUUID } from "crypto";
@@ -1027,6 +1029,19 @@ app.post(
 );
 
 // --- Health & Version ---
+// Day 278 — resolve the deploy marker from src/build-info.json (stamped with the
+// real commit at `railway up` time by scripts/write-build-info.mjs), because
+// `railway up` does not populate RAILWAY_GIT_COMMIT_SHA and the static GIT_SHA
+// service var goes stale. Read once at startup; fall back to env vars, then "dev".
+const BUILD_INFO: { commit?: string | null; dirty?: boolean; builtAt?: string | null } =
+  (() => {
+    try {
+      return JSON.parse(fs.readFileSync(path.join(__dirname, "build-info.json"), "utf8"));
+    } catch {
+      return {};
+    }
+  })();
+
 app.get("/v1/version", (_req, res) => {
   // Safe, non-secret deploy marker. `app_env` proves which environment this is
   // (invisible/absent in production); the scoring block reports the resolved
@@ -1035,9 +1050,11 @@ app.get("/v1/version", (_req, res) => {
     ok: true,
     version:
       process.env.RAILWAY_GIT_COMMIT_SHA ||
+      (BUILD_INFO.commit || undefined) ||
       process.env.GIT_SHA ||
       "dev",
-    buildTime: process.env.BUILD_TIME || null,
+    dirty: BUILD_INFO.dirty ?? undefined,
+    buildTime: BUILD_INFO.builtAt || process.env.BUILD_TIME || null,
     app_env: process.env.APP_ENV || null,
     scoring: {
       contract: resolveScoringContract(),

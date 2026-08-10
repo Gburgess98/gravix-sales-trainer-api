@@ -104,6 +104,10 @@
     "validate:staging-environment": "tsx scripts/validate-staging-environment-day-271.ts",
     "validate:staging-qa-identity": "tsx scripts/validate-staging-qa-identity-day-273.ts",
     "validate:staging-fixtures": "tsx scripts/validate-staging-fixtures-day-276.ts",
-    "validate:accounts-company-scope": "tsx scripts/validate-accounts-company-scope-day-277.ts"
+    "validate:accounts-company-scope": "tsx scripts/validate-accounts-company-scope-day-277.ts",
+    "build:info": "node scripts/write-build-info.mjs",
+    "deploy:staging": "node scripts/write-build-info.mjs && railway up",
+    "validate:accounts-uuid-guard": "tsx scripts/validate-accounts-uuid-guard-day-278.ts",
+    "validate:staging-qa-teardown": "tsx scripts/validate-staging-qa-teardown-day-278.ts"
   }
 }
