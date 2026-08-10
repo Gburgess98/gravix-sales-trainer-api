@@ -21,7 +21,7 @@ function getUserId(req: Request) {
 async function getRequesterContext(userId: string) {
   if (!userId) return null;
 
-  const { data } = await supa
+  const { data: userRow } = await supa
     .from('users')
     .select(`
     id,
@@ -34,7 +34,32 @@ async function getRequesterContext(userId: string) {
     .eq('id', userId)
     .maybeSingle();
 
-  return data || null;
+  if (userRow?.company_id) return userRow;
+
+  // Day 277 — auth-first identities (created via the supported Admin Auth API +
+  // reps bridge, with no legacy public.users row) carry their company on the
+  // reps row. Fall back to it so company-scoped Accounts reads/writes resolve
+  // instead of 403 "missing_company_context". Mirrors resolveCompanyId() (used by
+  // the create handler) and routes/team.ts. Tenant isolation is unchanged: the
+  // resolved company is the identity's own reps.company_id.
+  const { data: repRow } = await supa
+    .from('reps')
+    .select('company_id, manager_id, tier')
+    .eq('id', userId)
+    .maybeSingle();
+
+  if ((repRow as any)?.company_id) {
+    return {
+      id: userId,
+      company_id: String((repRow as any).company_id),
+      office_id: null,
+      role: (userRow as any)?.role ?? (repRow as any).tier ?? null,
+      manager_id: (repRow as any).manager_id ?? (userRow as any)?.manager_id ?? null,
+      is_admin: (userRow as any)?.is_admin ?? false,
+    };
+  }
+
+  return userRow || null;
 }
 
 function buildAccountVisibilityFilter(query: any, requester: any) {
