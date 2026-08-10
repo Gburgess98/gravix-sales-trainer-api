@@ -16,6 +16,22 @@
 
 begin;
 
+-- Day 276 — remove STALE duplicate fixtures with malformed UUIDs. ------------
+-- Day 272 first seeded the proof calls under UUID-version/variant-zero ids
+-- (00000000-2722-0000-0000-…001/002), then CLONED them to valid ids
+-- (00000000-2722-4000-8000-…001/002) but left the originals in place. The library
+-- list endpoint returns every row, so both twins appeared; opening the malformed
+-- twin failed because GET /v1/calls/:id correctly rejects the invalid UUID
+-- ("invalid id"), producing a detail page with no scored rubric. Delete the stale
+-- twins (and their score history) so each fixture is a single, openable row.
+-- Idempotent: no-ops once removed. The valid 4000-8000 ids are seeded below.
+delete from public.call_scores
+ where call_id in ('00000000-2722-0000-0000-000000000001',
+                   '00000000-2722-0000-0000-000000000002');
+delete from public.calls
+ where id in ('00000000-2722-0000-0000-000000000001',
+              '00000000-2722-0000-0000-000000000002');
+
 -- Tenant / org / company hierarchy -------------------------------------------
 insert into public.tmcs (id, name, slug)
 values ('00000000-2711-0000-0000-000000000001', 'Gravix Staging TMC', 'gravix-staging-tmc')

@@ -102,6 +102,7 @@
     "validate:scoring-v2-production-wiring": "tsx scripts/validate-scoring-v2-production-wiring-day-269.ts",
     "validate:scoring-v2-staging-activation": "tsx scripts/validate-scoring-v2-staging-activation-day-270.ts",
     "validate:staging-environment": "tsx scripts/validate-staging-environment-day-271.ts",
-    "validate:staging-qa-identity": "tsx scripts/validate-staging-qa-identity-day-273.ts"
+    "validate:staging-qa-identity": "tsx scripts/validate-staging-qa-identity-day-273.ts",
+    "validate:staging-fixtures": "tsx scripts/validate-staging-fixtures-day-276.ts"
   }
 }
