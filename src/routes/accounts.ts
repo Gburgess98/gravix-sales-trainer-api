@@ -271,6 +271,70 @@ router.post('/', async (req: Request, res: Response) => {
 });
 
 /* ----------------------------------------------------------------
+   GET /v1/accounts/escalations
+   MUST be registered before GET /:id — Express matches by definition order, and
+   a generic /:id above this would capture the literal "escalations" segment (the
+   Day-278 UUID guard would then reject it as an invalid id). Day 279.
+----------------------------------------------------------------- */
+router.get('/escalations', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+
+    const requester = await getRequesterContext(userId);
+
+    if (!requester?.company_id) {
+      return res.status(403).json({
+        ok: false,
+        error: 'missing_company_context',
+      });
+    }
+
+    let escalationQuery = supa
+      .from('account_escalations')
+      .select(`
+        id,
+        account_id,
+        severity,
+        status,
+        escalation_reason,
+        intervention_required,
+        assigned_manager_id,
+        triggered_by,
+        workflow_stage,
+        metadata,
+        created_at,
+        updated_at
+      `)
+      // Day 279 — account_escalations is company-scoped via `company_id` (there is
+      // no `org_id` column; the old name 500'd, but the route was unreachable so it
+      // was never hit). Scope to the requester's own company_id — isolation intact.
+      .eq('company_id', requester.company_id)
+      .order('created_at', { ascending: false })
+      .limit(100);
+
+    const { data: escalations, error } =
+      await escalationQuery;
+
+    if (error) {
+      throw error;
+    }
+
+    return res.json({
+      ok: true,
+      escalations: escalations || [],
+    });
+  } catch (e: any) {
+    console.error('[accounts:get-escalations] failed', e);
+
+    return res.status(500).json({
+      ok: false,
+      error:
+        e?.message || 'account_escalations_fetch_failed',
+    });
+  }
+});
+
+/* ----------------------------------------------------------------
    GET /v1/accounts/:id
 ----------------------------------------------------------------- */
 router.get('/:id', async (req: Request, res: Response) => {
@@ -1616,63 +1680,9 @@ router.post('/:id/coaching-action', async (req: Request, res: Response) => {
   }
 });
 
-/* ----------------------------------------------------------------
-   GET /v1/accounts/escalations
------------------------------------------------------------------ */
-router.get('/escalations', async (req: Request, res: Response) => {
-  try {
-    const userId = getUserId(req);
-
-    const requester = await getRequesterContext(userId);
-
-    if (!requester?.company_id) {
-      return res.status(403).json({
-        ok: false,
-        error: 'missing_company_context',
-      });
-    }
-
-    let escalationQuery = supa
-      .from('account_escalations')
-      .select(`
-        id,
-        account_id,
-        severity,
-        status,
-        escalation_reason,
-        intervention_required,
-        assigned_manager_id,
-        triggered_by,
-        workflow_stage,
-        metadata,
-        created_at,
-        updated_at
-      `)
-      .eq('org_id', requester.company_id)
-      .order('created_at', { ascending: false })
-      .limit(100);
-
-    const { data: escalations, error } =
-      await escalationQuery;
-
-    if (error) {
-      throw error;
-    }
-
-    return res.json({
-      ok: true,
-      escalations: escalations || [],
-    });
-  } catch (e: any) {
-    console.error('[accounts:get-escalations] failed', e);
-
-    return res.status(500).json({
-      ok: false,
-      error:
-        e?.message || 'account_escalations_fetch_failed',
-    });
-  }
-});
+/* GET /v1/accounts/escalations is registered ABOVE the generic GET /:id route
+   (see near the top of this file) so the literal path is matched before /:id and
+   is never captured by it. Day 279. */
 
 /* ----------------------------------------------------------------
    POST /v1/accounts/:id/escalate
