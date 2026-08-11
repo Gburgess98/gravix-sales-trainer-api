@@ -109,6 +109,7 @@
     "deploy:staging": "node scripts/write-build-info.mjs && railway up",
     "validate:accounts-uuid-guard": "tsx scripts/validate-accounts-uuid-guard-day-278.ts",
     "validate:staging-qa-teardown": "tsx scripts/validate-staging-qa-teardown-day-278.ts",
-    "validate:accounts-route-order": "tsx scripts/validate-accounts-route-order-day-279.ts"
+    "validate:accounts-route-order": "tsx scripts/validate-accounts-route-order-day-279.ts",
+    "validate:account-action-writes": "tsx scripts/validate-account-action-writes-day-280.ts"
   }
 }

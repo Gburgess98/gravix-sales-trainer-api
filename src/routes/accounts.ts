@@ -80,6 +80,21 @@ async function getRequesterContext(userId: string) {
   return userRow || null;
 }
 
+/**
+ * Day 280 — account_escalations / account_coaching_actions have user-FK columns
+ * (triggered_by, assigned_manager_id, created_by, assigned_to) that REFERENCE
+ * public.users(id). Auth-first identities (Admin Auth API + reps bridge) have no
+ * public.users row, so writing their auth id into those columns violates the FK.
+ * These columns are nullable, so resolve a candidate id to a real users.id or null.
+ * Legacy users-row identities are unaffected (their id resolves to itself).
+ */
+async function existingUserId(id: string | null | undefined): Promise<string | null> {
+  const v = String(id ?? '').trim();
+  if (!v) return null;
+  const { data } = await supa.from('users').select('id').eq('id', v).maybeSingle();
+  return data ? v : null;
+}
+
 function buildAccountVisibilityFilter(query: any, requester: any) {
   if (!requester?.company_id) {
     return query;
@@ -1572,11 +1587,12 @@ router.post('/:id/coaching-action', async (req: Request, res: Response) => {
       req.body?.description || ''
     ).trim();
 
-    const assignedTo = String(
-      req.body?.assigned_to ||
-      account.owner_id ||
-      requester.id
-    ).trim();
+    // Day 280 — resolve user-FK columns to a real users.id or null (auth-first
+    // identities have no users row; the columns are nullable and FK to users).
+    const assignedTo = await existingUserId(
+      req.body?.assigned_to || account.owner_id || requester.id
+    );
+    const createdBy = await existingUserId(requester.id);
 
     const managerNotes = String(
       req.body?.manager_notes || ''
@@ -1614,7 +1630,10 @@ router.post('/:id/coaching-action', async (req: Request, res: Response) => {
 
     const payload = {
       account_id: account.id,
-      org_id: requester.company_id,
+      // Day 280 — account_coaching_actions is company-scoped via `company_id`
+      // (there is no `org_id` column). Company ownership is resolved server-side
+      // from the requester, never accepted from the client.
+      company_id: requester.company_id,
       action_type: actionType,
       title,
       description,
@@ -1628,7 +1647,7 @@ router.post('/:id/coaching-action', async (req: Request, res: Response) => {
       manager_notes: managerNotes,
       due_at: dueAt,
       metadata,
-      created_by: requester.id,
+      created_by: createdBy,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
@@ -1758,11 +1777,12 @@ router.post('/:id/escalate', async (req: Request, res: Response) => {
     const interventionRequired =
       req.body?.intervention_required !== false;
 
-    const assignedManagerId = String(
-      req.body?.assigned_manager_id ||
-      requester.manager_id ||
-      requester.id
-    ).trim();
+    // Day 280 — resolve user-FK columns to a real users.id or null (auth-first
+    // identities have no users row; these columns are nullable and FK to users).
+    const assignedManagerId = await existingUserId(
+      req.body?.assigned_manager_id || requester.manager_id || requester.id
+    );
+    const triggeredBy = await existingUserId(requester.id);
 
     const metadata = {
       source: 'ai_escalation_engine',
@@ -1774,13 +1794,16 @@ router.post('/:id/escalate', async (req: Request, res: Response) => {
 
     const payload = {
       account_id: account.id,
-      org_id: requester.company_id,
+      // Day 280 — account_escalations is company-scoped via `company_id` (there is
+      // no `org_id` column). Company ownership is resolved server-side from the
+      // requester, never accepted from the client.
+      company_id: requester.company_id,
       severity,
       status: 'open',
       escalation_reason: escalationReason,
       intervention_required: interventionRequired,
       assigned_manager_id: assignedManagerId,
-      triggered_by: requester.id,
+      triggered_by: triggeredBy,
       workflow_stage: workflowStage,
       metadata,
       created_at: new Date().toISOString(),
