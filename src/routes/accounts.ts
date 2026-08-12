@@ -942,6 +942,15 @@ router.post('/:id/tasks/generate', async (req: Request, res: Response) => {
         )
         : 0;
 
+    // Day 283 — assigned_to / generated_by REFERENCE public.users(id). Auth-first
+    // identities (Admin Auth API + reps bridge) have no public.users row, so writing
+    // their auth id violates the FK (500). Both columns are nullable, so resolve each
+    // candidate to a real users.id or null. Legacy users-row identities resolve to self.
+    const generatedById = await existingUserId(requester.id);
+    const ownerAssignee = await existingUserId(
+      account.owner_id || requester.id
+    );
+
     const generatedTasks: any[] = [];
 
     if (!account.owner_id) {
@@ -953,9 +962,9 @@ router.post('/:id/tasks/generate', async (req: Request, res: Response) => {
         category: 'ownership',
         urgency: 'high',
         status: 'open',
-        assigned_to: requester.id,
+        assigned_to: generatedById,
         escalation_source: 'missing_owner',
-        generated_by: requester.id,
+        generated_by: generatedById,
         metadata: {
           trigger: 'owner_missing',
         },
@@ -971,10 +980,9 @@ router.post('/:id/tasks/generate', async (req: Request, res: Response) => {
         category: 'coaching',
         urgency: 'critical',
         status: 'open',
-        assigned_to:
-          account.owner_id || requester.id,
+        assigned_to: ownerAssignee,
         escalation_source: 'low_account_score',
-        generated_by: requester.id,
+        generated_by: generatedById,
         metadata: {
           avg_score: avgScore,
         },
@@ -990,10 +998,9 @@ router.post('/:id/tasks/generate', async (req: Request, res: Response) => {
         category: 'engagement',
         urgency: 'high',
         status: 'open',
-        assigned_to:
-          account.owner_id || requester.id,
+        assigned_to: ownerAssignee,
         escalation_source: 'account_inactivity',
-        generated_by: requester.id,
+        generated_by: generatedById,
         metadata: {
           inactivity_detected: true,
         },
@@ -1322,6 +1329,11 @@ router.post('/:id/summary', async (req: Request, res: Response) => {
       req.body?.manager_notes || ''
     ).trim();
 
+    // Day 283 — generated_by REFERENCES public.users(id). Auth-first identities have
+    // no public.users row, so writing their auth id violates the FK (500). The column
+    // is nullable, so resolve the requester to a real users.id or null.
+    const generatedBy = await existingUserId(requester.id);
+
     const payload = {
       account_id: account.id,
       summary,
@@ -1329,7 +1341,7 @@ router.post('/:id/summary', async (req: Request, res: Response) => {
       churn_risk: churnRisk,
       next_best_action: nextBestAction,
       manager_notes: managerNotes,
-      generated_by: requester.id,
+      generated_by: generatedBy,
       updated_at: new Date().toISOString(),
     };
 
