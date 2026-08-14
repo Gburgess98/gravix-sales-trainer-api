@@ -106,6 +106,37 @@ function buildAccountVisibilityFilter(query: any, requester: any) {
 }
 
 /* ----------------------------------------------------------------
+   Day 284 — account ownership. `accounts.owner_id` (uuid, nullable, no FK) holds a
+   `reps.id`. Assignment validates the rep is in the requester's company (server
+   authority — the client cannot pick a foreign owner); the read path enriches
+   `owner_id` → { id, full_name, email } so the UI reflects it after refresh.
+----------------------------------------------------------------- */
+async function resolveOwnerRep(
+  ownerId: string | null | undefined,
+  companyId: string
+): Promise<{ id: string; full_name: string | null; email: string | null } | null> {
+  const id = ownerId ? String(ownerId).trim() : '';
+  if (!id) return null;
+
+  const { data } = await supa
+    .from('reps')
+    .select('id, company_id, display_name, name, first_name, last_name, email')
+    .eq('id', id)
+    .maybeSingle();
+
+  const rep: any = data;
+  if (!rep || String(rep.company_id) !== String(companyId)) return null;
+
+  const full_name =
+    rep.display_name ||
+    rep.name ||
+    [rep.first_name, rep.last_name].filter(Boolean).join(' ').trim() ||
+    null;
+
+  return { id: rep.id, full_name, email: rep.email ?? null };
+}
+
+/* ----------------------------------------------------------------
    GET /v1/accounts
 ----------------------------------------------------------------- */
 router.get('/', async (req: Request, res: Response) => {
@@ -451,11 +482,17 @@ router.get('/:id', async (req: Request, res: Response) => {
       },
     }));
 
+    // Day 284 — enrich the owner so the UI reflects assignment after refresh.
+    const owner = await resolveOwnerRep(account.owner_id, requester.company_id);
+
     return res.json({
       ok: true,
 
       account: {
         ...account,
+
+        owner,
+        ownership_status: account.owner_id ? 'assigned' : 'unassigned',
 
         stats: {
           contacts: contactsRes.data?.length || 0,
@@ -489,6 +526,125 @@ router.get('/:id', async (req: Request, res: Response) => {
       ok: false,
       error: e?.message || 'account_detail_failed',
     });
+  }
+});
+
+/* ----------------------------------------------------------------
+   PATCH /v1/accounts/:id/owner   Body: { owner_id }
+   Assign a same-company rep as the account owner. Company scope + owner
+   membership are server-resolved; a foreign account 404s and a foreign/unknown
+   owner is rejected without revealing existence.
+----------------------------------------------------------------- */
+router.patch('/:id/owner', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const requester = await getRequesterContext(userId);
+
+    if (!requester?.company_id) {
+      return res.status(403).json({ ok: false, error: 'missing_company_context' });
+    }
+
+    const accountId = String(req.params.id || '').trim();
+    if (!accountId) {
+      return res.status(400).json({ ok: false, error: 'invalid_account_id' });
+    }
+
+    let accountQuery = supa
+      .from('accounts')
+      .select('id, org_id, owner_id, name, domain')
+      .eq('id', accountId)
+      .limit(1);
+    accountQuery = buildAccountVisibilityFilter(accountQuery, requester);
+
+    const { data: accountRows, error: accountError } = await accountQuery;
+    if (accountError) throw accountError;
+
+    const account = accountRows?.[0];
+    if (!account) {
+      return res.status(404).json({ ok: false, error: 'account_not_found' });
+    }
+
+    const ownerId = req.body?.owner_id ? String(req.body.owner_id).trim() : '';
+    if (!ownerId) {
+      return res.status(400).json({ ok: false, error: 'invalid_owner' });
+    }
+
+    // The owner must be a rep in the SAME company. Rejects foreign/unknown owners
+    // without leaking existence (uniform invalid_owner). Server is the authority —
+    // the client cannot assign across company scope.
+    const owner = await resolveOwnerRep(ownerId, requester.company_id);
+    if (!owner) {
+      return res.status(400).json({ ok: false, error: 'invalid_owner' });
+    }
+
+    const { data: updated, error: updateError } = await supa
+      .from('accounts')
+      .update({ owner_id: ownerId, updated_at: new Date().toISOString() })
+      .eq('id', account.id)
+      .eq('org_id', requester.company_id) // defense-in-depth: never cross company
+      .select('id, org_id, owner_id, name, domain')
+      .single();
+    if (updateError) throw updateError;
+
+    return res.json({
+      ok: true,
+      account: { ...updated, owner, ownership_status: 'assigned' },
+    });
+  } catch (e: any) {
+    console.error('[accounts:assign-owner] failed', e);
+    return res.status(500).json({ ok: false, error: e?.message || 'assign_owner_failed' });
+  }
+});
+
+/* ----------------------------------------------------------------
+   DELETE /v1/accounts/:id/owner
+   Unassign the account owner (owner_id → null). Company-scoped; foreign 404s.
+----------------------------------------------------------------- */
+router.delete('/:id/owner', async (req: Request, res: Response) => {
+  try {
+    const userId = getUserId(req);
+    const requester = await getRequesterContext(userId);
+
+    if (!requester?.company_id) {
+      return res.status(403).json({ ok: false, error: 'missing_company_context' });
+    }
+
+    const accountId = String(req.params.id || '').trim();
+    if (!accountId) {
+      return res.status(400).json({ ok: false, error: 'invalid_account_id' });
+    }
+
+    let accountQuery = supa
+      .from('accounts')
+      .select('id, org_id, owner_id')
+      .eq('id', accountId)
+      .limit(1);
+    accountQuery = buildAccountVisibilityFilter(accountQuery, requester);
+
+    const { data: accountRows, error: accountError } = await accountQuery;
+    if (accountError) throw accountError;
+
+    const account = accountRows?.[0];
+    if (!account) {
+      return res.status(404).json({ ok: false, error: 'account_not_found' });
+    }
+
+    const { data: updated, error: updateError } = await supa
+      .from('accounts')
+      .update({ owner_id: null, updated_at: new Date().toISOString() })
+      .eq('id', account.id)
+      .eq('org_id', requester.company_id)
+      .select('id, org_id, owner_id, name, domain')
+      .single();
+    if (updateError) throw updateError;
+
+    return res.json({
+      ok: true,
+      account: { ...updated, owner: null, ownership_status: 'unassigned' },
+    });
+  } catch (e: any) {
+    console.error('[accounts:unassign-owner] failed', e);
+    return res.status(500).json({ ok: false, error: e?.message || 'unassign_owner_failed' });
   }
 });
 
