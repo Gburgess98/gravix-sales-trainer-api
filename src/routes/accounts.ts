@@ -170,6 +170,34 @@ async function fetchAccountContacts(accountId: string): Promise<any[]> {
 }
 
 /* ----------------------------------------------------------------
+   Day 286 — canonical per-account contact counts for the accounts LIST, from the
+   same source as the detail (crm_contacts.account_id). One bulk query over the
+   already company-visible account ids (no N+1); a contact only counts against an
+   account it is actually linked to, so foreign-company contacts (linked elsewhere)
+   and unlinked contacts (account_id null) count nowhere. Schema-tolerant: before
+   the migration lands the column is absent — every count falls back to 0 rather
+   than 500-ing the list.
+----------------------------------------------------------------- */
+async function countAccountContacts(accountIds: string[]): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  if (accountIds.length === 0) return counts;
+  try {
+    const { data, error } = await supa
+      .from('crm_contacts')
+      .select('account_id')
+      .in('account_id', accountIds);
+    if (error) throw error;
+    for (const row of data || []) {
+      const id = (row as any).account_id;
+      if (id) counts.set(id, (counts.get(id) || 0) + 1);
+    }
+  } catch (e) {
+    console.warn('[accounts:list] crm_contacts count fell back to 0', (e as any)?.message);
+  }
+  return counts;
+}
+
+/* ----------------------------------------------------------------
    GET /v1/accounts
 ----------------------------------------------------------------- */
 router.get('/', async (req: Request, res: Response) => {
@@ -207,28 +235,27 @@ router.get('/', async (req: Request, res: Response) => {
       throw error;
     }
 
+    // Day 286 — canonical contact counts from crm_contacts (one bulk query, no N+1),
+    // matching what GET /:id shows. Keyed by the already company-visible account ids.
+    const contactCounts = await countAccountContacts(
+      (accounts || []).map((a: any) => a.id)
+    );
+
     const enrichedAccounts = await Promise.all(
       (accounts || []).map(async (account: any) => {
-        const [contactsRes, callsRes] = await Promise.all([
-          supa
-            .from('contacts')
-            .select('id', { count: 'exact', head: true })
-            .eq('account_id', account.id),
-
-          supa
-            .from('calls')
-            .select('id, created_at', { count: 'exact' })
-            .eq('account_id', account.id)
-            .order('created_at', { ascending: false })
-            .limit(1),
-        ]);
+        const callsRes = await supa
+          .from('calls')
+          .select('id, created_at', { count: 'exact' })
+          .eq('account_id', account.id)
+          .order('created_at', { ascending: false })
+          .limit(1);
 
         return {
           ...account,
 
           stats: {
             contacts:
-              contactsRes.count || 0,
+              contactCounts.get(account.id) || 0,
 
             calls:
               callsRes.count || 0,
