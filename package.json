@@ -112,6 +112,7 @@
     "validate:accounts-route-order": "tsx scripts/validate-accounts-route-order-day-279.ts",
     "validate:account-action-writes": "tsx scripts/validate-account-action-writes-day-280.ts",
     "validate:account-ai-actor-fk": "tsx scripts/validate-account-ai-actor-fk-day-283.ts",
-    "validate:account-owner": "tsx scripts/validate-account-owner-day-284.ts"
+    "validate:account-owner": "tsx scripts/validate-account-owner-day-284.ts",
+    "validate:crm-contact-link": "tsx scripts/validate-crm-contact-link-day-285.ts"
   }
 }

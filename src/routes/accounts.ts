@@ -137,6 +137,39 @@ async function resolveOwnerRep(
 }
 
 /* ----------------------------------------------------------------
+   Day 285 — an account's contacts are canonical in `crm_contacts` (single
+   nullable `account_id` FK; see sql/20260814_crm_contacts_account_link.sql), not
+   the disconnected legacy `contacts` table. Reading by account_id is
+   company-safe: the account is already company-gated before this runs, and a link
+   can only be created against an account in the linker's company. Schema-tolerant:
+   before the migration lands the column is absent — return [] rather than 500.
+----------------------------------------------------------------- */
+async function fetchAccountContacts(accountId: string): Promise<any[]> {
+  try {
+    const { data, error } = await supa
+      .from('crm_contacts')
+      .select('id, first_name, last_name, email, company, account_id, created_at')
+      .eq('account_id', accountId)
+      .order('created_at', { ascending: false })
+      .limit(100);
+    if (error) throw error;
+    return (data || []).map((c: any) => ({
+      id: c.id,
+      name: [c.first_name, c.last_name].filter(Boolean).join(' ').trim() || null,
+      email: c.email ?? null,
+      company: c.company ?? null,
+      role: null,
+      account_id: c.account_id ?? null,
+      created_at: c.created_at ?? null,
+    }));
+  } catch (e) {
+    // Missing column (pre-migration) or transient error — never break the detail.
+    console.warn('[accounts:contacts] crm_contacts read fell back to empty', (e as any)?.message);
+    return [];
+  }
+}
+
+/* ----------------------------------------------------------------
    GET /v1/accounts
 ----------------------------------------------------------------- */
 router.get('/', async (req: Request, res: Response) => {
@@ -436,21 +469,9 @@ router.get('/:id', async (req: Request, res: Response) => {
       });
     }
 
-    const [contactsRes, callsRes] = await Promise.all([
-      supa
-        .from('contacts')
-        .select(`
-          id,
-          name,
-          email,
-          company,
-          role,
-          created_at,
-          updated_at
-        `)
-        .eq('account_id', account.id)
-        .order('updated_at', { ascending: false })
-        .limit(100),
+    const [linkedContacts, callsRes] = await Promise.all([
+      // Day 285 — canonical account contacts live in crm_contacts (by account_id).
+      fetchAccountContacts(account.id),
 
       supa
         .from('calls')
@@ -495,7 +516,7 @@ router.get('/:id', async (req: Request, res: Response) => {
         ownership_status: account.owner_id ? 'assigned' : 'unassigned',
 
         stats: {
-          contacts: contactsRes.data?.length || 0,
+          contacts: linkedContacts.length || 0,
           calls: calls.length || 0,
 
           avg_score:
@@ -511,8 +532,7 @@ router.get('/:id', async (req: Request, res: Response) => {
         },
       },
 
-      linked_contacts:
-        contactsRes.data || [],
+      linked_contacts: linkedContacts,
 
       linked_calls:
         calls,

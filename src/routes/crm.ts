@@ -3737,6 +3737,125 @@ router.post("/contacts/:id/mark-contacted", async (req, res) => {
   }
 });
 
+// ── Day 285 — CRM contact ↔ account link (one contact ⇒ ≤ one account) ─────────
+// `crm_contacts.account_id` (nullable FK → accounts.id ON DELETE SET NULL). The
+// contact is resolved through the existing CRM ownership authority (user_id ===
+// requester, same as the search picker); the account is resolved through the
+// company visibility rule (accounts.org_id === requester.company_id). Foreign
+// combinations are denied as not-found (no existence leak); the client cannot
+// supply scope. Relinking to another same-company account moves the FK.
+const CRM_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function shapeLinkedContact(c: any) {
+  return {
+    id: c.id,
+    name: [c.first_name, c.last_name].filter(Boolean).join(" ").trim() || null,
+    email: c.email ?? null,
+    company: c.company ?? null,
+    role: null,
+    account_id: c.account_id ?? null,
+    created_at: c.created_at ?? null,
+  };
+}
+
+/** Resolve a same-company account (accounts table, org_id === company). */
+async function resolveCompanyAccount(accountId: string, companyId: string) {
+  const { data } = await supa
+    .from("accounts")
+    .select("id, org_id")
+    .eq("id", accountId)
+    .eq("org_id", companyId)
+    .maybeSingle();
+  return data ?? null;
+}
+
+/** Resolve a requester-owned contact. */
+async function resolveOwnedContact(contactId: string, requester: string) {
+  const { data } = await supa
+    .from("crm_contacts")
+    .select("id, user_id, first_name, last_name, email, company, account_id")
+    .eq("id", contactId)
+    .eq("user_id", requester)
+    .maybeSingle();
+  return data ?? null;
+}
+
+// POST /v1/crm/contacts/:contactId/link-account   Body: { account_id }
+router.post("/contacts/:contactId/link-account", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    if (!requester) return res.status(401).json({ ok: false, error: "missing_user" });
+
+    const contactId = String((req.params as any)?.contactId ?? "").trim();
+    const accountId = String((req.body as any)?.account_id ?? "").trim();
+    if (!CRM_UUID_RE.test(contactId)) {
+      return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+    }
+    if (!CRM_UUID_RE.test(accountId)) {
+      return res.status(400).json({ ok: false, error: "invalid_account_id" });
+    }
+
+    const rep = await getRepContext(requester);
+    const companyId = rep?.company_id;
+    if (!companyId) return res.status(403).json({ ok: false, error: "missing_company_context" });
+
+    // Account must be in the requester's company; contact must be owned by them.
+    const account = await resolveCompanyAccount(accountId, companyId);
+    if (!account) return res.status(404).json({ ok: false, error: "account_not_found" });
+
+    const contact = await resolveOwnedContact(contactId, requester);
+    if (!contact) return res.status(404).json({ ok: false, error: "contact_not_found" });
+
+    // Relink is deterministic: the single FK moves to the new same-company account.
+    const { data: updated, error } = await supa
+      .from("crm_contacts")
+      .update({ account_id: account.id })
+      .eq("id", contactId)
+      .eq("user_id", requester)
+      .select("id, first_name, last_name, email, company, account_id, created_at")
+      .single();
+    if (error) throw error;
+
+    return res.json({ ok: true, contact: shapeLinkedContact(updated) });
+  } catch (err: any) {
+    console.error("[crm:link-account] failed", err);
+    return res.status(500).json({ ok: false, error: err?.message || "link_account_failed" });
+  }
+});
+
+// POST /v1/crm/contacts/:contactId/unlink-account   Body: { account_id }
+router.post("/contacts/:contactId/unlink-account", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+    if (!requester) return res.status(401).json({ ok: false, error: "missing_user" });
+
+    const contactId = String((req.params as any)?.contactId ?? "").trim();
+    if (!CRM_UUID_RE.test(contactId)) {
+      return res.status(400).json({ ok: false, error: "invalid_contact_id" });
+    }
+
+    const rep = await getRepContext(requester);
+    if (!rep?.company_id) return res.status(403).json({ ok: false, error: "missing_company_context" });
+
+    const contact = await resolveOwnedContact(contactId, requester);
+    if (!contact) return res.status(404).json({ ok: false, error: "contact_not_found" });
+
+    // Deterministic + idempotent: clearing an already-null link still succeeds.
+    const { error } = await supa
+      .from("crm_contacts")
+      .update({ account_id: null })
+      .eq("id", contactId)
+      .eq("user_id", requester);
+    if (error) throw error;
+
+    return res.json({ ok: true, contact_id: contactId });
+  } catch (err: any) {
+    console.error("[crm:unlink-account] failed", err);
+    return res.status(500).json({ ok: false, error: err?.message || "unlink_account_failed" });
+  }
+});
+
 /** ----------------------------------------------------------------
  * Contact Assignments (read-only)
  * GET /v1/crm/contacts/:id/assignments
