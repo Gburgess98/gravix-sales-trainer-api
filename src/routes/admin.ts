@@ -2,6 +2,7 @@ import 'dotenv/config';
 // src/routes/admin.ts
 import { Router } from "express";
 import { createClient } from "@supabase/supabase-js";
+import { getRequesterOrgId } from "../lib/callAccess";
 import { buildScoreSummaryBlocks } from "../lib/slackBlocks";
 import { getAdminConfig, patchAdminConfig } from "../services/adminConfig";
 import {
@@ -116,15 +117,13 @@ adminRouter.get("/org-settings", requireManager, async (req: any, res: any) => {
 
     const supa = createClient(url, key);
 
-    const { data: callRow } = await supa
-      .from("calls")
-      .select("org_id")
-      .eq("user_id", requester)
-      .not("org_id", "is", null)
-      .limit(1)
-      .maybeSingle();
-
-    const orgId = callRow?.org_id;
+    // Day 291 — resolve the requester's org via the canonical identity/tenant
+    // bridge (call-owned org, then reps membership) rather than a call-owned-only
+    // lookup. A fresh auth-first manager who has not yet recorded a call still
+    // resolves their company through reps, so this policy read agrees with the
+    // resolver /v1/calls/paged already uses — without leaning on a non-prod
+    // org-id env fallback to mask the mismatch.
+    const orgId = await getRequesterOrgId(requester);
     if (!orgId) return res.status(403).json({ ok: false, error: "no_org" });
 
     const { data, error } = await supa
@@ -165,15 +164,10 @@ adminRouter.patch("/org-settings", requireManager, async (req: any, res: any) =>
 
     const supa = createClient(url, key);
 
-    const { data: callRow } = await supa
-      .from("calls")
-      .select("org_id")
-      .eq("user_id", requester)
-      .not("org_id", "is", null)
-      .limit(1)
-      .maybeSingle();
-
-    const orgId = callRow?.org_id;
+    // Day 291 — same canonical org resolution as the GET above, so a manager who
+    // can read the policy can also write it (both go through the reps bridge, not
+    // a call-owned-only lookup).
+    const orgId = await getRequesterOrgId(requester);
     if (!orgId) return res.status(403).json({ ok: false, error: "no_org" });
 
     const { data, error } = await supa
