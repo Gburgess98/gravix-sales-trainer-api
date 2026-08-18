@@ -2124,7 +2124,7 @@ router.get('/:id/rescue-engine', async (req: Request, res: Response) => {
       });
     }
 
-    const [callsRes, contactsRes, ownerRes] = await Promise.all([
+    const [callsRes, ownerRes, contactCountMap] = await Promise.all([
       supa
         .from('calls')
         .select(`
@@ -2138,11 +2138,6 @@ router.get('/:id/rescue-engine', async (req: Request, res: Response) => {
         .order('created_at', { ascending: false })
         .limit(100),
 
-      supa
-        .from('contacts')
-        .select('id', { count: 'exact', head: true })
-        .eq('account_id', account.id),
-
       account.owner_id
         ? supa
           .from('users')
@@ -2150,6 +2145,11 @@ router.get('/:id/rescue-engine', async (req: Request, res: Response) => {
           .eq('id', account.owner_id)
           .maybeSingle()
         : Promise.resolve({ data: null, error: null }),
+
+      // Day 287 — contact count from the same canonical source as the list/detail
+      // (crm_contacts.account_id), via the shared Day-286 helper. Company-safe
+      // (single visible account) + schema-tolerant; only stats.contacts uses it.
+      countAccountContacts([account.id]),
     ]);
 
     const calls = callsRes.data || [];
@@ -2326,7 +2326,7 @@ router.get('/:id/rescue-engine', async (req: Request, res: Response) => {
         avg_score: avgScore,
         recent_avg_score: recentAvg,
         calls: calls.length,
-        contacts: contactsRes.count || 0,
+        contacts: contactCountMap.get(account.id) || 0,
       },
 
       churn_risk_score: churnRiskScore,
