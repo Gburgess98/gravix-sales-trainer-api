@@ -3,6 +3,7 @@ import 'dotenv/config';
 import { Router } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { getRequesterOrgId } from "../lib/callAccess";
+import { requireUserId } from "../middleware/requireUserId";
 import { buildScoreSummaryBlocks } from "../lib/slackBlocks";
 import { getAdminConfig, patchAdminConfig } from "../services/adminConfig";
 import {
@@ -106,10 +107,15 @@ adminRouter.post("/force-score/:id", async (req, res) => {
 
 /* ----------------------------------------------------------------
    GET /v1/admin/org-settings
+   Day 291 — readable by ANY authenticated tenant member (requireUserId), not
+   just managers: a rep must be able to learn whether company calls are allowed so
+   the WEB control matches backend enforcement. The org is resolved server-side
+   from the caller's identity (getRequesterOrgId), never from the client, so a rep
+   only ever sees their own org's policy. PATCH below stays manager-only.
 ----------------------------------------------------------------- */
-adminRouter.get("/org-settings", requireManager, async (req: any, res: any) => {
+adminRouter.get("/org-settings", requireUserId, async (req: any, res: any) => {
   try {
-    const requester = String(req.header("x-user-id") || "").trim();
+    const requester = String((req as any).userId || req.header("x-user-id") || "").trim();
 
     const url = process.env.SUPABASE_URL;
     const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
@@ -176,6 +182,7 @@ adminRouter.patch("/org-settings", requireManager, async (req: any, res: any) =>
         {
           org_id: orgId,
           call_visibility,
+          updated_at: new Date().toISOString(),
         },
         { onConflict: "org_id" }
       )
