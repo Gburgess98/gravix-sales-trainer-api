@@ -7,34 +7,72 @@ export type AdminConfig = {
   updated_at: string;
 };
 
-export async function getAdminConfig(): Promise<AdminConfig> {
-  const { data, error } = await supabaseAdmin
+const SELECT_COLS = "streak_threshold,xp_multiplier,comeback_bonus,updated_at";
+
+// Day 294 — idempotently ensure the canonical singleton (id=true) exists using
+// database defaults. Safe to call repeatedly (ON CONFLICT DO NOTHING); it never
+// overwrites existing values. A genuine transport/schema error is surfaced, never
+// swallowed — we do not fabricate success.
+async function ensureAdminConfigSingleton(): Promise<void> {
+  const { error } = await supabaseAdmin
     .from("admin_config")
-    .select("streak_threshold,xp_multiplier,comeback_bonus,updated_at")
+    .upsert({ id: true }, { onConflict: "id", ignoreDuplicates: true });
+
+  if (error) {
+    throw new Error(`Failed to ensure admin config singleton: ${error.message}`);
+  }
+}
+
+export async function getAdminConfig(): Promise<AdminConfig> {
+  // Resolve exactly the singleton (id=true), tolerating a genuinely absent row.
+  const first = await supabaseAdmin
+    .from("admin_config")
+    .select(SELECT_COLS)
+    .eq("id", true)
+    .maybeSingle();
+
+  if (first.error) {
+    // A real transport/schema error — surface it (do not self-heal over it).
+    throw new Error(`Failed to load admin config: ${first.error.message}`);
+  }
+  if (first.data) return first.data as AdminConfig;
+
+  // Singleton genuinely absent (partially-migrated environment). Restore exactly
+  // one canonical row with database defaults, then re-read. If it still fails,
+  // surface the error rather than returning fabricated values.
+  await ensureAdminConfigSingleton();
+
+  const second = await supabaseAdmin
+    .from("admin_config")
+    .select(SELECT_COLS)
     .eq("id", true)
     .single();
 
-  if (error || !data) {
-    throw new Error(`Failed to load admin config: ${error?.message ?? "No data"}`);
+  if (second.error || !second.data) {
+    throw new Error(`Failed to load admin config: ${second.error?.message ?? "No data"}`);
   }
 
-  return data as AdminConfig;
+  return second.data as AdminConfig;
 }
 
 export async function patchAdminConfig(patch: Partial<Pick<AdminConfig,
   "streak_threshold" | "xp_multiplier" | "comeback_bonus"
 >>): Promise<AdminConfig> {
-  const clean: any = {};
+  const clean: Record<string, number> = {};
 
   if (patch.streak_threshold !== undefined) clean.streak_threshold = patch.streak_threshold;
   if (patch.xp_multiplier !== undefined) clean.xp_multiplier = patch.xp_multiplier;
   if (patch.comeback_bonus !== undefined) clean.comeback_bonus = patch.comeback_bonus;
 
+  // Day 294 — upsert the canonical singleton (id=true). If the row is genuinely
+  // absent it is created (these values over DB defaults); if it exists, ONLY the
+  // provided columns are updated (others preserved, updated_at trigger fires as
+  // before). This keeps exactly one row and can no longer 500 on a missing
+  // singleton — while a genuine DB error is still surfaced, never faked.
   const { data, error } = await supabaseAdmin
     .from("admin_config")
-    .update(clean)
-    .eq("id", true)
-    .select("streak_threshold,xp_multiplier,comeback_bonus,updated_at")
+    .upsert({ id: true, ...clean }, { onConflict: "id" })
+    .select(SELECT_COLS)
     .single();
 
   if (error || !data) {
