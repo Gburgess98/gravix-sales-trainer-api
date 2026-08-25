@@ -118,6 +118,7 @@
     "validate:rescue-engine-contact-stat": "tsx scripts/validate-rescue-engine-contact-stat-day-287.ts",
     "validate:org-resolution": "tsx scripts/validate-org-resolution-day-291.ts",
     "validate:org-settings-schema": "tsx scripts/validate-org-settings-schema-day-291.ts",
-    "validate:admin-config-singleton": "tsx scripts/validate-admin-config-singleton-day-294.ts"
+    "validate:admin-config-singleton": "tsx scripts/validate-admin-config-singleton-day-294.ts",
+    "validate:accounts-contacts-canonical": "tsx scripts/validate-accounts-contacts-canonical-day-295.ts"
   }
 }

@@ -140,9 +140,12 @@ const NON_COLUMN_TOKENS = new Set(["*", "count", "sum", "avg", "min", "max"]);
 const KNOWN_DRIFT = new Set([
   "src/lib/scoring.ts|admin_config|low_score_threshold",
   "src/lib/scoring.ts|admin_config|critical_score_threshold",
-  "src/routes/accounts.ts|contacts|name",
-  "src/routes/accounts.ts|contacts|company",
-  "src/routes/accounts.ts|contacts|role",
+  // Day 295 — the three src/routes/accounts.ts|contacts|{name,company,role}
+  // allowances were removed: Days 285–287 cut the account list/detail/rescue paths
+  // over to canonical crm_contacts, so accounts.ts no longer selects the legacy
+  // `contacts` table at all and these baselines went stale. The two scoring.ts
+  // admin_config entries and accounts.ts|users|full_name remain real, baselined
+  // drift (fixed under their own scoped days).
   "src/routes/accounts.ts|users|full_name",
 ]);
 
