@@ -1230,6 +1230,55 @@ function buildScoreThresholdFlags(args: {
   return flags;
 }
 
+// Day 300 — canonical crm_activities row for a structured `review_flag` activity.
+// crm_activities requires `type`, `title` and `user_id` (all NOT NULL) and has NO
+// `summary` or `flag_*` columns (confirmed against the dedicated staging OpenAPI) —
+// flag analytics live in `meta`. Both the primary and fallback scoring paths build
+// their rows here so they cannot silently drift apart (or write nonexistent columns)
+// again. Only real top-level crm_activities columns are emitted. Exported for the
+// Day 300 guarded staging proof (the runtime callers are unchanged).
+export function buildReviewFlagActivityRow(args: {
+  flag: any;
+  userId: string | null;
+  orgId: string | null;
+  callId: string;
+  accountId: string | null;
+  contactId: string | null;
+  source: string;
+  thresholds: { low: number; critical: number };
+}) {
+  const { flag, userId, orgId, callId, accountId, contactId, source, thresholds } = args;
+  return {
+    type: "review_flag",
+    // Human-readable description → `title` (there is no `summary` column).
+    title: (flag?.label as string) || `${flag?.type} (${flag?.severity})`,
+    user_id: userId,
+    org_id: orgId,
+    rep_id: userId,
+    call_id: callId,
+    account_id: accountId ?? null,
+    contact_id: contactId ?? null,
+    source,
+    // Flexible flag analytics live under meta (no dedicated flag_* columns exist).
+    meta: {
+      action_type: "review_flag",
+      flag_key: flag?.flag_key ?? flag?.type ?? null,
+      flag_type: flag?.type ?? null,
+      flag_category: flag?.category ?? "score_threshold",
+      flag_label: flag?.label ?? null,
+      flag_severity: flag?.severity ?? null,
+      flag_section: flag?.section ?? null,
+      score: flag?.score ?? null,
+      timestamp: flag?.timestamp ?? null,
+      threshold_band: flag?.severity ?? null,
+      thresholds: { low: thresholds.low, critical: thresholds.critical },
+      needs_manager_review: flag?.severity === "critical",
+      // Provenance stays distinguishable both here and in the top-level `source`.
+      provenance: source,
+    },
+  };
+}
+
 function shouldCreateAssignment(args: {
   reviewFlags: Array<{ severity: "low" | "critical"; section: string }>;
   overall: number;
@@ -2366,44 +2415,35 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
       console.warn('[score] activity insert failed', e);
     }
 
-    // CRM Activity: review_flag (structured fallback)
+    // CRM Activity: review_flag (structured; analytics in meta) — primary path.
     try {
       if (!SKIP_SCORING_SIDE_EFFECTS && reviewFlags.length > 0) {
         const svc = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
+        // Best-effort account/contact linkage so the activity lands on their timelines.
+        const { data: linkRow } = await svc
+          .from('calls')
+          .select('id, account_id, contact_id')
+          .eq('id', callId)
+          .single();
+
         await svc.from('crm_activities').insert(
-          reviewFlags.map((flag) => ({
-            type: 'review_flag',
-
-            // ✅ CORE FIELDS
-            summary: `${flag.type} (${flag.severity})`,
-            org_id: (memoryCall as any)?.org_id ?? null,
-            rep_id: (memoryCall as any)?.user_id ?? null,
-            call_id: opts.callId,
-            source: 'scoring_engine_fallback',
-
-            // 🚀 NEW ANALYTICS FIELDS
-            flag_key: flag.type,
-            flag_category: 'score_threshold',
-            flag_severity: flag.severity,
-            flag_section: flag.section,
-
-            // 🧠 FLEXIBLE META
-            meta: {
-              score: flag.score,
-              timestamp: flag.timestamp ?? null,
-              threshold_band: flag.severity,
-              thresholds: {
-                low: thresholds.low,
-                critical: thresholds.critical,
-              },
-              needs_manager_review: flag.severity === 'critical',
-            },
-          }))
+          reviewFlags.map((flag) =>
+            buildReviewFlagActivityRow({
+              flag,
+              userId: (call as any)?.user_id ?? null,
+              orgId: (call as any)?.org_id ?? null,
+              callId,
+              accountId: (linkRow as any)?.account_id ?? null,
+              contactId: (linkRow as any)?.contact_id ?? null,
+              source: 'scoring_engine',
+              thresholds,
+            })
+          )
         );
       }
     } catch (e) {
-      console.warn('[score] review_flag activity insert failed (fallback)', e);
+      console.warn('[score] review_flag activity insert failed', e);
     }
 
     await ensureCriticalCallAssignment({
@@ -2621,44 +2661,35 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
       console.warn('[score] activity insert failed (fallback)', e);
     }
 
-    // CRM Activity: review_flag (structured + analytics-ready)
+    // CRM Activity: review_flag (structured; analytics in meta) — fallback path.
     try {
       if (!SKIP_SCORING_SIDE_EFFECTS && reviewFlags.length > 0) {
         const svc = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!);
 
+        // Best-effort account/contact linkage so the activity lands on their timelines.
+        const { data: linkRow } = await svc
+          .from('calls')
+          .select('id, account_id, contact_id')
+          .eq('id', opts.callId)
+          .single();
+
         await svc.from('crm_activities').insert(
-          reviewFlags.map((flag) => ({
-            type: 'review_flag',
-
-            // ✅ CORE FIELDS
-            summary: `${flag.type} (${flag.severity})`,
-            org_id: (call as any)?.org_id ?? null,
-            rep_id: (call as any)?.user_id ?? null,
-            call_id: callId,
-            source: 'scoring_engine',
-
-            // 🚀 NEW ANALYTICS FIELDS
-            flag_key: flag.type,
-            flag_category: 'score_threshold',
-            flag_severity: flag.severity,
-            flag_section: flag.section,
-
-            // 🧠 FLEXIBLE META
-            meta: {
-              score: flag.score,
-              timestamp: flag.timestamp ?? null,
-              threshold_band: flag.severity,
-              thresholds: {
-                low: thresholds.low,
-                critical: thresholds.critical,
-              },
-              needs_manager_review: flag.severity === 'critical',
-            },
-          }))
+          reviewFlags.map((flag) =>
+            buildReviewFlagActivityRow({
+              flag,
+              userId: (memoryCall as any)?.user_id ?? null,
+              orgId: (memoryCall as any)?.org_id ?? null,
+              callId: opts.callId,
+              accountId: (linkRow as any)?.account_id ?? null,
+              contactId: (linkRow as any)?.contact_id ?? null,
+              source: 'scoring_engine_fallback',
+              thresholds,
+            })
+          )
         );
       }
     } catch (e) {
-      console.warn('[score] review_flag activity insert failed', e);
+      console.warn('[score] review_flag activity insert failed (fallback)', e);
     }
 
     await ensureCriticalCallAssignment({

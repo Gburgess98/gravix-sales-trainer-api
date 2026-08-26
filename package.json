@@ -123,6 +123,8 @@
     "validate:scoring-thresholds": "tsx scripts/validate-scoring-thresholds-day-297.ts",
     "harness:scoring-thresholds": "tsx scripts/scoring-thresholds-harness-day-297.ts",
     "validate:rescue-engine-owner": "tsx scripts/validate-rescue-engine-owner-day-298.ts",
-    "validate:critical-assignment-schema": "tsx scripts/validate-critical-assignment-schema-day-299.ts"
+    "validate:critical-assignment-schema": "tsx scripts/validate-critical-assignment-schema-day-299.ts",
+    "validate:review-flag-activity-schema": "tsx scripts/validate-review-flag-activity-schema-day-300.ts",
+    "proof:review-flag-activity": "tsx scripts/proof-review-flag-activity-day-300.ts"
   }
 }
