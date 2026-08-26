@@ -122,6 +122,7 @@
     "validate:accounts-contacts-canonical": "tsx scripts/validate-accounts-contacts-canonical-day-295.ts",
     "validate:scoring-thresholds": "tsx scripts/validate-scoring-thresholds-day-297.ts",
     "harness:scoring-thresholds": "tsx scripts/scoring-thresholds-harness-day-297.ts",
-    "validate:rescue-engine-owner": "tsx scripts/validate-rescue-engine-owner-day-298.ts"
+    "validate:rescue-engine-owner": "tsx scripts/validate-rescue-engine-owner-day-298.ts",
+    "validate:critical-assignment-schema": "tsx scripts/validate-critical-assignment-schema-day-299.ts"
   }
 }

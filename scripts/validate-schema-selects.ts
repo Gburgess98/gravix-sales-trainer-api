@@ -663,6 +663,12 @@ async function main() {
     for (const [reason, n] of [...byReason].sort((a, b) => b[1] - a[1])) {
       console.log(`    ${String(n).padStart(3)}  ${reason}`);
     }
+    if (process.env.SCHEMA_AUDIT_DETAILS === "1") {
+      console.log("\n  Unverified operation inventory:");
+      for (const s of skips.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line)) {
+        console.log(`    ${s.file}:${s.line} | ${s.table} | ${s.reason}`);
+      }
+    }
   }
 
   const stale = staleJsSiblings();

@@ -1394,21 +1394,7 @@ async function ensureCriticalCallAssignment(args: {
       notes: "Auto-created from critical flagged call.",
       org_id: args.orgId ?? null,
       status: "open",
-      source: "flagged_call_auto",
-      meta: {
-        source: "flagged_call_auto",
-        action_type: "assignment_created",
-        assignment_origin: "flagged_call_auto",
-        dedupe_key: dedupeKey,
-        flagged_call: true,
-        threshold_band: args.thresholdBand,
-        needs_manager_review: true,
-        review_flags: args.reviewFlags,
-        score_overall: args.overall,
-        flag_sections: args.reviewFlags.map(f => f.section),
-        primary_flag: args.reviewFlags[0]?.type ?? null,
-      },
-    } as any;
+    };
 
     const inserted = await svc
       .from("coach_assignments")
@@ -1416,41 +1402,7 @@ async function ensureCriticalCallAssignment(args: {
       .select("id")
       .single();
 
-    if (inserted.error) {
-      const msg = String((inserted.error as any)?.message ?? "").toLowerCase();
-      const missingOrg = msg.includes("org_id") && msg.includes("schema cache");
-      if (missingOrg) {
-        const retryPayload = {
-          call_id: args.callId,
-          assignee_user_id: args.assigneeUserId,
-          drill_id: drillId,
-          notes: "Auto-created from critical flagged call.",
-          status: "open",
-          source: "flagged_call_auto",
-          meta: {
-            source: "flagged_call_auto",
-            action_type: "assignment_created",
-            assignment_origin: "flagged_call_auto",
-            dedupe_key: dedupeKey,
-            flagged_call: true,
-            threshold_band: args.thresholdBand,
-            needs_manager_review: true,
-            review_flags: args.reviewFlags,
-            score_overall: args.overall,
-          },
-        } as any;
-
-        const retry = await svc
-          .from("coach_assignments")
-          .insert(retryPayload)
-          .select("id")
-          .single();
-
-        if (retry.error) throw retry.error;
-        return { ok: true, skipped: false, id: (retry.data as any)?.id ?? null };
-      }
-      throw inserted.error;
-    }
+    if (inserted.error) throw inserted.error;
 
     try {
       await svc.from("crm_activities").insert({
