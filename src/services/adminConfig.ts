@@ -4,10 +4,16 @@ export type AdminConfig = {
   streak_threshold: number;
   xp_multiplier: number;
   comeback_bonus: number;
+  // Day 297 — persisted score-review thresholds (truthful contract, no longer a
+  // silent hard-coded fallback). Drive review flags / needs_manager_review /
+  // critical-assignment decisions.
+  low_score_threshold: number;
+  critical_score_threshold: number;
   updated_at: string;
 };
 
-const SELECT_COLS = "streak_threshold,xp_multiplier,comeback_bonus,updated_at";
+const SELECT_COLS =
+  "streak_threshold,xp_multiplier,comeback_bonus,low_score_threshold,critical_score_threshold,updated_at";
 
 // Day 294 — idempotently ensure the canonical singleton (id=true) exists using
 // database defaults. Safe to call repeatedly (ON CONFLICT DO NOTHING); it never
@@ -56,13 +62,18 @@ export async function getAdminConfig(): Promise<AdminConfig> {
 }
 
 export async function patchAdminConfig(patch: Partial<Pick<AdminConfig,
-  "streak_threshold" | "xp_multiplier" | "comeback_bonus"
+  "streak_threshold" | "xp_multiplier" | "comeback_bonus" |
+  "low_score_threshold" | "critical_score_threshold"
 >>): Promise<AdminConfig> {
   const clean: Record<string, number> = {};
 
   if (patch.streak_threshold !== undefined) clean.streak_threshold = patch.streak_threshold;
   if (patch.xp_multiplier !== undefined) clean.xp_multiplier = patch.xp_multiplier;
   if (patch.comeback_bonus !== undefined) clean.comeback_bonus = patch.comeback_bonus;
+  // Day 297 — thresholds now persist (were silently dropped). Only fields actually
+  // supplied are written, so a caller's value is never dropped while claiming success.
+  if (patch.low_score_threshold !== undefined) clean.low_score_threshold = patch.low_score_threshold;
+  if (patch.critical_score_threshold !== undefined) clean.critical_score_threshold = patch.critical_score_threshold;
 
   // Day 294 — upsert the canonical singleton (id=true). If the row is genuinely
   // absent it is created (these values over DB defaults); if it exists, ONLY the

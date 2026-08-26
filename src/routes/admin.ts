@@ -756,15 +756,24 @@ adminRouter.patch("/config", requireManager, async (req, res) => {
       }
     }
 
-    if (
-      low_score_threshold !== undefined &&
-      critical_score_threshold !== undefined &&
-      critical_score_threshold > low_score_threshold
-    ) {
-      return res.status(400).json({
-        ok: false,
-        error: "critical_score_threshold must be less than or equal to low_score_threshold",
-      });
+    // Day 297 — enforce critical <= low against the EFFECTIVE pair. When only one
+    // threshold is supplied, validate it against the stored companion so a
+    // single-field patch cannot break the invariant. Invalid ordering → clean 400
+    // with NO mutation (this check runs before patchAdminConfig).
+    if (low_score_threshold !== undefined || critical_score_threshold !== undefined) {
+      let effLow = low_score_threshold;
+      let effCritical = critical_score_threshold;
+      if (effLow === undefined || effCritical === undefined) {
+        const current = await getAdminConfig();
+        if (effLow === undefined) effLow = current.low_score_threshold;
+        if (effCritical === undefined) effCritical = current.critical_score_threshold;
+      }
+      if (Number(effCritical) > Number(effLow)) {
+        return res.status(400).json({
+          ok: false,
+          error: "critical_score_threshold must be less than or equal to low_score_threshold",
+        });
+      }
     }
 
     // no-op patch protection (optional but nice)

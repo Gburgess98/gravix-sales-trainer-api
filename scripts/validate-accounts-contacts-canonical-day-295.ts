@@ -66,10 +66,13 @@ gate("no accounts.ts|contacts|company baseline", !/["']src\/routes\/accounts\.ts
 gate("no accounts.ts|contacts|role baseline", !/["']src\/routes\/accounts\.ts\|contacts\|role["']/.test(VAL));
 gate("no residual accounts.ts|contacts|* baseline of any column",
   !/["']src\/routes\/accounts\.ts\|contacts\|/.test(VAL));
-gate("retains scoring.ts|admin_config|low_score_threshold (genuine drift)",
-  /["']src\/lib\/scoring\.ts\|admin_config\|low_score_threshold["']/.test(VAL));
-gate("retains scoring.ts|admin_config|critical_score_threshold (genuine drift)",
-  /["']src\/lib\/scoring\.ts\|admin_config\|critical_score_threshold["']/.test(VAL));
+// Day 297 removed the two scoring.ts|admin_config threshold baselines (the columns
+// now persist), so the Day-295 guard no longer asserts their retention. The
+// account/contact removal this guard exists for is unaffected.
+gate("scoring.ts|admin_config|low_score_threshold baseline removed (Day 297)",
+  !/["']src\/lib\/scoring\.ts\|admin_config\|low_score_threshold["']/.test(VAL));
+gate("scoring.ts|admin_config|critical_score_threshold baseline removed (Day 297)",
+  !/["']src\/lib\/scoring\.ts\|admin_config\|critical_score_threshold["']/.test(VAL));
 gate("retains accounts.ts|users|full_name (unchanged real drift)",
   /["']src\/routes\/accounts\.ts\|users\|full_name["']/.test(VAL));
 

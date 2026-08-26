@@ -81,9 +81,13 @@ section("patchAdminConfig — can create/restore the singleton, updates provided
 gate("patchAdminConfig located", patchFn.length > 0);
 gate("upserts the singleton onConflict id (creates if absent)",
   /upsert\(\s*\{\s*id:\s*true\s*,\s*\.\.\.clean\s*\}\s*,\s*\{[^}]*onConflict:\s*["']id["']/.test(patchFn));
-gate("only the provided columns are written (clean allow-list of the 3 fields)",
+gate("only the provided columns are written (clean allow-list includes streak/xp/comeback)",
   /clean\.streak_threshold/.test(patchFn) && /clean\.xp_multiplier/.test(patchFn) && /clean\.comeback_bonus/.test(patchFn));
-gate("does not widen scope to low/critical score thresholds", !/low_score_threshold|critical_score_threshold/.test(patchFn));
+// Day 297 superseded the original "does not widen to thresholds" gate: the thresholds
+// are now a legitimate persisted contract. The invariant that still matters is that
+// writes remain an explicit per-field allow-list — never a blind `...req.body` spread.
+gate("writes remain an explicit per-field allow-list (no blind req.body spread)",
+  !/\.\.\.\s*req\.body/.test(patchFn) && !/\.\.\.\s*patch\b/.test(patchFn));
 gate("surfaces a real write error (throws, no fabricated success)",
   /if\s*\(\s*error\s*\|\|\s*!data\s*\)[\s\S]{0,80}throw new Error/.test(patchFn));
 

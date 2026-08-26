@@ -1098,15 +1098,20 @@ export function computeScoringV2Result(args: {
 }
 
 // --- SCORING THRESHOLD HELPERS ---
-async function getScoringThresholds(supabase: SupabaseClient): Promise<{
+// Exported for the Day 297 deterministic harness (no network/AI). The runtime
+// callers below are unchanged.
+export async function getScoringThresholds(supabase: SupabaseClient): Promise<{
   low: number;
   critical: number;
 }> {
   try {
+    // Day 297 — read the canonical singleton (id=true), matching the admin service,
+    // and consume the persisted thresholds. The defaults remain only as last-resort
+    // resilience so scoring never crashes; they no longer mask a missing contract.
     const { data, error } = await supabase
       .from("admin_config")
       .select("low_score_threshold, critical_score_threshold")
-      .limit(1)
+      .eq("id", true)
       .maybeSingle();
 
     if (error) throw error;
