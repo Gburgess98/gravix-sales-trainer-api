@@ -418,6 +418,37 @@ async function requireManager(req: Request, res: Response, next: NextFunction) {
   }
 }
 
+// Day 301 — canonical crm_activities row for a `drill_memory` tracking activity.
+// crm_activities requires NOT-NULL `type`, `title` and `user_id` (no defaults;
+// confirmed against the dedicated staging OpenAPI) and has no `flag_*`/`section`
+// columns — the drill metadata lives in `meta`. Both the assignment-completion and
+// assignment-creation ("failure tracking") paths build their row here so they can't
+// silently drift (or omit the required columns) again. Only real crm_activities
+// columns are emitted. Exported for the Day 301 guarded staging proof (the runtime
+// callers are unchanged).
+export function buildDrillMemoryActivityRow(args: {
+  userId: string;
+  section: string;
+  completed: boolean;
+  source: string;
+  extraMeta?: Record<string, any>;
+}) {
+  const { userId, section, completed, source, extraMeta } = args;
+  return {
+    type: "drill_memory",
+    title: `${completed ? "Drill completed" : "Drill assigned"}: ${section}`,
+    user_id: userId,
+    rep_id: userId,
+    source,
+    meta: {
+      action_type: "drill_memory",
+      section,
+      completed,
+      ...(extraMeta || {}),
+    },
+  };
+}
+
 export function assignmentsRoutes() {
   const r = Router();
 
@@ -1062,20 +1093,25 @@ export function assignmentsRoutes() {
     }
 
     // 🔥 FAILURE TRACKING (CRITICAL)
+    // Day 301 — same defect as the completion path: this omitted the NOT-NULL
+    // `title` and `user_id`, so the tracking row always failed silently. Built via
+    // the shared canonical builder so the two paths cannot drift again.
     try {
       const section = payload?.meta?.flag_section || "general";
 
-      await supa.from("crm_activities").insert({
-        type: "drill_memory",
-        rep_id: rep_id,
-        meta: {
+      await supa.from("crm_activities").insert(
+        buildDrillMemoryActivityRow({
+          userId: rep_id,
           section,
           completed: false,
-          created_from_assignment: true,
-          assignment_id: (data as any)?.id,
-          created_at: new Date().toISOString(),
-        },
-      });
+          source: "assignment_created",
+          extraMeta: {
+            created_from_assignment: true,
+            assignment_id: (data as any)?.id,
+            created_at: new Date().toISOString(),
+          },
+        })
+      );
     } catch (e) {
       console.log("[memory.failure.track.failed]", e);
     }
@@ -1149,19 +1185,23 @@ export function assignmentsRoutes() {
 
     if (error) return res.status(500).json({ ok: false, error: error.message });
 
-    // MEMORY TRACKING: Insert drill_memory activity for this section
+    // MEMORY TRACKING: Insert drill_memory activity for this section.
+    // Day 301 — previously omitted the NOT-NULL `title` and `user_id` (set only
+    // `rep_id`), so every write failed the not-null constraint and was swallowed by
+    // the catch below — the completion succeeded while its memory-tracking activity
+    // was silently absent. Now built via the canonical shared row builder.
     try {
       const section = (data as any)?.meta?.flag_section;
       if (section) {
-        await supa.from("crm_activities").insert({
-          type: "drill_memory",
-          rep_id: userId,
-          meta: {
+        await supa.from("crm_activities").insert(
+          buildDrillMemoryActivityRow({
+            userId,
             section,
             completed: true,
-            completed_at: new Date().toISOString(),
-          },
-        });
+            source: "assignment_complete",
+            extraMeta: { completed_at: new Date().toISOString() },
+          })
+        );
       }
     } catch (e) {
       console.log("[memory.update.failed]", e);
