@@ -95,8 +95,8 @@ gate("no scoring.ts|admin_config|low_score_threshold baseline",
   !/["']src\/lib\/scoring\.ts\|admin_config\|low_score_threshold["']/.test(VAL));
 gate("no scoring.ts|admin_config|critical_score_threshold baseline",
   !/["']src\/lib\/scoring\.ts\|admin_config\|critical_score_threshold["']/.test(VAL));
-gate("retains accounts.ts|users|full_name (unchanged real drift — not fixed this day)",
-  /["']src\/routes\/accounts\.ts\|users\|full_name["']/.test(VAL));
+gate("accounts.ts|users|full_name baseline removed by Day 298",
+  !/["']src\/routes\/accounts\.ts\|users\|full_name["']/.test(VAL));
 
 console.log(`\n${failures === 0 ? "PASS" : "FAIL"} — ${failures} gate failure(s).`);
 process.exit(failures === 0 ? 0 : 1);

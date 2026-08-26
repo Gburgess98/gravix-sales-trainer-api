@@ -2138,13 +2138,11 @@ router.get('/:id/rescue-engine', async (req: Request, res: Response) => {
         .order('created_at', { ascending: false })
         .limit(100),
 
-      account.owner_id
-        ? supa
-          .from('users')
-          .select('id,email,role,full_name')
-          .eq('id', account.owner_id)
-          .maybeSingle()
-        : Promise.resolve({ data: null, error: null }),
+      // Day 298 — owner_id stores a reps.id (the Day-284 ownership contract).
+      // Reuse the company-scoped canonical resolver instead of querying
+      // users.full_name, a column that does not exist and caused rescue-engine to
+      // 500 for owned accounts. The helper preserves the existing owner response.
+      resolveOwnerRep(account.owner_id, requester.company_id),
 
       // Day 287 — contact count from the same canonical source as the list/detail
       // (crm_contacts.account_id), via the shared Day-286 helper. Company-safe
@@ -2320,7 +2318,7 @@ router.get('/:id/rescue-engine', async (req: Request, res: Response) => {
         domain: account.domain,
       },
 
-      owner: ownerRes.data || null,
+      owner: ownerRes || null,
 
       stats: {
         avg_score: avgScore,

@@ -73,8 +73,8 @@ gate("scoring.ts|admin_config|low_score_threshold baseline removed (Day 297)",
   !/["']src\/lib\/scoring\.ts\|admin_config\|low_score_threshold["']/.test(VAL));
 gate("scoring.ts|admin_config|critical_score_threshold baseline removed (Day 297)",
   !/["']src\/lib\/scoring\.ts\|admin_config\|critical_score_threshold["']/.test(VAL));
-gate("retains accounts.ts|users|full_name (unchanged real drift)",
-  /["']src\/routes\/accounts\.ts\|users\|full_name["']/.test(VAL));
+gate("accounts.ts|users|full_name baseline removed by Day 298",
+  !/["']src\/routes\/accounts\.ts\|users\|full_name["']/.test(VAL));
 
 section("schema-select guard mechanism preserved (not weakened)");
 gate("full scan retained (SCAN_DIRS includes src and scripts)",

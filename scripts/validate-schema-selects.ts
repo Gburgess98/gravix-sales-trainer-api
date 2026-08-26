@@ -143,8 +143,9 @@ const KNOWN_DRIFT = new Set([
   // 20260826) and are a persisted contract, so those selects are no longer drift.
   // Day 295 removed the three src/routes/accounts.ts|contacts|{name,company,role}
   // allowances after the Days 285–287 canonical crm_contacts cutover.
-  // Only accounts.ts|users|full_name remains real, baselined drift (its own day).
-  "src/routes/accounts.ts|users|full_name",
+  // Day 298 removed the final accounts.ts|users|full_name drift: rescue-engine
+  // now resolves accounts.owner_id through the canonical company-scoped reps
+  // helper. No known read drift remains.
 ]);
 
 const driftKey = (f: { file: string; table: string; column: string }) =>
