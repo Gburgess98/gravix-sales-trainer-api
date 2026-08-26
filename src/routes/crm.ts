@@ -6662,8 +6662,19 @@ router.post("/actions", async (req, res) => {
         return res.status(500).json({ ok: false, error: "crm_actions_table_missing" });
       }
 
-      // If it’s a missing column error, continue trying next payload
-      if (msg.includes("column") && msg.includes("does not exist")) {
+      // If it’s a missing-column error, continue trying the next (leaner) payload.
+      // Day 302 — supabase-js/PostgREST reports a missing column as PGRST204
+      // "Could not find the '<col>' column of '<table>' in the schema cache", NOT
+      // the raw Postgres "column ... does not exist". This ladder previously matched
+      // only the latter, so on staging (where crm_actions has no `rep_id`/`source`)
+      // it broke on the very first attempt and never reached the minimal fallback —
+      // POST /crm/actions always 500'd. Recognise the PostgREST format too, matching
+      // the sibling create path's handling.
+      const isMissingColumn =
+        (msg.includes("column") && msg.includes("does not exist")) ||
+        (msg.includes("could not find the") && msg.includes("column")) ||
+        msg.includes("schema cache");
+      if (isMissingColumn) {
         continue;
       }
 

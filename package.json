@@ -127,6 +127,8 @@
     "validate:review-flag-activity-schema": "tsx scripts/validate-review-flag-activity-schema-day-300.ts",
     "proof:review-flag-activity": "tsx scripts/proof-review-flag-activity-day-300.ts",
     "validate:drill-memory-activity-schema": "tsx scripts/validate-drill-memory-activity-schema-day-301.ts",
-    "proof:drill-memory-activity": "tsx scripts/proof-drill-memory-activity-day-301.ts"
+    "proof:drill-memory-activity": "tsx scripts/proof-drill-memory-activity-day-301.ts",
+    "validate:crm-actions-create": "tsx scripts/validate-crm-actions-create-day-302.ts",
+    "proof:crm-actions-create": "tsx scripts/proof-crm-actions-create-day-302.ts"
   }
 }
