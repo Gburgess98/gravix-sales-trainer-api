@@ -129,6 +129,8 @@
     "validate:drill-memory-activity-schema": "tsx scripts/validate-drill-memory-activity-schema-day-301.ts",
     "proof:drill-memory-activity": "tsx scripts/proof-drill-memory-activity-day-301.ts",
     "validate:crm-actions-create": "tsx scripts/validate-crm-actions-create-day-302.ts",
-    "proof:crm-actions-create": "tsx scripts/proof-crm-actions-create-day-302.ts"
+    "proof:crm-actions-create": "tsx scripts/proof-crm-actions-create-day-302.ts",
+    "validate:crm-opportunity-route-order": "tsx scripts/validate-crm-opportunity-route-order-day-304.ts",
+    "proof:crm-opportunity-stages": "tsx scripts/proof-crm-opportunity-stages-day-304.ts"
   }
 }

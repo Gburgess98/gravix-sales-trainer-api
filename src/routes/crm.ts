@@ -3013,6 +3013,55 @@ const OpportunityUpdateSchema = z
     { message: "no_fields" }
   );
 
+// Day 304 — the literal GET /opportunities/stages MUST register before the
+// parameterised GET /opportunities/:id. On a single Express router the first match
+// wins, so with /:id registered first a request to /opportunities/stages was
+// captured as id="stages" and rejected by the UUID guard (400 invalid_id), leaving
+// the stages handler unreachable. Moved here (from below /:id) — auth, tenant scope
+// (user_id) and the { ok, stages, source } response shape are unchanged. The /:id
+// UUID guard below still protects genuine detail requests.
+router.get("/opportunities/stages", async (req, res) => {
+  try {
+    const requester = getUserIdHeader(req);
+
+    // Best-effort: select just stage; tolerate schemas without created_at
+    const r = await supa
+      .from("crm_opportunities")
+      .select("stage")
+      .eq("user_id", requester)
+      .limit(2000);
+
+    if (r.error) {
+      const msg = String((r.error as any)?.message ?? "").toLowerCase();
+      if (msg.includes("relation") && msg.includes("does not exist")) {
+        return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
+      }
+      // fail-open with defaults
+      return res.json({
+        ok: true,
+        stages: ["Lead", "Qualified", "Proposal", "Negotiation", "Won", "Lost"],
+        source: "defaults",
+      });
+    }
+
+    const stages = Array.from(
+      new Set(
+        ((r.data as any[]) ?? [])
+          .map((x) => String((x as any)?.stage ?? "").trim())
+          .filter(Boolean)
+      )
+    ).sort((a, b) => a.localeCompare(b));
+
+    const out = stages.length
+      ? stages
+      : ["Lead", "Qualified", "Proposal", "Negotiation", "Won", "Lost"];
+
+    return res.json({ ok: true, stages: out, source: stages.length ? "db" : "defaults" });
+  } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
+  }
+});
+
 router.get("/opportunities/:id", async (req, res) => {
   try {
     const requester = getUserIdHeader(req);
@@ -7023,47 +7072,9 @@ router.get("/opportunities/pipeline", async (req, res) => {
 
 // GET /v1/crm/opportunities/stages
 // Returns distinct stage values for the requester.
-router.get("/opportunities/stages", async (req, res) => {
-  try {
-    const requester = getUserIdHeader(req);
-
-    // Best-effort: select just stage; tolerate schemas without created_at
-    const r = await supa
-      .from("crm_opportunities")
-      .select("stage")
-      .eq("user_id", requester)
-      .limit(2000);
-
-    if (r.error) {
-      const msg = String((r.error as any)?.message ?? "").toLowerCase();
-      if (msg.includes("relation") && msg.includes("does not exist")) {
-        return res.status(500).json({ ok: false, error: "crm_opportunities_table_missing" });
-      }
-      // fail-open with defaults
-      return res.json({
-        ok: true,
-        stages: ["Lead", "Qualified", "Proposal", "Negotiation", "Won", "Lost"],
-        source: "defaults",
-      });
-    }
-
-    const stages = Array.from(
-      new Set(
-        ((r.data as any[]) ?? [])
-          .map((x) => String((x as any)?.stage ?? "").trim())
-          .filter(Boolean)
-      )
-    ).sort((a, b) => a.localeCompare(b));
-
-    const out = stages.length
-      ? stages
-      : ["Lead", "Qualified", "Proposal", "Negotiation", "Won", "Lost"];
-
-    return res.json({ ok: true, stages: out, source: stages.length ? "db" : "defaults" });
-  } catch (e: any) {
-    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
-  }
-});
+// Day 304 — the GET /opportunities/stages handler was moved above the first
+// GET /opportunities/:id (it was unreachable here, shadowed by /:id). Only that one
+// registration remains, now reachable.
 
 // PATCH /v1/crm/opportunities/:id/stage
 // Body: { stage: string }
