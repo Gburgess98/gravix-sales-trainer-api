@@ -6753,56 +6753,6 @@ const StageSchema = z.object({
   stage: z.string().trim().min(1),
 });
 
-// Best-effort select helper (schema tolerant) for crm_opportunities
-async function selectCrmOpportunitiesSafe(args: {
-  requester: string;
-  stage?: string | null;
-  limit: number;
-}) {
-  const { requester, stage, limit } = args;
-
-  const candidateSelects = [
-    "id, name, stage, amount, close_date, account_id, contact_id, created_at, updated_at",
-    "id, name, stage, amount, close_date, account_id, contact_id, created_at",
-    "id, name, stage, amount, close_date, account_id, contact_id",
-    "id, name, stage, account_id, contact_id",
-    "id, name, stage",
-    "id, stage",
-    "id",
-  ];
-
-  for (const sel of candidateSelects) {
-    const q = supa
-      .from("crm_opportunities")
-      .select(sel)
-      .eq("user_id", requester)
-      .order("created_at", { ascending: false })
-      .limit(limit);
-
-    const r = stage ? await q.eq("stage", stage) : await q;
-
-    if (!r.error) {
-      return { ok: true as const, rows: (r.data as any[]) ?? [], select: sel };
-    }
-
-    const msg = String((r.error as any)?.message ?? "").toLowerCase();
-
-    // Table missing: hard fail (pipeline depends on this table)
-    if (msg.includes("relation") && msg.includes("does not exist")) {
-      return { ok: false as const, error: r.error };
-    }
-
-    // Missing column: try the next select candidate
-    if (msg.includes("column") && msg.includes("does not exist")) {
-      continue;
-    }
-
-    // Unknown error: stop
-    return { ok: false as const, error: r.error };
-  }
-
-  return { ok: false as const, error: new Error("crm_opportunities_select_failed") };
-}
 
 /* ---------------------------------------------
    POST /v1/crm/opportunities
@@ -7018,57 +6968,11 @@ router.post("/opportunities", async (req, res) => {
 });
 
 // GET /v1/crm/opportunities/pipeline
-// Returns opportunities grouped by stage (kanban-ready)
-router.get("/opportunities/pipeline", async (req, res) => {
-  try {
-    const requester = getUserIdHeader(req);
-
-    const limit = Math.min(Math.max(Number((req.query as any)?.limit ?? 500), 1), 2000);
-    const stage = String((req.query as any)?.stage ?? "").trim() || null;
-
-    const r = await selectCrmOpportunitiesSafe({ requester, stage, limit });
-    if (!r.ok) {
-      const msg = String(((r as any).error as any)?.message ?? (r as any).error ?? "pipeline_fetch_failed");
-      return res.status(500).json({ ok: false, error: msg });
-    }
-
-    const rows = (r.rows ?? []).map((o: any) => ({
-      id: o.id,
-      name: o.name ?? null,
-      stage: o.stage ?? null,
-      amount: (o as any).amount ?? null,
-      close_date: (o as any).close_date ?? null,
-      account_id: (o as any).account_id ?? null,
-      contact_id: (o as any).contact_id ?? null,
-      created_at: (o as any).created_at ?? null,
-      updated_at: (o as any).updated_at ?? null,
-    }));
-
-    const byStage: Record<string, any[]> = {};
-    for (const o of rows) {
-      const s = String(o.stage ?? "Unstaged").trim() || "Unstaged";
-      (byStage[s] ||= []).push(o);
-    }
-
-    // Deterministic column order (alpha), but keep common stages first if present
-    const preferred = ["Lead", "Qualified", "Proposal", "Negotiation", "Won", "Lost"];
-    const stageSet = new Set(Object.keys(byStage));
-    const orderedStages = [
-      ...preferred.filter((s) => stageSet.has(s)),
-      ...[...stageSet].filter((s) => !preferred.includes(s)).sort((a, b) => a.localeCompare(b)),
-    ];
-
-    return res.json({
-      ok: true,
-      stages: orderedStages,
-      by_stage: byStage,
-      opportunities: rows,
-      meta: { select: r.select, limit, stage },
-    });
-  } catch (e: any) {
-    return res.status(400).json({ ok: false, error: e?.message ?? "bad_request" });
-  }
-});
+// Day 306 — removed the SHADOWED duplicate handler here (it returned a different
+// { stages, by_stage, opportunities, meta } shape and was unreachable; the earlier
+// active handler @ the top of this file — { stages, columns, items } — wins and is
+// what the WEB consumes). Its exclusive helper selectCrmOpportunitiesSafe was removed
+// with it. The active handler and /opportunities/pipeline/summary are unchanged.
 
 // GET /v1/crm/opportunities/stages
 // Returns distinct stage values for the requester.

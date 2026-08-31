@@ -133,6 +133,8 @@
     "validate:crm-opportunity-route-order": "tsx scripts/validate-crm-opportunity-route-order-day-304.ts",
     "proof:crm-opportunity-stages": "tsx scripts/proof-crm-opportunity-stages-day-304.ts",
     "validate:crm-opportunity-detail-dedup": "tsx scripts/validate-crm-opportunity-detail-dedup-day-305.ts",
-    "proof:crm-opportunity-detail-dedup": "tsx scripts/proof-crm-opportunity-detail-dedup-day-305.ts"
+    "proof:crm-opportunity-detail-dedup": "tsx scripts/proof-crm-opportunity-detail-dedup-day-305.ts",
+    "validate:crm-opportunity-pipeline-dedup": "tsx scripts/validate-crm-opportunity-pipeline-dedup-day-306.ts",
+    "proof:crm-opportunity-pipeline-dedup": "tsx scripts/proof-crm-opportunity-pipeline-dedup-day-306.ts"
   }
 }
