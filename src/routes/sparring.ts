@@ -1465,7 +1465,8 @@ Your goal is to expose weakness.
         personaId,
         difficulty: difficulty as DifficultyLevel,
         mode,
-      } as any
+      } as any,
+      difficulty as DifficultyLevel
     );
   } catch (e) {
     console.warn(

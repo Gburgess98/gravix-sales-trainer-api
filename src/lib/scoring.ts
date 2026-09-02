@@ -1329,7 +1329,7 @@ async function ensureCriticalCallAssignment(args: {
   assigneeUserId?: string | null;
   overall: number;
   thresholdBand: string | null;
-  reviewFlags: Array<{ type: string; severity: "low" | "critical"; section: string; score: number; timestamp?: number | null }>;
+  reviewFlags: Array<{ type: string; severity: "low" | "critical"; section: string; score: number; timestamp?: number | null; failureCount?: number }>;
   source: "scoring_engine" | "scoring_engine_fallback";
 }) {
   if (SKIP_SCORING_SIDE_EFFECTS) {

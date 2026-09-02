@@ -1,7 +1,7 @@
 // src/routes/assignments.ts
 import { Router } from "express";
 import type { Request, Response, NextFunction } from "express";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 import {
   isCompanyManager,
@@ -9,13 +9,13 @@ import {
   canAccessOffice,
   canAccessCompany,
   type UserContext,
-} from "../lib/permissions.ts";
+} from "../lib/permissions";
 import { logAuditEvent } from "../lib/audit";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 
-let _supaAdmin: ReturnType<typeof createClient> | null = null;
+let _supaAdmin: SupabaseClient | null = null;
 function getSupaAdmin() {
   if (_supaAdmin) return _supaAdmin;
   _supaAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {

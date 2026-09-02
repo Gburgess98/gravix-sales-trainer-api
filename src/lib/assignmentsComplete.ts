@@ -155,7 +155,11 @@ export async function completeAssignmentsForTarget(opts: {
   targetId: string | null;
   assignmentId?: string | null;
   completedBy?: CompletedBy;
-}): Promise<{ ok: true; updated: number; completedCount: number; xpAwardedTotal: number }> {
+  // Accepted for caller provenance/metadata; not consumed by this function.
+  completedVia?: string;
+  xpAwarded?: number;
+  metaPatch?: Record<string, unknown>;
+}): Promise<{ ok: true; updated: number; completedCount: number; xpAwardedTotal: number; method?: string; reason?: string }> {
   const {
     repId,
     type,

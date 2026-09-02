@@ -6,7 +6,7 @@ const router = Router();
 async function tryGetSupabaseAdmin() {
   try {
     // Lazy import so missing file doesn't crash server boot
-    const mod: any = await import("../lib/supabaseAdmin");
+    const mod: any = await import("../lib/supabase");
     return mod?.supabaseAdmin ?? mod?.default ?? null;
   } catch {
     return null;

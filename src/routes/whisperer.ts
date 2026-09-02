@@ -167,9 +167,12 @@ async function rewriteSuggestionWithLLM(
       max_output_tokens: 120,
     });
 
+    const firstOutput = resp.output?.[0];
+    const firstContent =
+      firstOutput && "content" in firstOutput ? firstOutput.content : undefined;
     const out =
-      (resp.output[0].content[0] as any)?.text?.trim?.() ??
-      (resp.output[0].content as any)?.[0]?.text?.trim?.();
+      (firstContent?.[0] as any)?.text?.trim?.() ??
+      (firstContent as any)?.[0]?.text?.trim?.();
 
     if (out && typeof out === "string") return out;
     return base;

@@ -4,7 +4,7 @@ import {
   isCompanyManager,
   isOfficeManager,
   type UserContext,
-} from '../lib/permissions.ts';
+} from '../lib/permissions';
 
 const router = Router();
 
@@ -371,8 +371,8 @@ router.get('/kpis', async (req, res) => {
       winRate: [],
       top_accounts: [],
       top_reps: [],
-      // expose since for debugging even on error
-      since: typeof since !== 'undefined' ? since : undefined,
+      // `since` is scoped to the try block above and is not in scope here.
+      since: undefined,
     });
   }
 });

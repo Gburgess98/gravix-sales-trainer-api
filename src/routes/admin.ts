@@ -1,7 +1,7 @@
 import 'dotenv/config';
 // src/routes/admin.ts
 import { Router } from "express";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { getRequesterOrgId } from "../lib/callAccess";
 import { requireUserId } from "../middleware/requireUserId";
 import { buildScoreSummaryBlocks } from "../lib/slackBlocks";
@@ -10,10 +10,10 @@ import {
   auditUserCreated,
   writeAuditEvent,
 } from "../lib/audit";
-import { requirePartnerAdmin } from "../middleware/requirePartnerAdmin.ts";
-import { requireSuperAdmin }   from "../middleware/requireSuperAdmin.ts";
-import { getVisibleCompanies } from "../lib/partnerAccess.ts";
-import { AUDIT_ACTIONS, logAuditEvent } from "../lib/audit.ts";
+import { requirePartnerAdmin } from "../middleware/requirePartnerAdmin";
+import { requireSuperAdmin }   from "../middleware/requireSuperAdmin";
+import { getVisibleCompanies } from "../lib/partnerAccess";
+import { AUDIT_ACTIONS, logAuditEvent } from "../lib/audit";
 export const adminRouter = Router();
 
 // --- Roles (lean RBAC v1) -------------------------------------
@@ -95,7 +95,10 @@ async function requireManager(req: any, res: any, next: any) {
 adminRouter.post("/force-score/:id", async (req, res) => {
   const { id } = req.params;
   try {
-    const jobId = await req.services.scoring.enqueue({
+    // `services` is an optional request-scoped DI container; this handler
+    // assumes it has been wired. Retains the existing runtime behaviour
+    // (throws and is caught below when it is absent).
+    const jobId = await req.services!.scoring.enqueue({
       callId: id,
       userId: req.user?.id ?? "admin",
     });
@@ -1418,7 +1421,7 @@ adminRouter.post("/super/stop-impersonation", requireSuperAdmin, async (req: any
 async function assertUserEditScope(
   actorId: string,
   targetId: string,
-  supa: ReturnType<typeof createClient>
+  supa: SupabaseClient
 ): Promise<{ ok: true; actorTier: string } | { ok: false; status: number; error: string }> {
   const { data: actor } = await supa.from("reps").select("tier, company_id").eq("id", actorId).maybeSingle();
   if (!actor) return { ok: false, status: 401, error: "actor_not_found" };
@@ -1607,7 +1610,7 @@ adminRouter.patch("/users/:id", async (req: any, res: any) => {
 async function assertCompanyEditScope(
   actorId: string,
   targetCompanyId: string,
-  supa: ReturnType<typeof createClient>
+  supa: SupabaseClient
 ): Promise<{ ok: true; actorTier: string } | { ok: false; status: number; error: string }> {
   const { data: actor } = await supa.from("reps").select("tier, company_id").eq("id", actorId).maybeSingle();
   if (!actor) return { ok: false, status: 401, error: "actor_not_found" };

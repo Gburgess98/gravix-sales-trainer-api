@@ -1,6 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import { createClient } from '@supabase/supabase-js';
-import { logAuditEvent, AUDIT_ACTIONS } from '../lib/audit.ts';
+import { logAuditEvent, AUDIT_ACTIONS } from '../lib/audit';
 
 const router = express.Router();
 

@@ -21,6 +21,7 @@ export type PersonaBehaviour = {
 };
 
 export type DifficultyModifier = {
+  replyLength?: "short" | "medium" | "long";
   objectionFrequency?: "low" | "medium" | "high";
   interruptionLevel?: "low" | "medium" | "high";
   pricePressure?: "low" | "medium" | "high";

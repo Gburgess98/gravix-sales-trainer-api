@@ -6,7 +6,7 @@ import multer from "multer";
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 import { randomUUID } from "crypto";
 import { postSlack, postAssignNotification /* , postScoreSummary */ } from "./lib/slack";
@@ -681,7 +681,7 @@ function requireEnvUuid(name: string): string {
 
 /* --- Slack summary builder (used after scoring) --- */
 async function buildSlackSummaryBlocks(opts: {
-  supabase: ReturnType<typeof createClient>;
+  supabase: SupabaseClient;
   callId: string;
   filename?: string | null;
   overall: number;

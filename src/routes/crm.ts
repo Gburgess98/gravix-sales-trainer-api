@@ -1479,7 +1479,7 @@ function inferWeakestSkillFromRubric(rubric: any): string | null {
   ].filter((x) => x.value !== null) as Array<{ label: string; value: number }>;
 
   if (!skillCandidates.length) return null;
-  skillCandidates.sort((a, b) => a.value - b.value);
+  skillCandidates.sort((a, b) => (a.value ?? 0) - (b.value ?? 0));
   return skillCandidates[0]?.label ?? null;
 }
 

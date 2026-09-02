@@ -1351,7 +1351,7 @@ router.post("/:id/score", async (req, res) => {
       scoreOverall: body.score_overall,
       voiceScore: voice_score,
       summary: typeof body.summary === "string" ? body.summary : patch.summary ?? null,
-      reviewTags,
+      reviewTags: review_tags,
     });
     console.log("[score route] feedback email dispatch attempted", { callId: id, repId: call.user_id });
     await autoSendReviewFeedbackEmailBestEffort({
@@ -1361,7 +1361,7 @@ router.post("/:id/score", async (req, res) => {
       scoreOverall: body.score_overall,
       voiceScore: voice_score,
       summary: typeof body.summary === "string" ? body.summary : patch.summary ?? null,
-      reviewTags,
+      reviewTags: review_tags,
     });
     // ---------------------------------------------------------
     // DAY 52 — AUTO COACHING TRIGGERS
@@ -1858,4 +1858,4 @@ router.get("/:id", async (req, res) => {
   }
 });
 
-module.exports = router;
+export default router;
