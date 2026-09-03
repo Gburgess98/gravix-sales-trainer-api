@@ -6,8 +6,6 @@ import crypto from "crypto";
 import {
   isCompanyManager,
   isOfficeManager,
-  canAccessOffice,
-  canAccessCompany,
   type UserContext,
 } from "../lib/permissions";
 import { logAuditEvent } from "../lib/audit";

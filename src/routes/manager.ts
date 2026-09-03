@@ -1462,7 +1462,7 @@ router.post("/whisperer-trigger-candidates/:id/decision", async (req: Request, r
       throw selErr;
     }
 
-    let createdAt = nowIso;
+    const createdAt = nowIso;
     if (existing) {
       const { error: uErr } = await supa
         .from(table)

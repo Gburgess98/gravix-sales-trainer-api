@@ -1883,7 +1883,7 @@ adminRouter.get("/platform", requireSuperAdmin, async (_req: any, res: any) => {
     ]);
 
     // Storage: best-effort from Supabase storage API
-    let storage_usage: { bucket: string; file_count: number }[] = [];
+    const storage_usage: { bucket: string; file_count: number }[] = [];
     try {
       const { data: buckets } = await supa.storage.listBuckets();
       for (const b of buckets || []) {
@@ -2150,7 +2150,7 @@ adminRouter.get("/partner/licences", requirePartnerAdmin, async (req: any, res: 
 
     // Enrich with company names
     const companyIds = (allocations || []).map((a: any) => a.company_id);
-    let companyNameMap = new Map<string, string>();
+    const companyNameMap = new Map<string, string>();
     if (companyIds.length > 0) {
       const { data: cos } = await supa
         .from("companies")
@@ -2232,7 +2232,7 @@ adminRouter.get("/super/licences", requireSuperAdmin, async (req: any, res: any)
 
     // Enrich company allocations with names
     const allCompanyIds = [...new Set((allocations || []).map((a: any) => a.company_id))] as string[];
-    let companyNameMap = new Map<string, string>();
+    const companyNameMap = new Map<string, string>();
     if (allCompanyIds.length > 0) {
       const { data: cos } = await supa
         .from("companies")

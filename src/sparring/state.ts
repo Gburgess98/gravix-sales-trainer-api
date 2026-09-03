@@ -299,7 +299,7 @@ export function updateSparringState(
   }
 
   // Next buyer move (deterministic rule ladder)
-  let nextBuyerMove: NextBuyerMove = "ask_question";
+  let nextBuyerMove: NextBuyerMove;
   if (stage === "ended") nextBuyerMove = "close_window";
   else if (emotional && emotional.boredom > 75) nextBuyerMove = "close_window";
   else if (objectionState.active && !objectionState.resolved) nextBuyerMove = "push_back";

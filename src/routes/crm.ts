@@ -2,7 +2,6 @@ import { Router } from "express";
 import { randomUUID } from "crypto";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
-import { postSlack } from "../lib/slack";
 import { postCrmAutoAssignRunSlack } from "../lib/slack";
 
 const router = Router();
@@ -235,17 +234,6 @@ async function requireManagerOrg(req: any): Promise<{ requester: string; orgId: 
 
   await assertRequesterInOrg({ requester, orgId });
   return { requester, orgId, bypassed: false };
-}
-
-// ------------------------------
-// Cron auth helper (fail-closed)
-// ------------------------------
-function requireCronAuth(req: any) {
-  const expected = String(process.env.CRON_SECRET || "").trim();
-  if (!expected) throw new Error("cron_secret_not_configured");
-
-  const provided = String(req.header("x-cron-secret") || "").trim();
-  if (!provided || provided !== expected) throw new Error("invalid_cron_secret");
 }
 
 // Helper for safe contacts query (handles last_contacted_at column missing)
@@ -1550,8 +1538,8 @@ function buildRepControlCentreRow(args: {
 
   const weakestFromReasons = deriveWeakestSkillFromReasons(coachingReasons);
 
-  let weakestSkill: string | null = null;
-  let weakestSkillSource: string = "activity_fallback";
+  let weakestSkill: string | null;
+  let weakestSkillSource: string;
 
   if (weakestFromRubric) {
     weakestSkill = weakestFromRubric;
@@ -2089,7 +2077,7 @@ router.get("/manager/contacts", async (req, res) => {
 
     let contactRows: any[] = [];
     for (const sel of contactSelectCandidates) {
-      let q = supa
+      const q = supa
         .from("crm_contacts")
         .select(sel)
         .in("user_id", repIds)
@@ -2242,10 +2230,6 @@ type RepContext = {
   office_id: string | null;
 };
 
-type PartnerContext = RepContext & {
-  partner_id: string | null;
-};
-
 async function getRepContext(userId: string): Promise<RepContext | null> {
   try {
     const { data, error } = await supa
@@ -2340,36 +2324,6 @@ function accountInsertPayload(scope: AccountScope, fields: Record<string, unknow
   const payload: Record<string, unknown> = { org_id: scope.orgId, ...fields };
   if (scope.companyScoped) payload.company_id = scope.companyId;
   return payload;
-}
-
-/**
- * Returns the full identity context for a user: tier, company, office, and
- * the partner that owns their company (post-Phase-2-migration).
- *
- * Falls back gracefully when the partners table or partner_id column does not
- * exist yet — returns partner_id: null so callers can proceed without it.
- */
-async function getPartnerContext(userId: string): Promise<PartnerContext | null> {
-  const repCtx = await getRepContext(userId);
-  if (!repCtx) return null;
-
-  let partnerId: string | null = null;
-
-  if (repCtx.company_id) {
-    try {
-      const { data } = await supa
-        .from("companies")
-        .select("partner_id")
-        .eq("id", repCtx.company_id)
-        .maybeSingle();
-
-      partnerId = (data as any)?.partner_id ?? null;
-    } catch {
-      // partners table or partner_id column not yet migrated — fail-soft
-    }
-  }
-
-  return { ...repCtx, partner_id: partnerId };
 }
 
 /**
@@ -3677,12 +3631,10 @@ async function touchContactBestEffort(opts: { requester: string; contactId: stri
     (msg.includes(col) && msg.includes("could not find"));
 
   const tryUpdate = async (ownerCol: "user_id" | "requester_id") => {
-    // @ts-ignore dynamic column
     const r = await supa
       .from("crm_contacts")
       .update({ last_contacted_at: nowIso })
       .eq("id", contactId)
-      // @ts-ignore dynamic column
       .eq(ownerCol, requester)
       .select("id")
       .maybeSingle();
@@ -4753,91 +4705,6 @@ function relativeTimeFromIso(iso: string | null | undefined) {
   return `${months}mo ago`;
 }
 
-// ------------------- Contact Health Helpers -------------------
-function daysSince(iso: string | null | undefined): number | null {
-  if (!iso) return null;
-  const dt = new Date(iso);
-  if (Number.isNaN(dt.getTime())) return null;
-  const ms = Date.now() - dt.getTime();
-  return Math.floor(ms / (1000 * 60 * 60 * 24));
-}
-
-type ContactHealthStatus = "hot" | "warm" | "cold" | "stale";
-
-function classifyHealth(args: {
-  lastContactedDays: number | null;
-  overdueCount: number;
-  criticalNotesCount: number;
-  importantNotesCount: number;
-  lastCallScore: number | null;
-}): { status: ContactHealthStatus; score: number; reasons: string[]; next_action: string } {
-  const { lastContactedDays, overdueCount, criticalNotesCount, importantNotesCount, lastCallScore } = args;
-
-  let score = 50;
-  const reasons: string[] = [];
-
-  if (lastContactedDays == null) {
-    score -= 10;
-    reasons.push("Never contacted");
-  } else if (lastContactedDays <= 2) {
-    score += 20;
-    reasons.push("Contacted recently");
-  } else if (lastContactedDays <= 7) {
-    score += 10;
-    reasons.push("Contacted within 7 days");
-  } else if (lastContactedDays <= 14) {
-    score -= 5;
-    reasons.push("No contact in 2 weeks");
-  } else if (lastContactedDays <= 30) {
-    score -= 15;
-    reasons.push("No contact in 30 days");
-  } else {
-    score -= 25;
-    reasons.push("No contact in 30+ days");
-  }
-
-  if (overdueCount > 0) {
-    score -= Math.min(25, overdueCount * 8);
-    reasons.push(`${overdueCount} overdue assignment${overdueCount === 1 ? "" : "s"}`);
-  }
-
-  if (criticalNotesCount > 0) {
-    score -= Math.min(20, criticalNotesCount * 10);
-    reasons.push("Critical note(s) present");
-  } else if (importantNotesCount > 0) {
-    score -= Math.min(10, importantNotesCount * 5);
-    reasons.push("Important note(s) present");
-  }
-
-  if (lastCallScore != null) {
-    if (lastCallScore >= 80) {
-      score += 10;
-      reasons.push("Strong last call score");
-    } else if (lastCallScore >= 60) {
-      score += 3;
-      reasons.push("Decent last call score");
-    } else {
-      score -= 8;
-      reasons.push("Weak last call score");
-    }
-  }
-
-  score = Math.max(0, Math.min(100, score));
-
-  let status: ContactHealthStatus = "cold";
-  if (overdueCount > 0 || (lastContactedDays != null && lastContactedDays > 14)) status = "stale";
-  if ((lastContactedDays != null && lastContactedDays <= 7) && overdueCount === 0) status = "warm";
-  if ((lastContactedDays != null && lastContactedDays <= 2) && overdueCount === 0 && criticalNotesCount === 0) status = "hot";
-
-  let next_action = "Log a next step (time + outcome) and schedule follow-up.";
-  if (overdueCount > 0) next_action = "Clear overdue assignment(s) before doing anything else.";
-  else if (lastContactedDays == null) next_action = "Send intro + 2 discovery questions + book a time.";
-  else if (lastContactedDays > 14) next_action = "Re-open with a short recap + clear next step + 2 time slots.";
-  else if (criticalNotesCount > 0) next_action = "Review critical notes before contacting.";
-
-  return { status, score, reasons, next_action };
-}
-
 function buildHeuristicBrief(args: {
   contact: any;
   notes: any[];
@@ -5352,11 +5219,6 @@ router.post("/link-call", async (req, res) => {
      - For demo/virtual calls: update/delete from `crm_demo_call_links` (scoped by user_id).
      - Best-effort schema tolerance: if account_id column missing, fallback to deleting the link row.
 ---------------------------------------------- */
-const UnlinkSchema = z.object({
-  callId: z.string().trim().min(1),
-  target: z.enum(["contact", "account"]),
-});
-
 // POST /v1/crm/unlink
 // Body: { callId | call_id, target?: "contact"|"account"|"opportunity"|"all" }
 // Supports demo/string call IDs by using `crm_demo_call_links` for non-UUID ids.
@@ -6071,7 +5933,7 @@ async function selectCrmActionsSafe(args: {
   const { requester, repId, contactId, status, limit, orderByDue } = args;
 
   // Prefer a rich select, but tolerate missing columns.
-  let cols = [
+  const cols = [
     "id",
     "contact_id",
     "type",

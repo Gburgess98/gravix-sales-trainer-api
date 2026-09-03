@@ -18,8 +18,6 @@
 //
 // UK spelling throughout.
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
-
 import { AI_MODEL } from "./openai";
 import type { VoiceAnalysis, CallMoment } from "./types/call-analysis";
 import type { ResolvedScorecard, ResolvedContext } from "./intelligenceRuntime";

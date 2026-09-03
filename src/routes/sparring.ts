@@ -2,7 +2,6 @@ import express, { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
-import { PERSONAS } from "../personas";
 import { getScoringConfig } from "../services/scoringConfig";
 import { completeAssignmentsForTarget } from "../lib/assignmentsComplete";
 import {
@@ -134,7 +133,7 @@ function updateStreakMeta(
 
   const streakScore = getStreakScore(rawTurnScore);
 
-  let streak = prevStreak;
+  let streak: number;
   let best_streak = prevBest;
 
   if (isGoodTurn(rawTurnScore)) {
@@ -515,7 +514,7 @@ function getInitialEmotionalState(personaId: string, difficulty: string): Emotio
 function evaluateRepWeakness(text: string) {
   const t = (text || "").toLowerCase();
 
-  let weakness = {
+  const weakness = {
     vague: false,
     no_question: false,
     weak_close: false,
@@ -549,7 +548,7 @@ function applyEmotionalDelta(
 ): EmotionalState {
   const { personaId, difficulty, turnsSoFar, lastUserText } = opts;
   const lower = (lastUserText || "").toLowerCase();
-  let next: EmotionalState = { ...prev };
+  const next: EmotionalState = { ...prev };
 
   // Base drift: longer drills slowly increase boredom
   next.boredom = clampEmotion(next.boredom + (turnsSoFar > 8 ? 2 : 1));
@@ -2007,11 +2006,9 @@ router.post('/log', express.json(), async (req, res) => {
       if (repUpsertErr) {
         // Non-fatal; continue but warn
         // (If table doesn't exist yet, this will be collected in warnings)
-        // @ts-ignore
         warnings?.push?.(`reps upsert: ${repUpsertErr.message}`);
       }
     } catch (e: any) {
-      // @ts-ignore
       warnings?.push?.(`reps upsert threw: ${e?.message ?? String(e)}`);
     }
   }
@@ -2194,7 +2191,7 @@ router.post("/score", express.json(), async (req, res) => {
       let cfgForAward: any = null;
       try {
         cfgForAward = await getScoringConfig();
-      } catch { }
+      } catch { /* best-effort config load; fall back to defaults */ }
 
       const streakNow = Number.isFinite(Number(prevMeta?.streak)) ? Number(prevMeta.streak) : 0;
       const mult = streakMultiplier(
@@ -2211,7 +2208,7 @@ router.post("/score", express.json(), async (req, res) => {
       let globalMult = 1;
       try {
         if (Number.isFinite(Number(cfgForAward?.xpMultiplier))) globalMult = Number(cfgForAward.xpMultiplier);
-      } catch { }
+      } catch { /* best-effort config load; fall back to defaults */ }
 
       const multXpGlobal = Math.round(multXp * globalMult);
 
@@ -2264,7 +2261,7 @@ router.post("/score", express.json(), async (req, res) => {
         typeof turns === "number" ? turns : row.turns ?? null;
 
       let summary = row.summary ?? null;
-      let flags = row.flags ?? null;
+      const flags = row.flags ?? null;
 
       if (finalDuration == null || finalTurns == null || !summary) {
         try {
@@ -2727,7 +2724,6 @@ router.post(
       }
 
       let repId: string | null = null;
-      let orgIdHeader: string | null = null;
       try {
         repId = getUserIdHeader(req);
       } catch {
@@ -2736,9 +2732,6 @@ router.post(
           repId = bodyRep.trim();
         }
       }
-      orgIdHeader =
-        (req.headers['x-org-id'] as string | undefined)?.toString().trim() ||
-        null;
 
       // 1) Load session and basic access check
       const { data: session, error: sessErr } = await supa
@@ -3105,7 +3098,7 @@ INSTRUCTIONS:
             pendingMetaPatch.failed_moments = failedMoment
               ? [...existingFailedMoments, failedMoment].slice(-50)
               : existingFailedMoments;
-          } catch (e: any) {
+          } catch {
             // non-fatal
           }
         }
@@ -3446,8 +3439,6 @@ router.post(
           ? String((req.body as any).lastBuyerText)
           : null;
 
-      let repTurnId: string | null = null;
-
       if (!lastUserText || !lastBuyerText) {
         // Infer latest rep+buyer pair from DB
         const { data: turns, error: turnsErr } = await supa
@@ -3481,7 +3472,6 @@ router.post(
           return res.json({ ok: true, micro: null, message: "No valid rep+buyer turn pair found." });
         }
 
-        repTurnId = repRow.id;
         lastUserText = String(repRow.text || "");
         lastBuyerText = String(buyerRow.text || "");
       }
@@ -3499,7 +3489,7 @@ router.post(
         let cfgForMicro: any = null;
         try {
           cfgForMicro = await getScoringConfig();
-        } catch { }
+        } catch { /* best-effort config load; fall back to defaults */ }
 
         const streakMeta = updateStreakMeta(prevMeta, micro.turn_score, {
           streakThreshold: cfgForMicro?.streakThreshold,
@@ -3724,21 +3714,6 @@ router.get("/sessions", async (req: Request, res: Response) => {
   res.setHeader("Cache-Control", "no-store");
 
   try {
-    // Prefer explicit ?repId= (manager views),
-    // otherwise fall back to x-user-id header if present.
-    let repId: string | null = null;
-
-    if (typeof req.query.repId === "string" && req.query.repId.trim().length) {
-      repId = req.query.repId.trim();
-    } else {
-      try {
-        repId = getUserIdHeader(req);
-      } catch {
-        // no header – allowed for now (e.g. future manager/global view)
-        repId = null;
-      }
-    }
-
     const limitRaw =
       typeof req.query.limit === "string"
         ? parseInt(req.query.limit as string, 10)
@@ -3748,7 +3723,7 @@ router.get("/sessions", async (req: Request, res: Response) => {
         ? limitRaw
         : 20;
 
-    let query = supa
+    const query = supa
       .from("sparring_sessions")
       .select(
         "id, rep_id, persona_id, difficulty, total_score, xp_awarded, created_at, duration_ms, turns, summary, flags, meta"
@@ -3756,11 +3731,9 @@ router.get("/sessions", async (req: Request, res: Response) => {
       .order("created_at", { ascending: false })
       .limit(limit);
 
-    // TEMP: manager/global view — return ALL sessions regardless of rep
-    // If you want to scope per rep again later, re-enable this:
-    // if (repId) {
-    //   query = query.eq("rep_id", repId);
-    // }
+    // manager/global view — return ALL sessions regardless of rep.
+    // To scope per rep later, resolve a repId (?repId= query param or the
+    // x-user-id header) and add `.eq("rep_id", repId)` to the query above.
 
     const { data, error } = await query;
 

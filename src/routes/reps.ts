@@ -28,8 +28,7 @@ function pct(numer: number, denom: number) {
 //   rubric[stage].score                 (legacy, pre-`stages` nesting)
 // Same precedence as lib/scoring.ts normaliseStages, which treats a
 // missing `stages` wrapper as the stage map itself.
-const STAGE_KEYS = ["intro", "discovery", "objection", "close"] as const;
-type StageKey = (typeof STAGE_KEYS)[number];
+type StageKey = "intro" | "discovery" | "objection" | "close";
 
 // null means "this call carries no score for this stage" — never 0. A
 // missing stage is not a stage scored zero, and callers must not average

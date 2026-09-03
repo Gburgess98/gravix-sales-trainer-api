@@ -9,7 +9,7 @@ import path from "path";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 import { randomUUID } from "crypto";
-import { postSlack, postAssignNotification /* , postScoreSummary */ } from "./lib/slack";
+import { postSlack } from "./lib/slack";
 import { scoreWithLLM, resolveScoringContract, resolveScoringProvider } from "./lib/scoring";
 import { cleanTranscript, buildSegments } from "./lib/transcript";
 
@@ -28,7 +28,6 @@ import teamRoutes from "./routes/team";
 import intelligenceRoutes from "./routes/intelligence";
 import repsRouter from "./routes/reps";
 import { rewardsRoutes } from "./routes/rewards";
-import { PERSONAS } from "./personas";
 import whispererRouter from "./routes/whisperer";
 import adminRouter from "./routes/admin";
 import { assignmentsRoutes } from "./routes/assignments";
@@ -65,7 +64,7 @@ function sendJsonError(
     const rid = ((res as any).req?.rid) || ((res as any).req?.headers?.["x-request-id"]) || "no-rid";
     res.status(status).json({ ok: false, error: message, rid, ...(extra || {}) });
   } catch {
-    try { res.status(status).end(); } catch { }
+    try { res.status(status).end(); } catch { /* best-effort; failure is non-fatal here */ }
   }
 }
 
@@ -417,7 +416,7 @@ app.get("/v1/reps/:id/overview", requireIdentity, async (req, res) => {
         const { data: usr } = await supabase.from("reps").select("id,full_name:name").eq("id", repId).maybeSingle();
         if (usr?.full_name) name = usr.full_name;
       }
-    } catch { }
+    } catch { /* best-effort; failure is non-fatal here */ }
 
     // Calls since window
     const { data: calls } = await supabase
@@ -456,7 +455,7 @@ app.get("/v1/reps/:id/overview", requireIdentity, async (req, res) => {
           .limit(50);
         activities = act || [];
       }
-    } catch { }
+    } catch { /* best-effort; failure is non-fatal here */ }
 
     // Build a simple score trend (avg per day) from recent scored calls
     const byDay = new Map<string, { sum: number; n: number }>();
@@ -1443,9 +1442,8 @@ app.patch("/v1/coach/assignments/:id", requireIdentity, async (req, res) => {
     const id = String(req.params.id || "");
     if (!id) return res.status(400).json({ ok: false, error: "id required" });
 
-    const { status, note } = (req.body || {}) as {
+    const { status } = (req.body || {}) as {
       status?: "open" | "completed";
-      note?: string | null;
     };
     if (!status || !["open", "completed"].includes(status)) {
       return res.status(400).json({ ok: false, error: "status must be 'open' or 'completed'" });
@@ -1702,7 +1700,7 @@ app.get('/v1/coach/assignments/by-entity', requireIdentity, async (req, res) => 
           map.set(String((c as any).id), String((c as any).filename || (c as any).id));
         }
       }
-    } catch { }
+    } catch { /* best-effort; failure is non-fatal here */ }
 
     const items = (assigns || []).map((x: any) => ({
       id: x.id,

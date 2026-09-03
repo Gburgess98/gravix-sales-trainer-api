@@ -21,7 +21,7 @@ r.post("/assign", async (req, res) => {
   try {
     const body = Create.parse(req.body);
     const requester = uid(req);
-    let activityDebug: any = { attempted: false, ok: false, error: null };
+    const activityDebug: any = { attempted: false, ok: false, error: null };
 
     console.log("[coach/assign] handler reached", {
       callId: body.callId,

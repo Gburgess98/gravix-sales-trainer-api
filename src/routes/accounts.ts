@@ -395,7 +395,7 @@ router.get('/escalations', async (req: Request, res: Response) => {
       });
     }
 
-    let escalationQuery = supa
+    const escalationQuery = supa
       .from('account_escalations')
       .select(`
         id,

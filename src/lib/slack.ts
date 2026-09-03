@@ -283,7 +283,7 @@ export function buildScoreBlocks(s: SummaryInput) {
 
   const header = `*${Math.round(s.overallScore)}* / 100  •  Intro ${s.section.intro} | Disc ${s.section.discovery} | Obj ${s.section.objection} | Close ${s.section.close}`;
 
-  const baseFromCall = s.callUrl ? s.callUrl.replace(/\/calls\/[^\/?#]+.*/, "") : "";
+  const baseFromCall = s.callUrl ? s.callUrl.replace(/\/calls\/[^/?#]+.*/, "") : "";
   const coachUrl = baseFromCall ? `${baseFromCall}/calls/${s.callId}?panel=coach&assign=1` : s.callUrl;
 
   const subtitleParts = [
@@ -370,7 +370,6 @@ export async function postAssignNotification(input: {
   notes?: string | null;
 }) {
   const { callId, assigneeName, assigneeWebhook, drillId, notes } = input;
-  const text = `New coaching assignment: ${drillId}`;
   const url = buildCallUrl(callId, { panel: "coach", assign: 1 });
 
   const blocks: SlackBlock[] = [

@@ -1,5 +1,5 @@
 // api/src/routes/rewards.ts
-import { Router } from "express";
+import { Router, json } from "express";
 import { createClient } from "@supabase/supabase-js";
 
 export function rewardsRoutes() {
@@ -50,7 +50,7 @@ export function rewardsRoutes() {
   });
 
   // POST select title (equip)
-  r.post("/rewards/:userId/select-title", expressJson(), async (req, res) => {
+  r.post("/rewards/:userId/select-title", json(), async (req, res) => {
     const { userId } = req.params;
     const { titleId } = req.body || {};
     if (!titleId) return res.status(400).json({ ok: false, error: "titleId_required" });
@@ -100,9 +100,4 @@ export function rewardsRoutes() {
   });
 
   return r;
-}
-
-function expressJson() {
-  const express = require("express");
-  return express.json();
 }

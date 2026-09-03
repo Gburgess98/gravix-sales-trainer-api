@@ -13,12 +13,6 @@ export async function withRetry<T>(fn: () => Promise<T>, opts: RetryOpts = {}): 
     baseMs = 250,
     maxMs = 2000,
     jitter = true,
-    retryOn = (res, err) => {
-      if (err) return true;
-      if (!res) return true;
-      // retry on 429, 5xx
-      return res.status === 429 || (res.status >= 500 && res.status < 600);
-    },
   } = opts;
 
   let attempt = 0;

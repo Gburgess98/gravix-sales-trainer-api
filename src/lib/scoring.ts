@@ -555,7 +555,7 @@ async function updateCallScoreRow(
     }
   }
 
-  let { error } = await supabase.from("calls").update(nextPayload).eq("id", callId);
+  const { error } = await supabase.from("calls").update(nextPayload).eq("id", callId);
   if (!error) return;
 
   const msg = String((error as any)?.message ?? "").toLowerCase();
@@ -2536,7 +2536,7 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
       transcriptSegments = Array.isArray((callRow as any)?.analysis_json?.transcript?.segments)
         ? (callRow as any)?.analysis_json?.transcript?.segments
         : buildSegments(transcriptText);
-    } catch { }
+    } catch { /* best-effort lookup; failure is non-fatal */ }
 
     const fallbackMoments = detectMomentsFromTranscript(
       transcriptText,
@@ -2570,7 +2570,7 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
         .eq("id", opts.callId)
         .maybeSingle();
       memoryCall = lookup.data ?? null;
-    } catch { }
+    } catch { /* best-effort lookup; failure is non-fatal */ }
 
     const fallbackModelVersion = `${fb.model}:${SCORING_PROMPT_VERSION}:${RUBRIC_VERSION}`;
     const rubric = buildRubricWithMeta({
@@ -2712,7 +2712,7 @@ ${knowledge.repMemoryText || "None"}${contextBlock}`;
         .eq("id", opts.callId)
         .single();
       durationSec = (data as any)?.duration_sec ?? null;
-    } catch { }
+    } catch { /* best-effort lookup; failure is non-fatal */ }
 
     if (!SKIP_SCORING_SIDE_EFFECTS) {
       const slackStart = Date.now();

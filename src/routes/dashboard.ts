@@ -639,7 +639,7 @@ router.get('/reporting-summary', async (req, res) => {
     // for them failed with 42703 and, because the guard below matched any
     // "does not exist", the error was swallowed and every assignment metric
     // on this route silently reported zero.
-    let coachAssignmentsQuery = db
+    const coachAssignmentsQuery = db
       .from('coach_assignments')
       .select('id,assignee_user_id,status,created_at')
       .gte('created_at', since)
@@ -950,7 +950,7 @@ router.get('/leaderboard', async (req, res) => {
       }
     }
 
-    let rows = Array.from(byUser.values())
+    const rows = Array.from(byUser.values())
       .map(acc => ({
         user_id: acc.user_id,
         name: nameById.get(acc.user_id) || 'Rep',
@@ -1030,7 +1030,7 @@ router.get('/rep-summary', async (req, res) => {
     // was discarded by the `if (!aErr)` below, so drill XP silently stayed 0.
     // The query is already constrained to this rep's own rows by rep_id, so
     // dropping the impossible org filter grants no additional visibility.
-    let assignsQ = supabase
+    const assignsQ = supabase
       .from('assignments')
       .select('status, created_at')
       .eq('rep_id', userId)
