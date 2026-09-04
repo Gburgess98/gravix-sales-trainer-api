@@ -1401,7 +1401,9 @@ YOU MUST:
   return scenario.trim();
 }
 
-function buildPersonaSystemPrompt(opts: {
+// Exported as a pure test seam (no I/O) so the release validators can prove the
+// real buyer system prompt embeds the configured persona/difficulty behaviour.
+export function buildPersonaSystemPrompt(opts: {
   personaId: string | null;
   mode?: string | null;
   difficulty?: string | null;
@@ -1456,15 +1458,15 @@ Your goal is to expose weakness.
     : [];
   const desc = (persona as any)?.description || "";
 
-  // Try to build a richer behaviour summary from the shared persona helper
+  // Build a richer behaviour summary from the shared persona helper, passing the
+  // real resolved PersonaConfig (not a fabricated object) so configured tone,
+  // pace, objection frequency, patience and price pressure actually shape the
+  // buyer. The try/catch stays as genuine resilience — but for valid inputs it
+  // must succeed, not silently degrade to basic traits.
   let behaviourSummary = "";
   try {
     behaviourSummary = buildPersonaBehaviourSummary(
-      {
-        personaId,
-        difficulty: difficulty as DifficultyLevel,
-        mode,
-      } as any,
+      persona,
       difficulty as DifficultyLevel
     );
   } catch (e) {

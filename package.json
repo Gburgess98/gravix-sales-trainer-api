@@ -42,6 +42,7 @@
     "check": "npm run lint && npm run typecheck && npm run smoke",
     "check:ci": "npm run lint && npm run typecheck",
     "check:release": "npm run lint && tsc -p tsconfig.json --noEmit --incremental false && npm run build",
+    "validate:sparring-persona-behaviour": "tsx scripts/validate-sparring-persona-behaviour-day-314.ts",
     "regression": "tsx scripts/api-regression.ts",
     "seed:demo": "tsx scripts/seed-demo-org.ts",
     "seed:ufc-story": "tsx scripts/seed-ufc-demo-story.ts",
