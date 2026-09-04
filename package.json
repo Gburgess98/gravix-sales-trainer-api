@@ -41,6 +41,7 @@
     "smoke": "bash scripts/smoke.sh",
     "check": "npm run lint && npm run typecheck && npm run smoke",
     "check:ci": "npm run lint && npm run typecheck",
+    "check:release": "npm run lint && tsc -p tsconfig.json --noEmit --incremental false && npm run build",
     "regression": "tsx scripts/api-regression.ts",
     "seed:demo": "tsx scripts/seed-demo-org.ts",
     "seed:ufc-story": "tsx scripts/seed-ufc-demo-story.ts",
