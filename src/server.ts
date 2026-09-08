@@ -15,6 +15,7 @@ import { cleanTranscript, buildSegments } from "./lib/transcript";
 
 import { securityHeaders } from "./middleware/security";
 import { globalRateLimit, authRateLimit, uploadRateLimit } from "./middleware/rateLimits";
+import { resolveIdentity, isUuid, type AuthCtx } from "./identityTrust";
 
 import callsRouter from "./routes/calls";
 import pinsRouter from "./routes/pins";
@@ -170,81 +171,14 @@ app.use((req, res, next) => {
 // We keep routes responsible for *authorisation* (manager/rep), but we ensure
 // identity is consistently available and mismatches are caught loudly.
 
-type AuthCtx = { userId: string | null; via: "header" | "jwt" | "env" | null };
-
-function tryDecodeJwtSub(token: string | null): string | null {
-  if (!token) return null;
-  try {
-    const parts = token.split(".");
-    if (parts.length < 2) return null;
-    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const padded = b64 + "===".slice((b64.length + 3) % 4);
-    const json = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
-    const sub = typeof json?.sub === "string" ? json.sub : null;
-    return sub && sub.length > 10 ? sub : null;
-  } catch {
-    return null;
-  }
-}
-
-function getBearerToken(req: express.Request): string | null {
-  const raw = (req.header("authorization") || req.header("Authorization") || "").trim();
-  if (!raw) return null;
-  const m = raw.match(/^Bearer\s+(.+)$/i);
-  return m ? m[1].trim() : null;
-}
-
-function isUuid(v: string | null | undefined) {
-  if (!v) return false;
-  return /^[0-9a-fA-F-]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(v);
-}
-
-// Day 175 — proxy trust boundary for identity headers.
-// When PROXY_SHARED_SECRET is configured, x-user-id (and its aliases) are only
-// honoured when the request carries the matching x-proxy-secret, i.e. it came
-// from our web proxy rather than a direct caller. Untrusted identity headers
-// are stripped from the request so downstream per-route header reads cannot
-// be spoofed either. When the env is unset, behaviour is unchanged (dev/local).
-function identityHeadersTrusted(req: express.Request): boolean {
-  const expected = String(process.env.PROXY_SHARED_SECRET || "").trim();
-  if (!expected) return true;
-  const provided = String(req.header("x-proxy-secret") || "").trim();
-  if (!provided || provided.length !== expected.length) return false;
-  try {
-    return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
-  } catch {
-    return false;
-  }
-}
-
-const SPOOFABLE_IDENTITY_HEADERS = [
-  "x-user-id",
-  "x-gravix-user-id",
-  "x-forwarded-user-id",
-  "x-real-user-id",
-] as const;
+// Identity trust primitives (resolveIdentity / isUuid / AuthCtx / the Day-175
+// proxy-secret boundary) now live in ./identityTrust so the hardening contract
+// can be unit-tested network-free. Behaviour is unchanged.
 
 // Attach req.userId early so middleware ordering changes can't silently break auth.
 app.use((req, res, next) => {
-  if (!identityHeadersTrusted(req)) {
-    for (const h of SPOOFABLE_IDENTITY_HEADERS) delete req.headers[h];
-  }
-
-  const headerUid = (req.header("x-user-id") || "").trim() || null;
-  const token = getBearerToken(req);
-  const jwtUid = tryDecodeJwtSub(token);
-
-  // DEV escape hatch (local only — never honoured in production)
-  const envUid = process.env.NODE_ENV === "production"
-    ? null
-    : (process.env.DEV_TEST_UID || "").trim() || null;
-
-  let ctx: AuthCtx = { userId: null, via: null };
-
-  // Priority: explicit header > jwt > env
-  if (isUuid(headerUid)) ctx = { userId: headerUid, via: "header" };
-  else if (isUuid(jwtUid)) ctx = { userId: jwtUid, via: "jwt" };
-  else if (isUuid(envUid)) ctx = { userId: envUid, via: "env" };
+  const resolved = resolveIdentity(req);
+  const ctx: AuthCtx = { userId: resolved.userId, via: resolved.via };
 
   (req as any).auth = ctx;
   (req as any).userId = ctx.userId;
@@ -252,10 +186,10 @@ app.use((req, res, next) => {
   (res.locals as any).authVia = ctx.via;
 
   // Guardrail: if both header + jwt exist and disagree, fail loudly.
-  if (isUuid(headerUid) && isUuid(jwtUid) && headerUid !== jwtUid) {
+  if (resolved.mismatch) {
     return sendJsonError(res, 401, "auth_mismatch", {
-      headerUid,
-      jwtUid,
+      headerUid: resolved.headerUid,
+      jwtUid: resolved.jwtUid,
       hint: "x-user-id and Authorization Bearer token sub do not match",
     });
   }
