@@ -1,37 +1,12 @@
 import { Request, Response, NextFunction } from "express";
 
-function getBearerToken(req: Request): string | null {
-  const h = req.header("authorization") || req.header("Authorization");
-  if (!h) return null;
-  const m = h.match(/^Bearer\s+(.+)$/i);
-  return m?.[1]?.trim() || null;
-}
-
-function tryDecodeJwtSub(token: string | null): string | null {
-  if (!token) return null;
-  try {
-    const parts = token.split(".");
-    if (parts.length < 2) return null;
-    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const padded = b64 + "===".slice((b64.length + 3) % 4);
-    const json = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
-    const sub = typeof json?.sub === "string" ? json.sub : null;
-    return sub && sub.length > 10 ? sub : null;
-  } catch {
-    return null;
-  }
-}
-
+// Day 26 (G1): this middleware used to re-read identity headers and base64-decode
+// the Bearer token itself (no signature check). It now trusts ONLY the identity
+// resolved by the global middleware in server.ts: a proxy header that passed the
+// Day-175 x-proxy-secret boundary, or a Bearer token verified by
+// src/tokenVerification.ts. Untrusted identity headers are already stripped there.
 export function requireUserId(req: Request, res: Response, next: NextFunction) {
-  const headerUid =
-    req.header("x-user-id") ||
-    req.header("x-forwarded-user-id") ||
-    req.header("x-gravix-user-id") ||
-    null;
-
-  const uid =
-    (headerUid ? headerUid.trim() : null) ||
-    tryDecodeJwtSub(getBearerToken(req));
+  const uid = String((req as any).userId || "").trim();
 
   if (!uid) return res.status(401).json({ ok: false, error: "missing_user_identity" });
 

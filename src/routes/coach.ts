@@ -15,7 +15,8 @@ const Create = z.object({
   notes: z.string().max(500).optional(),
 });
 
-function uid(req: any) { const v = (req.header("x-user-id") || "").trim(); if (!v) throw new Error("Missing x-user-id"); return v; }
+// Day 26 (G1): verified identity from the global middleware, not a raw header.
+function uid(req: any) { const v = String(req.userId || "").trim(); if (!v) throw new Error("Missing x-user-id"); return v; }
 
 r.post("/assign", async (req, res) => {
   try {

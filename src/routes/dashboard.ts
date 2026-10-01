@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { accessibleRepIds } from "../lib/repAccess";
 import { createClient } from '@supabase/supabase-js';
 import {
   isCompanyManager,
@@ -13,16 +14,29 @@ const router = Router();
 // req.authUserId always resolved to '' because nothing ever sets that field,
 // which silently disabled hierarchy filtering on these aggregate endpoints.
 function requesterIdOf(req: any): string {
-  return String(req?.authUserId || req?.userId || req?.header?.('x-user-id') || '').trim();
+  // Day 26: only the identity resolved (and verified) by the global middleware.
+  return String(req?.userId || '').trim();
 }
 
 // All dashboard endpoints aggregate tenant data — require an identity.
-router.use((req: any, res, next) => {
+// Day 26 (G2): and resolve the rep ids the caller may see (self, or the whole
+// tenant for manager tiers). Every handler below constrains its query to this
+// set, so an unknown or rep-tier caller can never read another tenant.
+router.use(async (req: any, res, next) => {
   if (!requesterIdOf(req)) {
     return res.status(401).json({ ok: false, error: 'missing_user_identity' });
   }
+  try {
+    req.scopeRepIds = await accessibleRepIds(requesterIdOf(req));
+  } catch {
+    return res.status(500).json({ ok: false, error: 'scope_resolution_failed' });
+  }
   return next();
 });
+
+function scopeRepIdsOf(req: any): string[] {
+  return Array.isArray(req?.scopeRepIds) ? req.scopeRepIds : [];
+}
 
 // ---- Supabase client (service role for server-side aggregations) ----
 const SUPABASE_URL = process.env.SUPABASE_URL as string;
@@ -63,7 +77,10 @@ async function getUserContext(db: any, userId: string): Promise<UserContext | nu
   };
 }
 
-function applyHierarchyFilters(query: any, user: UserContext | null) {
+function applyHierarchyFilters(query: any, user: UserContext | null, scopeRepIds: string[]) {
+  // Day 26 (G2): always constrain to the caller's accessible reps first; the
+  // office/company narrowing below can only reduce that set further.
+  query = query.in('user_id', scopeRepIds);
   if (!user) return query;
 
   if (isOfficeManager(user)) {
@@ -220,7 +237,7 @@ router.get('/kpis', async (req, res) => {
   try {
     if (!supabase) throw new Error('Supabase not configured');
 
-    res.set('Cache-Control', 'public, max-age=15');
+    res.set('Cache-Control', 'private, max-age=15');
 
     const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? '90'), 10) || 90));
     const since = isoDaysAgo(days);
@@ -251,7 +268,7 @@ router.get('/kpis', async (req, res) => {
     if (orgId) callQuery = callQuery.eq('org_id', orgId);
 
     const userContext = await getUserContext(db, userId);
-    callQuery = applyHierarchyFilters(callQuery, userContext);
+    callQuery = applyHierarchyFilters(callQuery, userContext, scopeRepIdsOf(req));
 
     const { data: calls, error: callsErr, count } = await callQuery;
     const supportsWon = Array.isArray(calls) && calls.some((c: any) => typeof (c as any).won !== 'undefined');
@@ -395,6 +412,7 @@ router.get("/flags/summary", async (req, res) => {
       // will also appear as top-level columns, but meta is always populated.
       .select("meta, rep_id, created_at")
       .eq("type", "review_flag")
+      .in("rep_id", scopeRepIdsOf(req))
       .gte("created_at", since);
 
     if (error) throw error;
@@ -462,11 +480,12 @@ router.get("/flags/summary", async (req, res) => {
 });
 
 // 🔥 COMPANY WEAKNESS AGGREGATION (Day 66)
-async function getCompanyWeaknessAggregation(supa: any) {
+async function getCompanyWeaknessAggregation(supa: any, scopeRepIds: string[]) {
   const { data, error } = await supa
     .from("crm_activities")
     .select("meta, rep_id, created_at")
     .eq("type", "review_flag")
+    .in("rep_id", scopeRepIds)
     .limit(5000);
 
   if (error) throw error;
@@ -524,7 +543,7 @@ router.get("/company-weakness", async (req, res) => {
       process.env.SUPABASE_SERVICE_ROLE_KEY!
     );
 
-    const data = await getCompanyWeaknessAggregation(supa);
+    const data = await getCompanyWeaknessAggregation(supa, scopeRepIdsOf(req));
 
     return res.json({
       ok: true,
@@ -548,6 +567,9 @@ router.get("/rep-improvement", async (req, res) => {
     const repId = String(req.query.rep_id || "").trim();
     if (!repId) {
       return res.status(400).json({ ok: false, error: "rep_id required" });
+    }
+    if (!scopeRepIdsOf(req).includes(repId)) {
+      return res.status(403).json({ ok: false, error: "forbidden_rep_scope" });
     }
 
     const days = Number(req.query.days || 30);
@@ -628,7 +650,7 @@ router.get('/reporting-summary', async (req, res) => {
     if (orgId) callsQuery = callsQuery.eq('org_id', orgId);
 
     const userContext = await getUserContext(db, userId);
-    callsQuery = applyHierarchyFilters(callsQuery, userContext);
+    callsQuery = applyHierarchyFilters(callsQuery, userContext, scopeRepIdsOf(req));
 
     const { data: calls, error: callsErr } = await callsQuery;
     if (callsErr) throw callsErr;
@@ -642,6 +664,7 @@ router.get('/reporting-summary', async (req, res) => {
     const coachAssignmentsQuery = db
       .from('coach_assignments')
       .select('id,assignee_user_id,status,created_at')
+      .in('assignee_user_id', scopeRepIdsOf(req))
       .gte('created_at', since)
       .order('created_at', { ascending: false })
       .limit(50000);
@@ -880,7 +903,7 @@ router.get('/leaderboard', async (req, res) => {
     if (orgId) callQuery = callQuery.eq('org_id', orgId);
 
     const userContext = await getUserContext(supabase, userId);
-    callQuery = applyHierarchyFilters(callQuery, userContext);
+    callQuery = applyHierarchyFilters(callQuery, userContext, scopeRepIdsOf(req));
     const { data: calls, error: callsErr } = await callQuery;
 
     if (callsErr) throw callsErr;
@@ -903,6 +926,7 @@ router.get('/leaderboard', async (req, res) => {
     const { data: assigns, error: aErr } = await supabase
       .from('assignments')
       .select('rep_id, status, created_at')
+      .in('rep_id', scopeRepIdsOf(req))
       .gte('created_at', since)
       .limit(50000);
     if (aErr && aErr.message && !/relation .* does not exist/i.test(aErr.message)) {
@@ -975,7 +999,7 @@ router.get('/leaderboard', async (req, res) => {
       rank: i + 1,
     }));
 
-    res.set('Cache-Control', 'public, max-age=15');
+    res.set('Cache-Control', 'private, max-age=15');
     res.json({ ok: true, items: rows, reps, since });
   } catch (err: any) {
     console.error('GET /v1/dashboard/leaderboard error:', err);
@@ -989,6 +1013,9 @@ router.get('/rep-summary', async (req, res) => {
     if (!supabase) throw new Error('Supabase not configured');
     const userId = String(req.query.userId || '').trim();
     if (!userId) return res.status(400).json({ ok: false, error: 'userId required' });
+    if (!scopeRepIdsOf(req).includes(userId)) {
+      return res.status(403).json({ ok: false, error: 'forbidden_rep_scope' });
+    }
 
     const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? '90'), 10) || 90));
     const since = isoDaysAgo(days);
@@ -1066,7 +1093,7 @@ router.get('/rep-summary', async (req, res) => {
       account_id: (c as any).account_id,
     }));
 
-    res.set('Cache-Control', 'public, max-age=15');
+    res.set('Cache-Control', 'private, max-age=15');
     return res.json({
       ok: true,
       userId,
@@ -1104,7 +1131,10 @@ router.get('/voice-score-summary', async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(10000);
 
-    if (repId) q = q.eq('user_id', repId);
+    if (repId && !scopeRepIdsOf(req).includes(repId)) {
+      return res.status(403).json({ ok: false, error: 'forbidden_rep_scope' });
+    }
+    q = repId ? q.eq('user_id', repId) : q.in('user_id', scopeRepIdsOf(req));
 
     const { data: scoreRows, error: scoreErr } = await q;
     if (scoreErr) throw scoreErr;
@@ -1157,7 +1187,7 @@ router.get('/voice-score-summary', async (req, res) => {
       ? Number((fillerDensitySum / fillerDensityCount).toFixed(4))
       : null;
 
-    res.set('Cache-Control', 'public, max-age=15');
+    res.set('Cache-Control', 'private, max-age=15');
     return res.json({
       ok: true,
       scope: repId ? 'rep' : 'team',
@@ -1197,7 +1227,10 @@ router.get('/voice-score-trend', async (req, res) => {
       .order('created_at', { ascending: true })
       .limit(10000);
 
-    if (repId) q = q.eq('user_id', repId);
+    if (repId && !scopeRepIdsOf(req).includes(repId)) {
+      return res.status(403).json({ ok: false, error: 'forbidden_rep_scope' });
+    }
+    q = repId ? q.eq('user_id', repId) : q.in('user_id', scopeRepIdsOf(req));
 
     const { data: scoreRows, error: scoreErr } = await q;
     if (scoreErr) throw scoreErr;
@@ -1226,7 +1259,7 @@ router.get('/voice-score-trend', async (req, res) => {
 
     const latest_avg = trend.length ? trend[trend.length - 1].voice_score : null;
 
-    res.set('Cache-Control', 'public, max-age=15');
+    res.set('Cache-Control', 'private, max-age=15');
     return res.json({
       ok: true,
       scope: repId ? 'rep' : 'team',

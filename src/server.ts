@@ -15,7 +15,10 @@ import { cleanTranscript, buildSegments } from "./lib/transcript";
 
 import { securityHeaders } from "./middleware/security";
 import { globalRateLimit, authRateLimit, uploadRateLimit } from "./middleware/rateLimits";
-import { resolveIdentity, isUuid, type AuthCtx } from "./identityTrust";
+import { resolveIdentity, getBearerToken, isUuid, type AuthCtx } from "./identityTrust";
+import { defaultClaimsVerifier } from "./tokenVerification";
+import { requireIdentityByDefault } from "./routeAuthPolicy";
+import { accessibleRepIds, canAccessRep } from "./lib/repAccess";
 
 import callsRouter from "./routes/calls";
 import pinsRouter from "./routes/pins";
@@ -176,8 +179,13 @@ app.use((req, res, next) => {
 // can be unit-tested network-free. Behaviour is unchanged.
 
 // Attach req.userId early so middleware ordering changes can't silently break auth.
-app.use((req, res, next) => {
-  const resolved = resolveIdentity(req);
+// Day 26 (G1): a Bearer token only counts once its signature, exp, iss and aud
+// are verified; an invalid token is ignored (never trusted, never decoded).
+const verifyClaims = defaultClaimsVerifier();
+app.use(async (req, res, next) => {
+  const token = getBearerToken(req);
+  const verified = token ? await verifyClaims(token) : null;
+  const resolved = resolveIdentity(req, verified?.sub ?? null);
   const ctx: AuthCtx = { userId: resolved.userId, via: resolved.via };
 
   (req as any).auth = ctx;
@@ -232,6 +240,11 @@ app.use(async (req, res, next) => {
 
   return next();
 });
+
+// Day 26 (G2/G4): default-deny. Every route needs a verified identity unless
+// it is listed in PUBLIC_ROUTES (src/routeAuthPolicy.ts). Enforced by
+// `npm run validate:route-authz` against the real router.
+app.use(requireIdentityByDefault);
 
 // Root: simple status page for browsers/Slack bots
 app.get('/', (_req, res) => {
@@ -326,7 +339,7 @@ app.get("/v1/dashboard/leaderboard", requireIdentity, async (req, res) => {
       .sort((a, b) => (b.avg_score! - a.avg_score!))
       .slice(0, limit);
 
-    res.set("Cache-Control", "public, max-age=15");
+    res.set("Cache-Control", "private, max-age=15");
     return res.json({ ok: true, items, since: sinceIso });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message || 'leaderboard_failed' });
@@ -338,6 +351,10 @@ app.get("/v1/reps/:id/overview", requireIdentity, async (req, res) => {
   try {
     const repId = String(req.params.id || "");
     if (!repId) return res.status(400).json({ ok: false, error: "rep_id required" });
+    // Day 26 (G2): self, or a manager-tier caller in the same tenant.
+    if (!(await canAccessRep((req as any).userId, repId))) {
+      return sendJsonError(res, 403, "forbidden_rep_scope");
+    }
     const days = Math.min(Number(req.query.days || 90), 365);
     const sinceIso = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
@@ -451,7 +468,7 @@ app.get("/v1/reps/:id/overview", requireIdentity, async (req, res) => {
       recent
     };
 
-    res.set("Cache-Control", "public, max-age=15");
+    res.set("Cache-Control", "private, max-age=15");
     return res.json(payload);
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message || "rep_overview_failed" });
@@ -468,6 +485,8 @@ app.get("/v1/dashboard/objections/top", requireIdentity, async (req, res) => {
     const { data: assigns, error } = await supabase
       .from("coach_assignments")
       .select("drill_id, created_at")
+      // Day 26 (G2): only the caller's accessible reps (was every tenant).
+      .in("assignee_user_id", await accessibleRepIds((req as any).userId))
       .gte("created_at", sinceIso)
       .ilike("drill_id", "objection-%")
       .order("created_at", { ascending: false })
@@ -486,7 +505,7 @@ app.get("/v1/dashboard/objections/top", requireIdentity, async (req, res) => {
       .sort((a, b) => b.count - a.count)
       .slice(0, limit);
 
-    res.set("Cache-Control", "public, max-age=15");
+    res.set("Cache-Control", "private, max-age=15");
     return res.json({ ok: true, items, since: sinceIso });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message || "top_objections_failed" });
@@ -1350,7 +1369,7 @@ app.get("/v1/coach/assignments", requireIdentity, async (req, res) => {
       completed_at: x.completed_at || null,
     }));
 
-    res.set('Cache-Control', 'public, max-age=10');
+    res.set('Cache-Control', 'private, max-age=10');
     return res.json({ ok: true, items });
   } catch (e: any) {
     return res.status(500).json({ ok: false, error: e?.message || 'assignments_list_failed' });
@@ -2059,6 +2078,12 @@ app.use((err: any, req: any, res: express.Response, _next: express.NextFunction)
   return sendJsonError(res, 500, "Internal error");
 });
 
+export { app };
+
 /* Boot */
-const port = Number(process.env.PORT || 4000);
-app.listen(port, () => console.log(`🚀 Gravix API listening on :${port}`));
+// GRAVIX_API_NO_LISTEN=1 is set only by the network-free route-authz
+// validator so it can import the real app without binding a port.
+if (process.env.GRAVIX_API_NO_LISTEN !== "1") {
+  const port = Number(process.env.PORT || 4000);
+  app.listen(port, () => console.log(`🚀 Gravix API listening on :${port}`));
+}

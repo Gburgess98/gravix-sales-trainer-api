@@ -25,20 +25,9 @@ export interface IdentityRequestLike {
   headers: Record<string, unknown>;
 }
 
-export function tryDecodeJwtSub(token: string | null): string | null {
-  if (!token) return null;
-  try {
-    const parts = token.split(".");
-    if (parts.length < 2) return null;
-    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const padded = b64 + "===".slice((b64.length + 3) % 4);
-    const json = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
-    const sub = typeof json?.sub === "string" ? json.sub : null;
-    return sub && sub.length > 10 ? sub : null;
-  } catch {
-    return null;
-  }
-}
+// Day 26 (G1): the unverified `tryDecodeJwtSub` decoder was removed. A Bearer
+// token only becomes an identity through ./tokenVerification (signature, exp,
+// iss, aud); callers pass the verified `sub` into resolveIdentity.
 
 export function getBearerToken(req: IdentityRequestLike): string | null {
   const raw = (req.header("authorization") || req.header("Authorization") || "").trim();
@@ -55,11 +44,13 @@ export function isUuid(v: string | null | undefined): boolean {
 // Day 175 — proxy trust boundary for identity headers.
 // When PROXY_SHARED_SECRET is configured, x-user-id (and its aliases) are only
 // honoured when the request carries the matching x-proxy-secret, i.e. it came
-// from our web proxy rather than a direct caller. When the env is unset,
-// behaviour is unchanged (dev/local).
+// from our web proxy rather than a direct caller.
+// Day 26: when the secret is unset or empty, PRODUCTION trusts no identity
+// headers at all (fail closed); only non-production keeps the dev/local
+// behaviour of trusting them.
 export function identityHeadersTrusted(req: IdentityRequestLike): boolean {
   const expected = String(process.env.PROXY_SHARED_SECRET || "").trim();
-  if (!expected) return true;
+  if (!expected) return process.env.NODE_ENV !== "production";
   const provided = String(req.header("x-proxy-secret") || "").trim();
   if (!provided || provided.length !== expected.length) return false;
   try {
@@ -86,19 +77,24 @@ export type ResolvedIdentity = {
 
 /**
  * Resolve the caller identity, applying the Day-175 trust boundary.
+ * `verifiedJwtSub` must come from a verified Bearer token (Day 26 G1), never
+ * from a bare decode.
  * Mutates `req.headers` (stripping spoofable identity headers) exactly as the
  * original inline middleware did, so downstream per-route header reads are also
  * protected. Returns the resolved context plus a `mismatch` flag; the caller
  * decides how to respond to a mismatch.
  */
-export function resolveIdentity(req: IdentityRequestLike): ResolvedIdentity {
+export function resolveIdentity(
+  req: IdentityRequestLike,
+  verifiedJwtSub: string | null
+): ResolvedIdentity {
   if (!identityHeadersTrusted(req)) {
     for (const h of SPOOFABLE_IDENTITY_HEADERS) delete req.headers[h];
   }
 
   const headerUid = (req.header("x-user-id") || "").trim() || null;
-  const token = getBearerToken(req);
-  const jwtUid = tryDecodeJwtSub(token);
+  // Only a signature/exp/iss/aud-verified sub (see ./tokenVerification).
+  const jwtUid = verifiedJwtSub;
 
   // DEV escape hatch (local only — never honoured in production)
   const envUid = process.env.NODE_ENV === "production"

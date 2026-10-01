@@ -284,6 +284,10 @@ router.post("/ensure-profile", async (req, res) => {
   try {
     const { id, name, email } = (req.body || {}) as { id?: string; name?: string; email?: string };
     if (!id || typeof id !== "string") return res.status(400).json({ ok: false, error: "missing id" });
+    // Day 26 (G2): only the caller's own profile (was any id, unauthenticated).
+    if (id !== String((req as any).userId || "")) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_self" });
+    }
 
     const table = supa.from("profiles");
 

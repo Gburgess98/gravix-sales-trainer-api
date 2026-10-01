@@ -92,7 +92,10 @@ async function requireManager(req: any, res: any, next: any) {
   }
 }
 
-adminRouter.post("/force-score/:id", async (req, res) => {
+// Day 26: SuperAdmin-guarded too. Currently shadowed by the server.ts
+// POST /v1/admin/force-score/:id (requireAdmin), but must stay safe if route
+// order ever changes.
+adminRouter.post("/force-score/:id", requireSuperAdmin, async (req, res) => {
   const { id } = req.params;
   try {
     // `services` is an optional request-scoped DI container; this handler
@@ -384,7 +387,9 @@ adminRouter.get("/users", requireManager, async (req: any, res: any) => {
   }
 });
 
-adminRouter.get("/status", async (_req, res) => {
+// Day 26 (G3): SuperAdmin only (was unauthenticated: env presence, bucket
+// names and a live Slack post on every call).
+adminRouter.get("/status", requireSuperAdmin, async (_req, res) => {
   const out: any = { ok: true, checks: [] as any[] };
 
   function push(name: string, ok: boolean, detail?: any) {
@@ -392,59 +397,9 @@ adminRouter.get("/status", async (_req, res) => {
     if (!ok) out.ok = false;
   }
 
-  /* ----------------------------------------------------------------
-     PATCH /v1/admin/org-settings
-     Body: { call_visibility: 'everyone' | 'managers' | 'disabled' }
-  ----------------------------------------------------------------- */
-  adminRouter.patch("/org-settings", requireManager, async (req: any, res: any) => {
-    try {
-      const requester = String(req.header("x-user-id") || "").trim();
-      const call_visibility = req.body?.call_visibility;
-
-      if (!["everyone", "managers", "disabled"].includes(call_visibility)) {
-        return res.status(400).json({ ok: false, error: "invalid_call_visibility" });
-      }
-
-      const url = process.env.SUPABASE_URL;
-      const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SERVICE_KEY;
-      if (!url || !key) return res.status(500).json({ ok: false, error: "server_missing_supabase_env" });
-
-      const supa = createClient(url, key);
-
-      // get org_id
-      const { data: callRow } = await supa
-        .from("calls")
-        .select("org_id")
-        .eq("user_id", requester)
-        .not("org_id", "is", null)
-        .limit(1)
-        .maybeSingle();
-
-      const orgId = callRow?.org_id;
-      if (!orgId) return res.status(403).json({ ok: false, error: "no_org" });
-
-      const { data, error } = await supa
-        .from("org_settings")
-        .upsert(
-          {
-            org_id: orgId,
-            call_visibility,
-          },
-          { onConflict: "org_id" }
-        )
-        .select()
-        .single();
-
-      if (error) throw error;
-
-      return res.json({
-        ok: true,
-        settings: data,
-      });
-    } catch (e: any) {
-      return res.status(500).json({ ok: false, error: e?.message || "org_settings_update_failed" });
-    }
-  });
+  // Day 26 (G3): a duplicate PATCH /org-settings used to be registered here,
+  // inside the handler, on every call (shadowed by the module-level route
+  // above, so it only grew the route table). Removed.
 
   // --- ENV presence checks ---
   try {
@@ -495,7 +450,7 @@ adminRouter.get("/status", async (_req, res) => {
    POST /v1/admin/test-slack  { text?: string }
    Sends a test message to the configured SLACK_WEBHOOK_URL.
 ----------------------------------------------------------------- */
-adminRouter.post('/test-slack', async (req, res) => {
+adminRouter.post('/test-slack', requireSuperAdmin, async (req, res) => {
   try {
     const url = (process.env.SLACK_WEBHOOK_URL || '').trim();
     if (!url) return res.status(400).json({ ok: false, error: 'SLACK_WEBHOOK_URL not set' });
@@ -579,7 +534,7 @@ adminRouter.get("/usage", requireManager, async (req: any, res: any) => {
    POST /v1/admin/send-slack?callId=...
    Fire-and-forget: posts a simple call summary to the Slack webhook.
 ----------------------------------------------------------------- */
-adminRouter.post('/send-slack', async (req, res) => {
+adminRouter.post('/send-slack', requireSuperAdmin, async (req, res) => {
   try {
     const callId = (req.query.callId as string | undefined)?.trim();
     if (!callId) return res.status(400).json({ ok: false, error: 'missing_callId' });
@@ -618,7 +573,7 @@ adminRouter.post('/send-slack', async (req, res) => {
    GET /v1/admin/preview-slack?callId=...
    Returns the JSON payload that would be sent to Slack (no posting).
 ----------------------------------------------------------------- */
-adminRouter.get('/preview-slack', async (req, res) => {
+adminRouter.get('/preview-slack', requireSuperAdmin, async (req, res) => {
   try {
     const callId = (req.query.callId as string | undefined)?.trim();
     if (!callId) return res.status(400).json({ ok: false, error: 'missing_callId' });
@@ -645,7 +600,7 @@ adminRouter.get('/preview-slack', async (req, res) => {
 });
 
 
-adminRouter.post("/post-score-demo", async (_req, res) => {
+adminRouter.post("/post-score-demo", requireSuperAdmin, async (_req, res) => {
   try {
     const slack = process.env.SLACK_WEBHOOK_URL;
     if (!slack) return res.status(400).json({ ok: false, error: "No SLACK_WEBHOOK_URL" });
@@ -676,12 +631,12 @@ adminRouter.post("/post-score-demo", async (_req, res) => {
   }
 });
 
-adminRouter.get('/whoami', (req, res) => {
+adminRouter.get('/whoami', requireSuperAdmin, (req, res) => {
   const uid = (req.header('x-user-id') || '').trim() || null;
   return res.json({ ok: true, userId: uid });
 });
 
-adminRouter.get('/whoami-org', (req, res) => {
+adminRouter.get('/whoami-org', requireSuperAdmin, (req, res) => {
   const headerOrg = (req.header('x-org-id') || '').trim() || null;
   const effectiveOrg = headerOrg || (process.env.DEFAULT_ORG_ID || null);
   return res.json({ ok: true, headerOrg, defaultOrgId: process.env.DEFAULT_ORG_ID || null, effectiveOrg });

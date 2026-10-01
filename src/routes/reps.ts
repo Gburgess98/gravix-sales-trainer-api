@@ -303,7 +303,7 @@ repsRouter.get("/:id/overview", async (req: Request, res: Response) => {
     };
 
     // #5 (cache header) — we’ll set this here too:
-    res.set("Cache-Control", "public, max-age=15");
+    res.set("Cache-Control", "private, max-age=15");
     return res.json({ ok: true, ...payload });
   } catch (err: any) {
     const msg = String(err?.message || err);

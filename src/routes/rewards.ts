@@ -1,5 +1,6 @@
 // api/src/routes/rewards.ts
 import { Router, json } from "express";
+import { canAccessRep } from "../lib/repAccess";
 import { createClient } from "@supabase/supabase-js";
 
 export function rewardsRoutes() {
@@ -8,6 +9,10 @@ export function rewardsRoutes() {
   // GET earned cosmetics for a user (badges, titles, selected)
   r.get("/rewards/:userId", async (req, res) => {
     const { userId } = req.params;
+    // Day 26 (G2): self, or a manager-tier caller in the same tenant.
+    if (!(await canAccessRep((req as any).userId, userId))) {
+      return res.status(403).json({ ok: false, error: "forbidden_rep_scope" });
+    }
     try {
       const supa = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
       const { data: badges } = await supa
@@ -26,7 +31,7 @@ export function rewardsRoutes() {
         .eq("user_id", userId)
         .maybeSingle();
 
-      res.set("Cache-Control", "public, max-age=15");
+      res.set("Cache-Control", "private, max-age=15");
       res.json({
         ok: true,
         badges: (badges || []).map((x: any) => ({
@@ -53,6 +58,10 @@ export function rewardsRoutes() {
   r.post("/rewards/:userId/select-title", json(), async (req, res) => {
     const { userId } = req.params;
     const { titleId } = req.body || {};
+    // Day 26 (G2): only the caller may change their own title.
+    if (userId !== String((req as any).userId || "")) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_self" });
+    }
     if (!titleId) return res.status(400).json({ ok: false, error: "titleId_required" });
 
     try {

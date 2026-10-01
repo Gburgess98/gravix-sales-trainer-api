@@ -1,4 +1,5 @@
 import express, { Request, Response } from 'express';
+import { accessibleRepIds, canAccessRep } from "../lib/repAccess";
 import { v4 as uuidv4 } from 'uuid';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
@@ -794,11 +795,30 @@ function getNextStackedObjection(opts: {
 }
 
 function getUserIdHeader(req: Request): string {
-  const raw = (req.headers['x-user-id'] as string | undefined)?.toString().trim();
+  // Day 26 (G1): the identity resolved by the global middleware (trusted proxy
+  // header or verified Bearer token) — never a raw, possibly spoofed header.
+  const raw = String((req as any).userId || '').trim();
   if (!raw) {
     throw new Error('missing x-user-id header');
   }
   return raw;
+}
+
+// Day 26 (G2): a caller may only touch sessions owned by themselves or, for
+// manager tiers, by a rep in their tenant. Unknown and foreign sessions both
+// answer 404 so session ids cannot be probed.
+async function requireSessionAccess(req: Request, res: Response, sessionId: string): Promise<boolean> {
+  const { data } = await supa
+    .from('sparring_sessions')
+    .select('rep_id')
+    .eq('id', sessionId)
+    .maybeSingle();
+  const repId = (data as any)?.rep_id ?? null;
+  if (!data || !repId || !(await canAccessRep((req as any).userId, repId))) {
+    res.status(404).json({ ok: false, error: 'session_not_found' });
+    return false;
+  }
+  return true;
 }
 
 function getOrgIdFromRequest(req: Request): string | null {
@@ -1684,6 +1704,7 @@ router.get('/sessions/:id/analytics', async (req: Request, res: Response) => {
         error: 'invalid_session_id',
       });
     }
+    if (!(await requireSessionAccess(req, res, sessionId))) return;
 
     const { data: session, error } = await supa
       .from('sparring_sessions')
@@ -1883,6 +1904,8 @@ router.get("/leaderboard/:personaId", async (req, res) => {
       .from("sparring_sessions")
       .select("total_score,difficulty,meta")
       .eq("persona_id", personaId)
+      // Day 26 (G2): the caller's tenant only (was every tenant).
+      .in("rep_id", await accessibleRepIds((req as any).userId))
       .not("total_score", "is", null);
 
     if (error) {
@@ -1993,6 +2016,10 @@ router.post('/log', express.json(), async (req, res) => {
 
   const award = Number.isFinite(xp) ? Number(xp) : 25;
   const rep_id: string | null = typeof repId === 'string' && repId.length ? repId : null;
+  // Day 26 (G2): XP may only be logged for the caller or a rep they manage.
+  if (!rep_id || !(await canAccessRep((req as any).userId, rep_id))) {
+    return res.status(403).json({ ok: false, error: 'forbidden_rep_scope' });
+  }
   const persona_id: string = (typeof personaId === 'string' && personaId.trim().length) ? personaId.trim() : 'unknown';
 
   const session_id = uuidv4();
@@ -2123,6 +2150,7 @@ router.post("/score", express.json(), async (req, res) => {
     // MODE 1 — REAL SESSION SCORING
     // -----------------------------
     if (typeof sessionId === "string" && sessionId.trim().length) {
+      if (!(await requireSessionAccess(req, res, sessionId.trim()))) return;
       ; (global as any).__last_completed_count = 0;
       ; (global as any).__last_xp_awarded_total = 0;
       const { data: row, error: selErr } = await supa
@@ -3418,6 +3446,7 @@ router.post(
       if (!sessionId) {
         return res.status(400).json({ ok: false, error: "session_id_required" });
       }
+      if (!(await requireSessionAccess(req, res, sessionId))) return;
 
       // Load session (for persona/difficulty defaults + to update meta)
       const { data: session, error: sessErr } = await supa
@@ -3554,6 +3583,8 @@ router.post(
         });
       }
 
+      if (!(await requireSessionAccess(req, res, sessionId))) return;
+
       if (!Number.isFinite(failedTurn) || failedTurn <= 0) {
         return res.status(400).json({
           ok: false,
@@ -3674,6 +3705,8 @@ router.get(
         });
       }
 
+      if (!(await requireSessionAccess(req, res, sessionId))) return;
+
       const { data, error } = await supa
         .from("sparring_sessions")
         .select("id, meta")
@@ -3730,6 +3763,9 @@ router.get("/sessions", async (req: Request, res: Response) => {
       .select(
         "id, rep_id, persona_id, difficulty, total_score, xp_awarded, created_at, duration_ms, turns, summary, flags, meta"
       )
+      // Day 26 (G2): the caller's own sessions, or their tenant's for managers
+      // (was every tenant's sessions).
+      .in("rep_id", await accessibleRepIds((req as any).userId))
       .order("created_at", { ascending: false })
       .limit(limit);
 
@@ -3824,6 +3860,7 @@ router.get('/sessions/:id', async (req: Request, res: Response) => {
     if (!id) {
       return res.status(400).json({ ok: false, error: 'id is required' });
     }
+    if (!(await requireSessionAccess(req, res, String(id)))) return;
 
     const { data, error } = await supa
       .from('sparring_sessions')

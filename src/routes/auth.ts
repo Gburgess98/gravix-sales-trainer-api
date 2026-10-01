@@ -248,6 +248,11 @@ authRouter.post("/verify-role", async (req: Request, res: Response) => {
     if (!userId || !UUID_RE.test(userId)) {
       return res.status(400).json({ ok: false, error: "userId_required" });
     }
+    // Day 26 (G2): callers may only verify their own role (was any user's
+    // tier/company/org, unauthenticated).
+    if (userId !== String((req as any).userId || "")) {
+      return res.status(403).json({ ok: false, error: "forbidden_not_self" });
+    }
 
     const rep = await fetchRepProfile(userId);
     if (!rep) {

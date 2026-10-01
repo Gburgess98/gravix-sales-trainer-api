@@ -17,7 +17,8 @@ const UUID_RE =
 const isUuid = (v: string) => UUID_RE.test(String(v || ""));
 
 function uidFromHeader(req: any): string {
-  const uid = req.header("x-user-id");
+  // Day 26 (G1): verified identity from the global middleware, not a raw header.
+  const uid = String(req.userId || "").trim();
   if (!uid || !UUID_RE.test(uid)) throw new Error("Missing or invalid x-user-id");
   return uid;
 }

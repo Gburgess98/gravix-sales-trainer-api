@@ -1,4 +1,6 @@
 import { Router } from "express";
+import { canAccessRep } from "../lib/repAccess";
+import { decideCallWrite, type ExistingCallRow } from "../lib/callStoragePath";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import { postSlack } from "../lib/slack";
@@ -722,6 +724,12 @@ router.post("/", async (req, res) => {
   try {
     const body = CreateCallSchema.parse(req.body);
 
+    // Day 26 (G2): a call row may only be created for the caller or a rep
+    // they manage (was any userId, unauthenticated).
+    if (!(await canAccessRep((req as any).userId, body.userId))) {
+      return res.status(403).json({ ok: false, error: "forbidden_rep_scope" });
+    }
+
     const hierarchy = await getUserHierarchy(supa, body.userId);
 
     if (!hierarchy.office_id) {
@@ -754,12 +762,41 @@ router.post("/", async (req, res) => {
       audio_path: body.storagePath,
     };
 
-    // If you already insert in /v1/upload, upsert prevents duplicates by storage_path
-    const { data, error } = await supa
+    // Day 26: never re-assign someone else's call. The path must sit in the
+    // caller's own storage folder, and an existing row for that path may only
+    // be updated when it already belongs to the same user and company.
+    // (Previously an upsert on a caller-supplied storage_path could overwrite
+    // another tenant's call row.)
+    const { data: existingRow, error: existingErr } = await supa
       .from("calls")
-      .upsert(insert, { onConflict: "storage_path" })
-      .select()
-      .single();
+      .select("id, user_id, company_id")
+      .eq("storage_path", body.storagePath)
+      .maybeSingle();
+    if (existingErr) throw existingErr;
+
+    const decision = decideCallWrite({
+      callerId: String((req as any).userId || ""),
+      targetUserId: body.userId,
+      targetCompanyId: hierarchy.company_id,
+      storagePath: body.storagePath,
+      existing: (existingRow as ExistingCallRow) ?? null,
+    });
+    if (!decision.ok) {
+      return res.status(decision.status).json({ ok: false, error: decision.error });
+    }
+
+    // Insert (a concurrent duplicate path now fails on the unique constraint
+    // instead of overwriting), or update the caller-owned existing row.
+    const { data, error } =
+      decision.mode === "insert"
+        ? await supa.from("calls").insert(insert).select().single()
+        : await supa
+            .from("calls")
+            .update(insert)
+            .eq("id", decision.id)
+            .eq("user_id", body.userId)
+            .select()
+            .single();
 
     if (error) throw error;
     if (!data) throw new Error("upsert returned no row");
