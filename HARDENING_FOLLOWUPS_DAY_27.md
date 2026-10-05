@@ -16,6 +16,6 @@ Supersedes the "Next hardening day" section of HARDENING_FOLLOWUPS_DAY_26.md. Lo
 3. Assignments `requireManager` role policy (Manager/Admin/Owner; excludes PartnerAdmin/SuperAdmin).
 4. `requireInternal` reads never-set `req.authUserId` → internal portal unreachable. Decision needed on the intended service-auth/identity contract before changing.
 5. Bearer-only (no header) callers cannot use SuperAdmin-guarded routes (fail closed). Convert guards to verified `req.userId` only after deciding impersonation semantics.
-6. Legacy dev entry point `src/index.ts` (`start:dev`) still present — deliberately not deleted.
+6. Legacy dev entry point `src/index.ts` still present — deliberately not deleted. **Day 28:** `npm run start:dev` is now an alias of `npm run dev` (hardened `src/server.ts`); no npm script boots the legacy app (guarded by `validate:upload-dependencies`). The legacy source (unauthenticated `/v1/env-check`, `/v1/db/now`) remains a delete/keep follow-up.
 7. adminRouter `force-score` (needs unwired `req.services`) and `preview-slack` stub remain shadowed dead code; delete or wire in a reviewed change.
 8. Pre-existing: the validator suite imports `server.ts`, whose dotenv call reads `./.env` from the CWD; Day-27 validator runs from an empty directory with placeholder keys so no real secret is loaded.

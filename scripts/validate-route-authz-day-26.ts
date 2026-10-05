@@ -566,7 +566,7 @@ function analyse(files: Files, configFiles: Files): Report {
     if ([...importMap(files, f, parse(f, text)).values()].some((i) => i.file === "src/index.ts")) fail("entry-points", `${f} imports src/index.ts`);
   }
   if (files.has("src/index.ts") && /\bexpress\(\)/.test(files.get("src/index.ts")!)) {
-    info.push("src/index.ts is a legacy, UNAUTHENTICATED dev entry (start:dev only; exposes /v1/env-check, /v1/db/now). Not booted by production commands; consider deleting it.");
+    info.push("src/index.ts is a legacy, UNAUTHENTICATED dev entry (exposes /v1/env-check, /v1/db/now). Since Day 28 no npm script boots it (start:dev aliases the hardened dev server); the source remains a follow-up — consider deleting it.");
   }
 
   // ── guards ──

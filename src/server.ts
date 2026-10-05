@@ -562,9 +562,14 @@ const ALLOWED_UPLOAD_MIMES = new Set([
   "application/octet-stream", // generic binary — allow for legacy clients
 ]);
 
+// Day 28: multer >=2.2 ships field-name limits that default to Infinity, so a
+// version bump alone does NOT stop GHSA-535w-7cp7-47q4 (a field like
+// `a[4294967294]` followed by `a[x]` pins the CPU). POST /v1/upload reads only
+// the `file` part and no client sends bracketed text fields, so cap both tightly;
+// violations surface as LIMIT_* errors -> 400 upload_limit_exceeded below.
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits:  { fileSize: MAX_UPLOAD_BYTES },
+  limits:  { fileSize: MAX_UPLOAD_BYTES, fieldNestingDepth: 1, fieldArrayIndexLimit: 100 },
 });
 
 /* --- Helpers --- */
