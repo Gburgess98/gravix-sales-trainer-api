@@ -18,6 +18,8 @@ import { globalRateLimit, authRateLimit, uploadRateLimit } from "./middleware/ra
 import { resolveIdentity, getBearerToken, isUuid, type AuthCtx } from "./identityTrust";
 import { defaultClaimsVerifier } from "./tokenVerification";
 import { requireIdentityByDefault } from "./routeAuthPolicy";
+import { assertProductionAdminFlagUnset } from "./productionConfig";
+import { requireSuperAdmin } from "./middleware/requireSuperAdmin";
 import { accessibleRepIds, canAccessRep } from "./lib/repAccess";
 
 import callsRouter from "./routes/calls";
@@ -592,13 +594,17 @@ function requireIdentity(
   return next();
 }
 
+// Day 27: two gates. (1) the ALLOW_ADMIN_ENDPOINTS env gate (closed unless exactly
+// "true"; production boot refuses any value, see productionConfig.ts), then
+// (2) the same verified-SuperAdmin tier check the adminRouter handlers use.
+// Previously ANY authenticated identity passed once the env gate was open.
 function requireAdmin(
   req: express.Request,
   res: express.Response,
   next: express.NextFunction
 ) {
-  if (process.env.ALLOW_ADMIN_ENDPOINTS === "true") return next();
-  return res.status(403).json({ ok: false, error: "admin_required" });
+  if (process.env.ALLOW_ADMIN_ENDPOINTS !== "true") return res.status(403).json({ ok: false, error: "admin_required" });
+  return requireSuperAdmin(req, res, next);
 }
 
 function requireCron(
@@ -1835,7 +1841,7 @@ app.use("/v1/team", teamRoutes);
 // Intelligence Layer — Context Engine (Day 218); manager-gated, company-scoped
 app.use("/v1/intelligence", intelligenceRoutes);
 app.use("/v1/reps", repsRouter);
-app.use("/v1/rewards", rewardsRoutes);
+app.use("/v1/rewards", rewardsRoutes());
 app.use("/v1/sparring", sparringRouter);
 app.use("/v1/whisperer", whispererRouter);
 app.use("/v1/admin", adminRouter);
@@ -2083,6 +2089,9 @@ export { app };
 /* Boot */
 // GRAVIX_API_NO_LISTEN=1 is set only by the network-free route-authz
 // validator so it can import the real app without binding a port.
+// Day 27 (G5): refuse production boot when the legacy admin flag is set. Runs
+// before listen (and even under GRAVIX_API_NO_LISTEN so it is testable).
+assertProductionAdminFlagUnset(process.env);
 if (process.env.GRAVIX_API_NO_LISTEN !== "1") {
   const port = Number(process.env.PORT || 4000);
   app.listen(port, () => console.log(`🚀 Gravix API listening on :${port}`));

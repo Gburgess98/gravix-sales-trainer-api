@@ -306,9 +306,9 @@ function analyse(files: Files, configFiles: Files): Report {
   // ── inventory ──
   const reached = new Set<string>();
   // Mounts that pass a router FACTORY without calling it (Express would treat the
-  // factory as plain middleware and never run its routes). Pre-existing at HEAD for
-  // /v1/rewards; declared here so it is visible, and fails once it changes either way.
-  const DECLARED_UNCALLED = new Set(["/v1/rewards|rewardsRoutes"]);
+  // factory as plain middleware and never run its routes). Day 27: the only prior
+  // exception (/v1/rewards) was repaired, so NO uncalled mount is tolerated.
+  const DECLARED_UNCALLED = new Set<string>();
   const seenUncalled = new Set<string>();
   function classify(imps: Map<string, Imp>, t: ts.Expression | undefined): { file: string; factory: string | null; varName: string | null; uncalled: boolean } | null {
     if (!t) return null;
@@ -331,7 +331,7 @@ function analyse(files: Files, configFiles: Files): Report {
     const k = `${prefix}|${factory}`;
     seenUncalled.add(k);
     if (!DECLARED_UNCALLED.has(k)) fail("factory-uncalled", `${loc} mounts router factory ${factory} WITHOUT calling it — Express would run it as middleware and never serve its routes`);
-    else info.push(`${loc} mounts ${factory} uncalled at ${prefix} (pre-existing): requests to ${prefix}/* run the factory as middleware and never reach its routes. Its routes are still inventoried as if mounted at ${prefix}/rewards/:userId etc.`);
+    else info.push(`${loc} mounts ${factory} uncalled at ${prefix}: declared exception`);
   }
 
   function addRoutes(file: string, scope: ts.Node, vars: Set<string>, prefix: string, baseOrder: number[], serverPre: boolean, seen: string[]) {
@@ -610,8 +610,9 @@ function analyse(files: Files, configFiles: Files): Report {
         if (!has(t, "requireUserId(req, res, next)")) p.push("must delegate to requireUserId");
         break;
       case "requireAdmin":
-        if (nexts !== 1 || !has(t, 'if (process.env.ALLOW_ADMIN_ENDPOINTS === "true") return next()') || !has(t, "res.status(403)")) {
-          p.push('must be a fail-closed env gate: only `process.env.ALLOW_ADMIN_ENDPOINTS === "true"` may call next(), otherwise 403');
+        // Day 27: env gate (exact "true" only) THEN verified-SuperAdmin delegation; no direct next().
+        if (nexts !== 0 || !has(t, 'if (process.env.ALLOW_ADMIN_ENDPOINTS !== "true") return res.status(403)') || !has(t, "return requireSuperAdmin(req, res, next)")) {
+          p.push('must be an env gate (403 unless ALLOW_ADMIN_ENDPOINTS === "true") that delegates to requireSuperAdmin and never calls next() itself');
         }
         break;
       case "requireCron":
@@ -718,7 +719,7 @@ function analyse(files: Files, configFiles: Files): Report {
       }
     }
   }
-  info.push("server.ts /v1/admin/* routes use requireAdmin: closed unless ALLOW_ADMIN_ENDPOINTS==='true'; when set, ANY authenticated identity passes (no role check).");
+  info.push("server.ts /v1/admin/* routes use requireAdmin: closed unless ALLOW_ADMIN_ENDPOINTS==='true' AND the caller is a verified-tier SuperAdmin (Day 27); production boot refuses the flag entirely.");
 
   // inline-scope routes
   const adminText = files.get("src/routes/admin.ts");
@@ -803,7 +804,7 @@ function analyse(files: Files, configFiles: Files): Report {
   // ── release wiring ──
   const scripts = pkg.scripts ?? {};
   const cr = String(scripts["check:release"] ?? "");
-  for (const s of ["validate:authz-remediation", "validate:route-authz"]) {
+  for (const s of ["validate:authz-remediation", "validate:route-authz", "validate:admin-hardening"]) {
     if (!scripts[s]) fail("release-wiring", `package.json has no "${s}" script`);
     if (!cr.includes(`npm run ${s}`)) fail("release-wiring", `check:release does not run ${s}`);
   }
@@ -955,8 +956,8 @@ async function main() {
     { name: "mount prefix changed (prefix handling)", expect: "public-entry-unmatched", run: () => mutate(files, SERVER, 'app.use("/v1/crm", crmRouter)', 'app.use("/v2/crm", crmRouter)') },
     { name: "nested intelligence router unmounted", expect: "unmounted-undeclared", run: () => mutate(files, "src/routes/intelligence.ts", 'router.use("/scorecards", scorecardsRouter);', "") },
     { name: "factory router assignmentsRoutes() unmounted", expect: "unmounted-undeclared", run: () => mutate(files, SERVER, 'app.use("/v1/assignments", assignmentsRoutes());', "") },
-    { name: "factory router rewardsRoutes unmounted", expect: "unmounted-undeclared", run: () => mutate(files, SERVER, 'app.use("/v1/rewards", rewardsRoutes);', "") },
-    { name: "rewards factory fixed (called) but exception left stale", expect: "factory-uncalled", run: () => mutate(files, SERVER, 'app.use("/v1/rewards", rewardsRoutes);', 'app.use("/v1/rewards", rewardsRoutes());') },
+    { name: "factory router rewardsRoutes unmounted", expect: "unmounted-undeclared", run: () => mutate(files, SERVER, 'app.use("/v1/rewards", rewardsRoutes());', "") },
+    { name: "rewards factory regresses to uncalled mount", expect: "factory-uncalled", run: () => mutate(files, SERVER, 'app.use("/v1/rewards", rewardsRoutes());', 'app.use("/v1/rewards", rewardsRoutes);') },
     { name: "assignments factory mounted uncalled", expect: "factory-uncalled", run: () => mutate(files, SERVER, 'app.use("/v1/assignments", assignmentsRoutes());', 'app.use("/v1/assignments", assignmentsRoutes);') },
     {
       name: "excluded callsPins.ts.ts imported",
@@ -967,7 +968,8 @@ async function main() {
     { name: "param route shadows a public path", expect: "public-entry-shadowed", run: () => mutate(files, SERVER, 'app.get("/v1/version"', 'app.get("/v1/:x", (_q, r) => r.json({}));\napp.get("/v1/version"') },
     { name: "admin route loses requireSuperAdmin", expect: "admin-guard", run: () => mutate(files, "src/routes/admin.ts", 'adminRouter.get("/super/health", requireSuperAdmin,', 'adminRouter.get("/super/health",') },
     { name: "requireSuperAdmin widened to Manager", expect: "guard-weak", run: () => mutate(files, "src/middleware/requireSuperAdmin.ts", 'tier !== "SuperAdmin"', 'tier !== "SuperAdmin" && tier !== "Manager"') },
-    { name: "requireAdmin made fail-open", expect: "guard-weak", run: () => mutate(files, SERVER, 'process.env.ALLOW_ADMIN_ENDPOINTS === "true"', 'process.env.ALLOW_ADMIN_ENDPOINTS !== "false"') },
+    { name: "requireAdmin env gate made fail-open", expect: "guard-weak", run: () => mutate(files, SERVER, 'process.env.ALLOW_ADMIN_ENDPOINTS !== "true"', 'process.env.ALLOW_ADMIN_ENDPOINTS === "false"') },
+    { name: "requireAdmin drops SuperAdmin delegation (any identity passes)", expect: "guard-weak", run: () => mutate(files, SERVER, "return requireSuperAdmin(req, res, next);", "return next();") },
     { name: "server.ts admin route loses requireAdmin", expect: "admin-guard", run: () => mutate(files, SERVER, 'app.post("/v1/admin/post-slack", requireAdmin,', 'app.post("/v1/admin/post-slack",') },
     { name: "unclassified new admin route", expect: "admin-unclassified", run: () => mutate(files, "src/routes/admin.ts", "export default adminRouter;", 'adminRouter.get("/danger", async (_q: any, r: any) => r.json({}));\nexport default adminRouter;') },
     {
@@ -994,6 +996,7 @@ async function main() {
     { name: "committed config enables ALLOW_ADMIN_ENDPOINTS", expect: "admin-env", run: () => files, cfg: withCfg("nixpacks.toml", config.get("nixpacks.toml"), (t) => t + '\n[variables]\nALLOW_ADMIN_ENDPOINTS = "true"\n') },
     { name: "spoofable-header stripping removed", expect: "header-strip", run: () => mutate(files, "src/identityTrust.ts", "for (const h of SPOOFABLE_IDENTITY_HEADERS) delete req.headers[h];", "") },
     { name: "check:release drops validate:route-authz", expect: "release-wiring", run: () => files, cfg: withCfg("package.json", config.get("package.json"), (t) => t.replace(" && npm run validate:route-authz", "")) },
+    { name: "check:release drops validate:admin-hardening", expect: "release-wiring", run: () => files, cfg: withCfg("package.json", config.get("package.json"), (t) => t.replace(" && npm run validate:admin-hardening", "")) },
     { name: "check:release drops validate:authz-remediation", expect: "release-wiring", run: () => files, cfg: withCfg("package.json", config.get("package.json"), (t) => t.replace(" && npm run validate:authz-remediation", "")) },
   ];
   for (const m of M) {

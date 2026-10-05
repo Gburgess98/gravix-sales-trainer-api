@@ -1,4 +1,6 @@
 // api/src/routes/rewards.ts
+// Mounted at /v1/rewards (server.ts) — paths here are relative to that mount:
+//   GET /v1/rewards/:userId · POST /v1/rewards/:userId/select-title · GET /v1/rewards/bounties/active
 import { Router, json } from "express";
 import { canAccessRep } from "../lib/repAccess";
 import { createClient } from "@supabase/supabase-js";
@@ -7,7 +9,7 @@ export function rewardsRoutes() {
   const r = Router();
 
   // GET earned cosmetics for a user (badges, titles, selected)
-  r.get("/rewards/:userId", async (req, res) => {
+  r.get("/:userId", async (req, res) => {
     const { userId } = req.params;
     // Day 26 (G2): self, or a manager-tier caller in the same tenant.
     if (!(await canAccessRep((req as any).userId, userId))) {
@@ -55,7 +57,7 @@ export function rewardsRoutes() {
   });
 
   // POST select title (equip)
-  r.post("/rewards/:userId/select-title", json(), async (req, res) => {
+  r.post("/:userId/select-title", json(), async (req, res) => {
     const { userId } = req.params;
     const { titleId } = req.body || {};
     // Day 26 (G2): only the caller may change their own title.
@@ -80,7 +82,13 @@ export function rewardsRoutes() {
   });
 
   // GET active bounties (basic)
-  r.get("/rewards/bounties/active", async (_req, res) => {
+  // Day 27: this handler was unreachable until the factory mount was repaired. It
+  // reads `bounties` with no tenant filter (bounties.org_id is nullable; whether
+  // null means "global" is an unresolved product policy) using the anon client, so
+  // it stays CLOSED until that policy is decided (HARDENING_FOLLOWUPS_DAY_27.md).
+  const BOUNTIES_ENABLED = false;
+  r.get("/bounties/active", async (_req, res) => {
+    if (!BOUNTIES_ENABLED) return res.status(404).json({ ok: false, error: "bounties_not_available" });
     try {
       const now = new Date().toISOString();
       const supa = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
