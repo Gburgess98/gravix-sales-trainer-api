@@ -3,6 +3,7 @@
 //   GET /v1/rewards/:userId · POST /v1/rewards/:userId/select-title · GET /v1/rewards/bounties/active
 import { Router, json } from "express";
 import { canAccessRep } from "../lib/repAccess";
+import { supaAdmin } from "../lib/supa";
 import { createClient } from "@supabase/supabase-js";
 
 export function rewardsRoutes() {
@@ -15,23 +16,37 @@ export function rewardsRoutes() {
     if (!(await canAccessRep((req as any).userId, userId))) {
       return res.status(403).json({ ok: false, error: "forbidden_rep_scope" });
     }
+    // Day 30 (F-28-1): read through the shared service-role client AFTER the access
+    // check above (the anon client needed a SUPABASE_ANON_KEY the API does not have,
+    // and its errors were ignored). Each query's error is checked; clients only ever
+    // see the stable `rewards_fetch_failed` — never provider text, keys or schema.
+    const fail = (what: string, code?: string) => {
+      console.error(`[rewards] ${what} query failed${code ? ` (code ${code})` : ""}`);
+      return res.status(500).json({ ok: false, error: "rewards_fetch_failed" });
+    };
     try {
-      const supa = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!);
-      const { data: badges } = await supa
+      const badgesRes = await supaAdmin
         .from("user_badges")
         .select("badge_id, earned_at, badges(label, icon)")
         .eq("user_id", userId);
+      if (badgesRes.error) return fail("badges", badgesRes.error.code);
 
-      const { data: titles } = await supa
+      const titlesRes = await supaAdmin
         .from("user_titles")
         .select("title_id, unlocked_at, titles(label, icon, bg_class)")
         .eq("user_id", userId);
+      if (titlesRes.error) return fail("titles", titlesRes.error.code);
 
-      const { data: selected } = await supa
+      const selectedRes = await supaAdmin
         .from("user_selected_title")
         .select("title_id")
         .eq("user_id", userId)
         .maybeSingle();
+      if (selectedRes.error) return fail("selected-title", selectedRes.error.code);
+
+      const badges = badgesRes.data;
+      const titles = titlesRes.data;
+      const selected = selectedRes.data as { title_id?: string } | null;
 
       res.set("Cache-Control", "private, max-age=15");
       res.json({
@@ -52,7 +67,8 @@ export function rewardsRoutes() {
         selectedTitleId: selected?.title_id ?? null
       });
     } catch (e: any) {
-      res.status(500).json({ ok: false, error: e?.message || "rewards_fetch_failed" });
+      console.error("[rewards] unexpected failure:", e?.name || "error");
+      res.status(500).json({ ok: false, error: "rewards_fetch_failed" });
     }
   });
 
