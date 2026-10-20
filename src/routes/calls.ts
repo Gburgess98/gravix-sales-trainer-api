@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { canAccessRep } from "../lib/repAccess";
+import { resolveCallerHierarchy } from "../lib/callerHierarchy";
 import { decideCallWrite, type ExistingCallRow } from "../lib/callStoragePath";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
@@ -65,18 +66,7 @@ function getUserIdHeader(req: any): string {
 }
 
 
-async function getUserHierarchy(supa: any, userId: string) {
-  const { data } = await supa
-    .from("users")
-    .select("office_id, company_id")
-    .eq("id", userId)
-    .maybeSingle();
-
-  return {
-    office_id: data?.office_id || null,
-    company_id: data?.company_id || null,
-  };
-}
+// Day 39: the users-only getUserHierarchy was replaced by lib/callerHierarchy.resolveCallerHierarchy.
 
 // SPRINT 4 — Day 91: hierarchy context for manager-review scope checks.
 // Same users-table lookup pattern as dashboard.ts / manager.ts.
@@ -730,25 +720,21 @@ router.post("/", async (req, res) => {
       return res.status(403).json({ ok: false, error: "forbidden_rep_scope" });
     }
 
-    const hierarchy = await getUserHierarchy(supa, body.userId);
-
-    if (!hierarchy.office_id) {
-      return res.status(400).json({
+    // Day 39 (F-38-1): same canonical resolver as /v1/upload*: reps first, users as a legacy
+    // bridge; company/org required, office optional. (This route previously used a
+    // users-only lookup and refused every auth-first rep with `user_missing_office`.)
+    const resolved = await resolveCallerHierarchy(supa, body.userId, { defaultOrgId: process.env.DEFAULT_ORG_ID ?? null });
+    if (!resolved.ok) {
+      return res.status(resolved.error === "hierarchy_lookup_failed" ? 503 : 400).json({
         ok: false,
-        error: "user_missing_office",
+        error: resolved.error === "hierarchy_lookup_failed" ? "hierarchy_lookup_failed" : "user_missing_company",
       });
     }
-
-    if (!hierarchy.company_id) {
-      return res.status(400).json({
-        ok: false,
-        error: "user_missing_company",
-      });
-    }
+    const hierarchy = resolved.hierarchy;
 
     const insert = {
       user_id: body.userId,
-      org_id: process.env.DEFAULT_ORG_ID ?? null, // adapt if NOT NULL
+      org_id: hierarchy.org_id,
       office_id: hierarchy.office_id,
       company_id: hierarchy.company_id,
       filename: body.fileName,

@@ -19,6 +19,9 @@ import { resolveIdentity, getBearerToken, isUuid, type AuthCtx } from "./identit
 import { defaultClaimsVerifier } from "./tokenVerification";
 import { requireIdentityByDefault } from "./routeAuthPolicy";
 import { assertProductionAdminFlagUnset } from "./productionConfig";
+import { resolveCallerHierarchy } from "./lib/callerHierarchy";
+import { recordScorePostedActivity } from "./lib/scoreActivity";
+import { storagePathOwnedBy } from "./lib/callStoragePath";
 import { assertTranscriptionProviderConfig, resolveTranscriptionProvider, describeTranscriptionProvider } from "./lib/transcriptionProvider";
 import { requireSuperAdmin } from "./middleware/requireSuperAdmin";
 import { accessibleRepIds, canAccessRep } from "./lib/repAccess";
@@ -780,6 +783,29 @@ app.post("/v1/upload/finalize", async (req, res) => {
     const linkAccountId = (typeof accountId === "string" && /^[0-9a-f-]{36}$/i.test(accountId)) ? accountId : null;
     if (!path.startsWith(`${userId}/`)) return res.status(400).json({ ok: false, error: "path_user_mismatch" });
 
+    // Day 39 (F-38-1): the caller's canonical tenant hierarchy (reps first, users as a
+    // legacy bridge) is resolved BEFORE any call/job row exists. A caller without a
+    // company/org is refused — never stored unscoped — and the object the client already
+    // PUT to storage is removed (bounded, one attempt) so a rejected finalize cannot leave
+    // an orphan. The client can never supply these fields.
+    const hier = await resolveCallerHierarchy(supabase, userId, { defaultOrgId: DEFAULT_ORG_ID });
+    if (!hier.ok) {
+      let objectRemoved = false;
+      // Only a PERMANENT refusal removes the object. A lookup failure is transient and the
+      // client may retry finalize, which needs the object to still exist.
+      if (hier.error === "caller_hierarchy_incomplete" && storagePathOwnedBy(userId, path)) {
+        try {
+          const rm = await supabase.storage.from(BUCKET).remove([path]);
+          objectRemoved = !rm.error;
+        } catch { objectRemoved = false; }
+        if (!objectRemoved) console.error("[upload] orphan cleanup failed after rejected finalize");
+      }
+      console.warn("[upload] finalize refused:", hier.error);
+      return hier.error === "hierarchy_lookup_failed"
+        ? res.status(503).json({ ok: false, error: "hierarchy_lookup_failed" })
+        : res.status(422).json({ ok: false, error: "upload_hierarchy_incomplete", object_removed: objectRemoved });
+    }
+
     // best-effort existence check
     try {
       const test = await supabase.storage.from(BUCKET).createSignedUrl(path, 30);
@@ -819,7 +845,9 @@ app.post("/v1/upload/finalize", async (req, res) => {
     const callInsert: Record<string, any> = {
       id,
       user_id: userId,
-      org_id: DEFAULT_ORG_ID,
+      org_id: hier.hierarchy.org_id,
+      company_id: hier.hierarchy.company_id,
+      ...(hier.hierarchy.office_id ? { office_id: hier.hierarchy.office_id } : {}),
       filename,
       storage_path: path,
       mime_type: mime || null,
@@ -833,19 +861,7 @@ app.post("/v1/upload/finalize", async (req, res) => {
     };
     if (linkAccountId) callInsert.account_id = linkAccountId;
 
-    // Day 165 — stamp the uploader's hierarchy (office/company) so the call is
-    // visible in the manager's scoped Review Queue and Command Centre, both of
-    // which filter calls by office_id / company_id. Fail-soft: if the lookup
-    // returns nothing the upload still proceeds (unscoped, as before).
-    try {
-      const { data: urow } = await supabase
-        .from("users")
-        .select("office_id, company_id")
-        .eq("id", userId)
-        .maybeSingle();
-      if (urow?.office_id) callInsert.office_id = urow.office_id;
-      if (urow?.company_id) callInsert.company_id = urow.company_id;
-    } catch { /* fail-soft: hierarchy scoping is best-effort */ }
+    // (Day 165 stamped office/company from `users` only; replaced by resolveCallerHierarchy above.)
 
     let linkedAccountId: string | null = linkAccountId;
     let { error: dbErrCall } = await supabase.from("calls").insert(callInsert);
@@ -907,6 +923,17 @@ app.post(
         });
       }
 
+      // Day 39 (F-38-1): canonical hierarchy (reps first, users bridge) before anything is
+      // stored or written; an unscoped caller is refused with nothing to clean up.
+      const hier = await resolveCallerHierarchy(supabase, userId, { defaultOrgId: DEFAULT_ORG_ID });
+      if (!hier.ok) {
+        console.warn("[upload] direct upload refused:", hier.error);
+        return res.status(hier.error === "hierarchy_lookup_failed" ? 503 : 422).json({
+          ok: false,
+          error: hier.error === "hierarchy_lookup_failed" ? "hierarchy_lookup_failed" : "upload_hierarchy_incomplete",
+        });
+      }
+
       const isJson = f.mimetype.includes("json");
       const kind = isJson ? "json" : "audio";
       const id = crypto.randomUUID();
@@ -941,7 +968,9 @@ app.post(
       const { error: dbErrCall } = await supabase.from("calls").insert({
         id,
         user_id: userId,
-        org_id: DEFAULT_ORG_ID,
+        org_id: hier.hierarchy.org_id,
+        company_id: hier.hierarchy.company_id,
+        ...(hier.hierarchy.office_id ? { office_id: hier.hierarchy.office_id } : {}),
         filename: f.originalname,
         storage_path: key,
         mime_type: f.mimetype,
@@ -1935,19 +1964,37 @@ async function simulateScore(jobId: string, callId: string) {
       .from("calls").update({ status: "scored", updated_at: new Date().toISOString() }).eq("id", callId);
     if (upErr) throw new Error(`score status update failed: ${upErr.message}`);
 
-    // Activity: call scored (best-effort)
-    try {
-      const summary = `Scored ${Math.round(result.overall)} — Intro ${Math.round(result.stages.intro.score)} / Disc ${Math.round(result.stages.discovery.score)} / Obj ${Math.round(result.stages.objection.score)} / Close ${Math.round(result.stages.close.score)}`;
-      await supabase.from("activities").insert({
-        org_id: (callRow as any)?.org_id ?? DEFAULT_ORG_ID ?? null,
-        actor_user_id: (callRow as any)?.user_id ?? null,
-        type: "call_scored",
-        summary,
-        call_id: callId,
-        created_at: new Date().toISOString(),
-      });
-    } catch (e: any) {
-      console.warn("[activity] call_scored insert failed:", e?.message || e);
+    // Activity: score posted. Day 39 (F-38-2): schema-valid type, `{ error }` checked, and
+    // a failure is surfaced (log + job result) instead of being treated as success.
+    const activity = await recordScorePostedActivity(supabase, {
+      callId,
+      jobId,
+      orgId: (callRow as any)?.org_id ?? DEFAULT_ORG_ID ?? null,
+      actorUserId: (callRow as any)?.user_id ?? null,
+      overall: result.overall,
+      stages: {
+        intro: result.stages.intro.score,
+        discovery: result.stages.discovery.score,
+        objection: result.stages.objection.score,
+        close: result.stages.close.score,
+      },
+      model: result.model,
+    });
+    if (!activity.logged) {
+      console.error("[activity] score_posted NOT logged:", activity.error_code);
+      await setJobStatus(jobId, "succeeded", {
+        result: {
+          model: result.model,
+          overall: result.overall,
+          sections: {
+            intro: result.stages.intro.score,
+            discovery: result.stages.discovery.score,
+            objection: result.stages.objection.score,
+            close: result.stages.close.score,
+          },
+          activity: { logged: false, error_code: activity.error_code },
+        },
+      }).catch((e: any) => console.error("[activity] could not record failure on job:", e?.message || e));
     }
 
     console.log("[score] wrote", { callId, overall: result.overall, model: result.model });

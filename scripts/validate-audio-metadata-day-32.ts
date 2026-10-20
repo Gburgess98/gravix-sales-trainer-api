@@ -147,6 +147,7 @@ function controlSuite(root: string): Check[] {
 
 // ───────────── end-to-end: real POST /v1/upload ─────────────
 const REP = "aaaaaaaa-0000-4000-8000-000000000003";
+const REP_ROW = { id: "aaaaaaaa-0000-4000-8000-000000000003", org_id: "dddddddd-0000-4000-8000-00000000000a", company_id: "dddddddd-0000-4000-8000-00000000000b", office_id: null };
 type Rec = { method: string; url: string; body: string };
 function startStub(records: Rec[]): Promise<http.Server> {
   const srv = http.createServer((req, res) => {
@@ -155,6 +156,8 @@ function startStub(records: Rec[]): Promise<http.Server> {
       const u = new URL(req.url || "/", "http://stub");
       if (req.method !== "GET") records.push({ method: req.method || "", url: u.pathname, body: u.pathname.startsWith("/storage/") ? "<bytes>" : Buffer.concat(chunks).toString("utf8") });
       const send = (c: number, b: unknown) => { res.writeHead(c, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
+      // Day 39: canonical caller hierarchy (reps row) — uploads are refused without it.
+      if (u.pathname === "/rest/v1/reps" && String(u.searchParams.get("id") || "").endsWith(REP)) return send(200, String(req.headers["accept"] || "").includes("vnd.pgrst.object") ? REP_ROW : [REP_ROW]);
       if (u.pathname === "/storage/v1/bucket") return send(200, []);
       if (u.pathname.startsWith("/storage/")) return send(200, { Key: "stub" });
       if (u.pathname.startsWith("/auth/")) return send(400, { error: "invalid_grant" });

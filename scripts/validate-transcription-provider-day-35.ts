@@ -31,6 +31,7 @@ const EMPTY_CWD = fs.mkdtempSync(path.join(os.tmpdir(), "gravix-nocfg-"));
 type Check = { id: string; pass: boolean; detail?: string };
 
 const REP = "aaaaaaaa-0000-4000-8000-000000000003";
+const REP_ROW = { id: "aaaaaaaa-0000-4000-8000-000000000003", org_id: "dddddddd-0000-4000-8000-00000000000a", company_id: "dddddddd-0000-4000-8000-00000000000b", office_id: null };
 const PLANTED_KEY = "sk-planted-secret-key-d35";
 const PLANTED_BAD = "planted-bad-provider-d35";
 const PROXY_SECRET = "planted-proxy-secret-d35";
@@ -94,6 +95,8 @@ function startStubs(rec: Rec): Promise<{ sb: http.Server; oa: http.Server }> {
       const u = new URL(req.url || "/", "http://stub"); const body = Buffer.concat(chunks).toString("utf8");
       const send = (c: number, b: unknown) => { res.writeHead(c, { "content-type": "application/json" }); res.end(JSON.stringify(b)); };
       rec.sb.push(`${req.method} ${u.pathname}`);
+      // Day 39: canonical caller hierarchy (reps row) — uploads/finalize are refused without it.
+      if (u.pathname === "/rest/v1/reps" && String(u.searchParams.get("id") || "").endsWith(REP)) return send(200, String(req.headers["accept"] || "").includes("vnd.pgrst.object") ? REP_ROW : [REP_ROW]);
       if (u.pathname === "/storage/v1/bucket") return send(200, []);
       if (u.pathname.startsWith("/storage/v1/object/sign/")) return send(200, { signedURL: `/object/sign/calls/x?token=t` });
       if (u.pathname.startsWith("/storage/v1/object/") && req.method === "GET") { res.writeHead(200, { "content-type": "audio/wav" }); return res.end(wavBytes()); }

@@ -31,6 +31,7 @@ const EMPTY_CWD = fs.mkdtempSync(path.join(os.tmpdir(), "gravix-nocfg-"));
 type Check = { id: string; pass: boolean; detail?: string };
 
 const REP = "aaaaaaaa-0000-4000-8000-000000000003";
+const REP_ROW = { id: "aaaaaaaa-0000-4000-8000-000000000003", org_id: "dddddddd-0000-4000-8000-00000000000a", company_id: "dddddddd-0000-4000-8000-00000000000b", office_id: null };
 
 // ───────────── loopback PostgREST + storage stub that records writes ─────────────
 type Rec = { method: string; url: string; body: string };
@@ -43,6 +44,8 @@ function startStub(records: Rec[]): Promise<http.Server> {
       const body = Buffer.concat(chunks).toString("utf8");
       if (req.method !== "GET") records.push({ method: req.method || "", url: u.pathname, body: u.pathname.startsWith("/storage/") ? `<${chunks.length ? Buffer.concat(chunks).length : 0} bytes>` : body });
       const wantsObject = String(req.headers["accept"] || "").includes("vnd.pgrst.object");
+      // Day 39: canonical caller hierarchy (reps row) — uploads are refused without it.
+      if (u.pathname === "/rest/v1/reps" && String(u.searchParams.get("id") || "").endsWith("aaaaaaaa-0000-4000-8000-000000000003")) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify(wantsObject ? REP_ROW : [REP_ROW])); }
       if (u.pathname.startsWith("/auth/")) { res.writeHead(400, { "content-type": "application/json" }); return res.end(JSON.stringify({ error: "invalid_grant", error_description: "stub" })); }
       if (u.pathname === "/storage/v1/bucket") { res.writeHead(200, { "content-type": "application/json" }); return res.end("[]"); }
       if (u.pathname.startsWith("/storage/")) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ Key: "stub" })); }
