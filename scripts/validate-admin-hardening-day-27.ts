@@ -253,6 +253,10 @@ function bootSuite(root: string, stubUrl: string): Check[] {
       SUPABASE_URL: stubUrl,
       ...PLACEHOLDER_KEYS,
       GRAVIX_API_NO_LISTEN: "1", // refusal must fire even though nothing would listen
+      // Day 35: production now requires an explicit transcription provider (separate
+      // contract, proved in validate:transcription-provider); "stub" keeps this
+      // matrix about ALLOW_ADMIN_ENDPOINTS only.
+      TRANSCRIPTION_PROVIDER: "stub",
     };
     for (const [k, v] of Object.entries(c.env)) if (v !== undefined) env[k] = v;
     const p = spawnSync(tsx, [__filename, "--boot", root], { env, cwd: EMPTY_CWD, encoding: "utf8", timeout: 60_000 });
@@ -350,7 +354,7 @@ const MUTATIONS: Mutation[] = [
   { name: "production trusts headers without a secret", file: "src/identityTrust.ts", find: 'if (!expected) return process.env.NODE_ENV !== "production";', repl: "if (!expected) return true;", suite: "runtime", expect: "production-without-secret-trusts-no-header" },
   { name: "boot guard only refuses exact true", file: "src/productionConfig.ts", find: 'if (raw === undefined || String(raw).trim() === "") return;', repl: 'if (String(raw).trim() !== "true") return;', suite: "boot", expect: "boot[prod-flag-false]" },
   { name: "boot guard ignores whitespace-padded true", file: "src/productionConfig.ts", find: 'String(raw).trim() === ""', repl: 'String(raw) === ""', suite: "contract", expect: "contract-whitespace-ok" },
-  { name: "boot guard removed from server.ts", file: "src/server.ts", find: "assertProductionAdminFlagUnset(process.env);\nif (", repl: "if (", suite: "boot", expect: "boot[prod-flag-true]" },
+  { name: "boot guard removed from server.ts", file: "src/server.ts", find: "assertProductionAdminFlagUnset(process.env);", repl: "", suite: "boot", expect: "boot[prod-flag-true]" },
   { name: "boot guard also refuses outside production", file: "src/productionConfig.ts", find: 'if (env.NODE_ENV !== "production") return;', repl: "", suite: "boot", expect: "boot[dev-flag-true-still-boots]" },
   { name: "new raw x-user-id reader added", file: "src/routes/rewards.ts", find: "const { userId } = req.params;", repl: 'const { userId } = req.params; void req.header("x-user-id");', suite: "contract", expect: "raw-identity-header-reads-match-reviewed-baseline" },
 ];

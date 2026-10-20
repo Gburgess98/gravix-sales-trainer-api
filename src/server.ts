@@ -19,6 +19,7 @@ import { resolveIdentity, getBearerToken, isUuid, type AuthCtx } from "./identit
 import { defaultClaimsVerifier } from "./tokenVerification";
 import { requireIdentityByDefault } from "./routeAuthPolicy";
 import { assertProductionAdminFlagUnset } from "./productionConfig";
+import { assertTranscriptionProviderConfig, resolveTranscriptionProvider, describeTranscriptionProvider } from "./lib/transcriptionProvider";
 import { requireSuperAdmin } from "./middleware/requireSuperAdmin";
 import { accessibleRepIds, canAccessRep } from "./lib/repAccess";
 
@@ -1019,6 +1020,8 @@ app.get("/v1/version", (_req, res) => {
     dirty: BUILD_INFO.dirty ?? undefined,
     buildTime: BUILD_INFO.builtAt || process.env.BUILD_TIME || null,
     app_env: process.env.APP_ENV || null,
+    // Day 35: resolved transcription provider (non-secret; independent of `scoring`).
+    transcription_provider: describeTranscriptionProvider(),
     scoring: {
       contract: resolveScoringContract(),
       provider: resolveScoringProvider(),
@@ -1999,8 +2002,12 @@ async function simulateTranscription(jobId: string, callId: string, _storagePath
   };
 
   try {
-    const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
-    if (apiKey) {
+    // Day 35 (F-34-1): the provider is an EXPLICIT choice (TRANSCRIPTION_PROVIDER), never
+    // inferred from the presence of OPENAI_API_KEY. Only "openai" may import/use the
+    // OpenAI client, download the audio for egress and call the provider. A resolution
+    // error falls into the catch below => stub transcript (fail-closed).
+    if (resolveTranscriptionProvider() === "openai") {
+      const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
       const { default: OpenAI, toFile } = await import("openai");
       const client = new OpenAI({ apiKey });
 
@@ -2097,6 +2104,8 @@ export { app };
 // Day 27 (G5): refuse production boot when the legacy admin flag is set. Runs
 // before listen (and even under GRAVIX_API_NO_LISTEN so it is testable).
 assertProductionAdminFlagUnset(process.env);
+// Day 35 (F-34-1): a valid, explicit transcription provider before anything listens.
+assertTranscriptionProviderConfig(process.env);
 if (process.env.GRAVIX_API_NO_LISTEN !== "1") {
   const port = Number(process.env.PORT || 4000);
   app.listen(port, () => console.log(`🚀 Gravix API listening on :${port}`));
