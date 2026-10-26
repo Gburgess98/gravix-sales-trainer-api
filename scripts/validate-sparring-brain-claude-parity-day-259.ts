@@ -8,17 +8,23 @@
  * This is a PARITY/SMOKE proof, not a quality ranking. It does NOT flip the
  * default (OpenAI stays default) and makes no claim that Claude is "better".
  *
- * Env: keys are read from .env via dotenv. A provider with no key is SKIPPED,
+ * SAFETY (Day 42 amendment): the DEFAULT run is network-free and stub-only — it
+ * never loads .env, never reads provider keys, and never constructs or calls a
+ * paid provider. Real providers run ONLY via the operator-only command
+ * `npm run validate:sparring-brain-claude-parity:live`, which needs BOTH
+ * `--live` and GRAVIX_ALLOW_LIVE_PROVIDER_PARITY=YES_SPEND_MONEY, else it exits 2
+ * before anything is imported or constructed. It is NOT part of check:release.
+ *
+ * Live env: keys are read from .env via dotenv. A provider with no key is SKIPPED,
  * never failed. Hard gates fail only when a *configured* provider returns an
  * empty reply, meta/assistant language, or provider/fallback provenance that
  * does not match the request. Qualitative rubric fields are reported, not gated
  * (model phrasing is non-deterministic).
  *
  * No secrets and no raw model output are committed — replies are printed to
- * stdout for the operator only. Usage: npx tsx scripts/…-day-259.ts
+ * stdout for the operator only. Usage: npm run validate:sparring-brain-claude-parity
  */
 
-import "dotenv/config";
 import { generateProspectReply } from "../src/lib/sparringBrain";
 import type { BrainProvider, BrainProviderName } from "../src/lib/sparringBrain";
 import { openaiBrain } from "../src/lib/sparringBrain/openaiBrain";
@@ -179,8 +185,8 @@ function gate(label: string, ok: boolean) {
 
 async function runProvider(name: BrainProviderName, available: boolean): Promise<Row> {
   if (!available) {
-    console.log(`\n── ${name.toUpperCase()} — SKIPPED (no API key present) ──`);
-    return { provider: name, status: "SKIPPED", reason: "no API key present" };
+    console.log(`\n── ${name.toUpperCase()} — SKIPPED (not live / no API key) ──`);
+    return { provider: name, status: "SKIPPED", reason: "not live or no API key present" };
   }
 
   const input = buildInput(buildState());
@@ -242,12 +248,26 @@ async function runProvider(name: BrainProviderName, available: boolean): Promise
   };
 }
 
+const LIVE_ENV = "GRAVIX_ALLOW_LIVE_PROVIDER_PARITY";
+const LIVE_TOKEN = "YES_SPEND_MONEY";
+
 async function main() {
-  const hasOpenAI = !!process.env.OPENAI_API_KEY;
-  const hasClaude = !!process.env.ANTHROPIC_API_KEY;
+  const wantsLive = process.argv.includes("--live");
+  if (wantsLive && process.env[LIVE_ENV] !== LIVE_TOKEN) {
+    console.error(`REFUSED: --live makes real, billable OpenAI/Anthropic requests. Also set ${LIVE_ENV}=${LIVE_TOKEN} to confirm. Nothing was loaded or contacted.`);
+    process.exit(2);
+  }
+  // Only the explicit live opt-in may load the repository .env.
+  let dotenvLoaded = false;
+  if (wantsLive) { await import("dotenv/config"); dotenvLoaded = true; }
+  const hasOpenAI = wantsLive && !!process.env.OPENAI_API_KEY;
+  const hasClaude = wantsLive && !!process.env.ANTHROPIC_API_KEY;
 
   console.log("Sparring Brain — Claude parity proof (Day 259)");
-  console.log(`Provider keys: openai=${hasOpenAI ? "present" : "absent"}  claude=${hasClaude ? "present" : "absent"}  (stub always runs)`);
+  console.log(`dotenv_loaded=${dotenvLoaded}`);
+  console.log(wantsLive
+    ? `LIVE MODE. Provider keys: openai=${hasOpenAI ? "present" : "absent"}  claude=${hasClaude ? "present" : "absent"}  (stub always runs)`
+    : "Network-free default: stub only; .env not loaded, paid providers not constructed (use :live for real providers).");
 
   const rows: Row[] = [];
   rows.push(await runProvider("openai", hasOpenAI));
@@ -274,7 +294,7 @@ async function main() {
     console.log(`  latency range: ${Math.min(...latencies)}–${Math.max(...latencies)}ms across ${ran.length} live provider(s)`);
   }
 
-  console.log(`\n${hardFailures === 0 ? "PASS" : "FAIL"} — ${hardFailures} hard-gate failure(s). Default provider unchanged (openai).`);
+  console.log(`\n${hardFailures === 0 ? "PASS" : "FAIL"} — ${hardFailures} hard-gate failure(s). Default provider is stub when unset outside production (Day 42).`);
   process.exit(hardFailures === 0 ? 0 : 1);
 }
 

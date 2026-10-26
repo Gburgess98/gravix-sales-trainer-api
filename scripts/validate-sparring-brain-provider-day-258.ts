@@ -2,9 +2,9 @@
  * validate-sparring-brain-provider-day-258.ts — Phase 1 (Prospect Brain).
  *
  * Proves the Gravix AI Core `Brain` provider interface behaves safely:
- *  - default provider resolves to openai;
+ *  - default provider resolves to stub (Day 42: no silent paid default);
  *  - the legacy SPARRING_PROVIDER env is honoured, SPARRING_BRAIN_PROVIDER wins;
- *  - an invalid provider resolves safely to openai;
+ *  - an invalid provider resolves safely to stub (never throws per request);
  *  - the stub provider is deterministic and makes NO LLM call (runs with no API
  *    keys present);
  *  - the legacy route path (generateBuyerReply) keeps its response shape;
@@ -40,9 +40,9 @@ async function main() {
   const { generateBuyerReply } = await import("../src/sparring/providers");
   const { STUB_MODEL } = await import("../src/lib/sparringBrain/stubBrain");
 
-  // ── 1. Default provider resolves openai ────────────────────────────────────
+  // ── 1. Default provider resolves stub (Day 42) ────────────────────────────────────
   clearBrainEnv();
-  check("default provider resolves to openai", resolveBrainProvider() === "openai");
+  check("default provider resolves to stub (Day 42: never a silent paid default)", resolveBrainProvider() === "stub");
 
   // ── 2. Legacy env honoured; canonical env wins ─────────────────────────────
   clearBrainEnv();
@@ -51,10 +51,10 @@ async function main() {
   process.env.SPARRING_BRAIN_PROVIDER = "claude";
   check("canonical SPARRING_BRAIN_PROVIDER wins over legacy", resolveBrainProvider() === "claude");
 
-  // ── 3. Invalid provider resolves safely to openai ──────────────────────────
+  // ── 3. Invalid provider resolves safely to stub (Day 42) ──────────────────────────
   clearBrainEnv();
   process.env.SPARRING_BRAIN_PROVIDER = "totally-not-a-provider";
-  check("invalid provider resolves safely to openai", resolveBrainProvider() === "openai");
+  check("invalid provider resolves safely to stub (never throws per request)", resolveBrainProvider() === "stub");
   clearBrainEnv();
 
   // ── 4. Stub is deterministic and needs NO LLM call ─────────────────────────

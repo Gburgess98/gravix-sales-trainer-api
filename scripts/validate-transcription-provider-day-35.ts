@@ -73,7 +73,7 @@ const BOOT_CASES: Array<{ id: string; env: Record<string, string | undefined>; r
 function bootSuite(root: string, stubUrl: string): Check[] {
   const tsx = path.join(ROOT, "node_modules/.bin/tsx");
   return BOOT_CASES.map((c) => {
-    const env: Record<string, string> = { PATH: process.env.PATH || "", HOME: process.env.HOME || "", SUPABASE_URL: stubUrl, SUPABASE_SERVICE_ROLE_KEY: "validator-placeholder", SUPABASE_ANON_KEY: "validator-placeholder", ANTHROPIC_API_KEY: "validator-placeholder", GRAVIX_API_NO_LISTEN: "1" };
+    const env: Record<string, string> = { PATH: process.env.PATH || "", HOME: process.env.HOME || "", SUPABASE_URL: stubUrl, SUPABASE_SERVICE_ROLE_KEY: "validator-placeholder", SUPABASE_ANON_KEY: "validator-placeholder", SPARRING_BRAIN_PROVIDER: "stub" /* Day 42: production also requires an explicit Sparring provider */, ANTHROPIC_API_KEY: "validator-placeholder", GRAVIX_API_NO_LISTEN: "1" };
     for (const [k, v] of Object.entries(c.env)) if (v !== undefined) env[k] = v;
     if (env.OPENAI_API_KEY === undefined) env.OPENAI_API_KEY = "validator-placeholder"; // other modules construct clients at import
     const p = spawnSync(tsx, [__filename, "--boot", root], { env, cwd: EMPTY_CWD, encoding: "utf8", timeout: 60_000 });

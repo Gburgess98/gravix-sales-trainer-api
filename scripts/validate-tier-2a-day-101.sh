@@ -42,7 +42,7 @@ grep -rq "provider_not_configured" "$BRAIN" 2>/dev/null
 check "claude returns not_configured (Day 102 pending)" $?
 
 grep -q "'/sessions/:id/messages'" "$ROUTE" 2>/dev/null
-check "/sessions/:id/messages alias exists" $?
+check "/sessions/:id/messages route registered (closed 410 since Day 42)" $?
 
 grep -q "'/sessions/:id/turns'" "$ROUTE" 2>/dev/null
 check "existing /sessions/:id/turns route intact" $?

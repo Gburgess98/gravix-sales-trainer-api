@@ -257,6 +257,9 @@ function bootSuite(root: string, stubUrl: string): Check[] {
       // contract, proved in validate:transcription-provider); "stub" keeps this
       // matrix about ALLOW_ADMIN_ENDPOINTS only.
       TRANSCRIPTION_PROVIDER: "stub",
+      // Day 42: production likewise requires an explicit Sparring provider (proved in
+      // validate:sparring-safety); "stub" keeps this matrix about ALLOW_ADMIN_ENDPOINTS only.
+      SPARRING_BRAIN_PROVIDER: "stub",
     };
     for (const [k, v] of Object.entries(c.env)) if (v !== undefined) env[k] = v;
     const p = spawnSync(tsx, [__filename, "--boot", root], { env, cwd: EMPTY_CWD, encoding: "utf8", timeout: 60_000 });

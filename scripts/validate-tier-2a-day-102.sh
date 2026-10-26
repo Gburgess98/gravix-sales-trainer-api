@@ -49,7 +49,7 @@ PATCH_REFS=$(grep -c "pendingMetaPatch" "$ROUTE")
 check "micro additions accumulate into the final write" $?
 
 grep -q "'/sessions/:id/messages'" "$ROUTE" 2>/dev/null
-check "/sessions/:id/messages alias intact" $?
+check "/sessions/:id/messages route registered (closed 410 since Day 42)" $?
 
 # Stale build artefacts must not shadow the TS sources
 if ls "$ROOT/src/sparring/"*.js >/dev/null 2>&1; then

@@ -2,9 +2,10 @@ import express, { Request, Response } from 'express';
 import { accessibleRepIds, canAccessRep } from "../lib/repAccess";
 import { v4 as uuidv4 } from 'uuid';
 import { createClient } from '@supabase/supabase-js';
-import OpenAI from 'openai';
 import { getScoringConfig } from "../services/scoringConfig";
 import { completeAssignmentsForTarget } from "../lib/assignmentsComplete";
+import { resolveCallerHierarchy } from "../lib/callerHierarchy";
+import { sparringLimiter, validateTurnText, SPARRING_LIMITS } from "../lib/sparringLimits";
 import {
   getPersonaConfig,
   buildPersonaBehaviourSummary,
@@ -30,10 +31,6 @@ const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const supa = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
-});
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY!,
 });
 
 // -------------------------
@@ -794,14 +791,23 @@ function getNextStackedObjection(opts: {
   return remaining[Math.floor(Math.random() * remaining.length)];
 }
 
-function getUserIdHeader(req: Request): string {
-  // Day 26 (G1): the identity resolved by the global middleware (trusted proxy
-  // header or verified Bearer token) — never a raw, possibly spoofed header.
+// Day 42 (G3): the ONLY identity a Sparring route may act as is the one resolved by the
+// global middleware (verified Bearer token or secret-checked proxy header). No body repId,
+// no dev fallback. Returns null when absent so the route answers a stable 401.
+function callerId(req: Request): string | null {
   const raw = String((req as any).userId || '').trim();
-  if (!raw) {
-    throw new Error('missing x-user-id header');
-  }
-  return raw;
+  return raw || null;
+}
+
+const sparringDeny = (res: Response, code: number, error: string, extra: Record<string, unknown> = {}) =>
+  res.status(code).json({ ok: false, error, ...extra });
+
+function rateLimited(res: Response, userId: string, scope: 'sessions' | 'turns' | 'score'): boolean {
+  const r = sparringLimiter.hit(userId, scope);
+  if (r.ok) return false;
+  res.setHeader('Retry-After', String(r.retryAfterSec));
+  sparringDeny(res, 429, 'sparring_rate_limited', { scope });
+  return true;
 }
 
 // Day 26 (G2): a caller may only touch sessions owned by themselves or, for
@@ -819,22 +825,6 @@ async function requireSessionAccess(req: Request, res: Response, sessionId: stri
     return false;
   }
   return true;
-}
-
-function getOrgIdFromRequest(req: Request): string | null {
-  const headerOrg = (req.headers['x-org-id'] as string | undefined)?.toString().trim();
-  if (headerOrg) return headerOrg;
-
-  const bodyOrg =
-    typeof (req.body as any)?.orgId === 'string'
-      ? String((req.body as any).orgId).trim()
-      : '';
-  if (bodyOrg) return bodyOrg;
-
-  const fallbackOrg = String(process.env.DEFAULT_ORG_ID || '').trim();
-  if (fallbackOrg) return fallbackOrg;
-
-  return null;
 }
 
 const DEFAULT_TEAM_SETTINGS_SNAPSHOT = {
@@ -2008,149 +1998,40 @@ router.get("/leaderboard/:personaId", async (req, res) => {
  * - If a table is missing, it returns ok:true with a warning.
  * - Writes are attempted independently, errors collected in warnings[].
  */
-router.post('/log', express.json(), async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
-
-  const { repId, xp, meta, personaId } = req.body ?? {};
-  const orgId = (req.header('x-org-id') || (req.body && req.body.orgId) || '').toString().trim();
-
-  const award = Number.isFinite(xp) ? Number(xp) : 25;
-  const rep_id: string | null = typeof repId === 'string' && repId.length ? repId : null;
-  // Day 26 (G2): XP may only be logged for the caller or a rep they manage.
-  if (!rep_id || !(await canAccessRep((req as any).userId, rep_id))) {
-    return res.status(403).json({ ok: false, error: 'forbidden_rep_scope' });
-  }
-  const persona_id: string = (typeof personaId === 'string' && personaId.trim().length) ? personaId.trim() : 'unknown';
-
-  const session_id = uuidv4();
-  const warnings: string[] = [];
-  const nowIso = new Date().toISOString();
-
-  // Ensure rep exists to satisfy FK on sparring_sessions.rep_id
-  if (rep_id) {
-    try {
-      const { error: repUpsertErr } = await supa
-        .from('reps')
-        .upsert([{ id: rep_id, name: 'Rep' }], { onConflict: 'id', ignoreDuplicates: false });
-      if (repUpsertErr) {
-        // Non-fatal; continue but warn
-        // (If table doesn't exist yet, this will be collected in warnings)
-        warnings?.push?.(`reps upsert: ${repUpsertErr.message}`);
-      }
-    } catch (e: any) {
-      warnings?.push?.(`reps upsert threw: ${e?.message ?? String(e)}`);
-    }
-  }
-
-  // 1) Insert sparring session (if table exists)
-  try {
-    const { error } = await supa
-      .from('sparring_sessions')
-      .insert({
-        id: session_id,
-        rep_id,
-        persona_id,       // <-- persona persisted
-        xp_awarded: award,
-        meta: meta ?? null,
-        created_at: nowIso,
-      } as any);
-    if (error) {
-      // Table may not exist yet — keep tolerant
-      warnings.push(`sparring_sessions insert: ${error.message}`);
-    }
-  } catch (e: any) {
-    warnings.push(`sparring_sessions insert threw: ${e?.message ?? String(e)}`);
-  }
-
-  // 2) Insert XP event (if table exists) — ties to rep
-  if (rep_id) {
-    try {
-      const { error } = await supa
-        .from('xp_events')
-        .insert({
-          id: uuidv4(),
-          rep_id,                    // match actual schema column
-          source: 'sparring',
-          delta: award,
-          amount: award,
-          session_id,
-          created_at: nowIso,
-        } as any);
-      if (error) warnings.push(`xp_events insert: ${error.message}`);
-    } catch (e: any) {
-      warnings.push(`xp_events insert threw: ${e?.message ?? String(e)}`);
-    }
-
-    // 3) Increment reps.xp (if column exists)
-    try {
-      const { error } = await supa.rpc('increment_rep_xp', { p_rep_id: rep_id, p_delta: award });
-      if (error) {
-        warnings.push(`increment_rep_xp rpc: ${error.message}`);
-      }
-    } catch (e: any) {
-      warnings.push(`increment_rep_xp threw: ${e?.message ?? String(e)}`);
-    }
-  } else {
-    warnings.push('No repId provided — recorded session without pinning XP to a rep.');
-  }
-
-  // 4) Activity log — only if explicitly enabled AND we have an org id.
-  // Toggle with env var SPAR_ACTIVITY_LOG=1 to avoid type check constraint until schema includes 'sparring_session'.
-  if (orgId && process.env.SPAR_ACTIVITY_LOG === '1') {
-    try {
-      const { error } = await supa
-        .from('activities')
-        .insert({
-          id: uuidv4(),
-          org_id: orgId,
-          type: 'sparring_session', // add this to activities_type_check in DB before enabling
-          actor_user_id: rep_id,
-          call_id: null,
-          payload: {
-            session_id,
-            xp_awarded: award,
-            source: 'sparring',
-          },
-          created_at: nowIso,
-        } as any);
-
-      if (error) warnings.push(`activities insert: ${error.message}`);
-    } catch (e: any) {
-      warnings.push(`activities insert threw: ${e?.message ?? String(e)}`);
-    }
-  }
-
-  return res.status(200).json({
-    ok: true,
-    session_id,
-    rep_id,
-    persona_id,
-    xp_awarded: award,
-    warnings,
-  });
-});
-
+router.post('/log', (_req, res) =>
+  // Day 42 (G2/F-41-5): CLOSED. It trusted client-supplied `xp` and `orgId`, wrote xp_events and
+  // activities for any scoped rep, and had no WEB consumer. XP is only ever awarded server-side
+  // (assignment completion). Still behind default-deny (anonymous => 401).
+  sparringDeny(res, 410, 'route_removed')
+);
 
 // --- Score endpoint (safe heuristic scorer) ---
 // Supports two modes:
-// 1) Persist mode: { sessionId, total?, meta?, durationMs?, turns? }
+// 1) Persist mode: { sessionId, assignmentId? } — Day 42 (G4): score, XP, duration and turn
+//    count are DERIVED on the server from stored session/turn state; any client `total`,
+//    `meta`, `durationMs`, `turns`, XP or org field is ignored.
 // 2) Mock mode: { transcript, personaId } → returns ephemeral scoring only
 // --- Score endpoint (safe heuristic scorer) ---
 // Supports two modes:
-// 1) Persist mode: { sessionId, total?, meta?, durationMs?, turns? }
+// 1) Persist mode: { sessionId, assignmentId? } — Day 42 (G4): score, XP, duration and turn
+//    count are DERIVED on the server from stored session/turn state; any client `total`,
+//    `meta`, `durationMs`, `turns`, XP or org field is ignored.
 // 2) Mock mode: { transcript, personaId } → returns ephemeral scoring only
 router.post("/score", express.json(), async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
 
   try {
     const body = (req.body || {}) as any;
-    const { sessionId, total, meta, durationMs, turns } = body;
+    const { sessionId } = body;
 
     // -----------------------------
     // MODE 1 — REAL SESSION SCORING
     // -----------------------------
     if (typeof sessionId === "string" && sessionId.trim().length) {
       if (!(await requireSessionAccess(req, res, sessionId.trim()))) return;
+      const scorer = callerId(req);
+      if (!scorer) return sparringDeny(res, 401, 'unauthenticated');
+      if (rateLimited(res, scorer, 'score')) return;
       ; (global as any).__last_completed_count = 0;
       ; (global as any).__last_xp_awarded_total = 0;
       const { data: row, error: selErr } = await supa
@@ -2164,34 +2045,29 @@ router.post("/score", express.json(), async (req, res) => {
       if (selErr || !row) {
         return res.status(400).json({
           ok: false,
-          error: `session select failed: ${selErr?.message || "not_found"}`,
+          error: "session_score_failed",
         });
       }
 
       const difficulty = getDifficultyFromRow(row);
       const mode = getModeFromRow(row);
 
-      let numericTotal: number;
-      if (typeof total === "number" && Number.isFinite(total)) {
-        numericTotal = clampScore(total);
-      } else if (typeof (row as any).total_score === "number") {
-        numericTotal = clampScore((row as any).total_score);
-      } else if (typeof row.meta?.total === "number") {
-        numericTotal = clampScore(row.meta.total);
-      } else {
-        let base = 70 + Math.floor(Math.random() * 11);
-        if (difficulty === "easy") base += 5;
-        if (difficulty === "hard") base -= 5;
-        if (difficulty === "nightmare") base -= 10;
-        numericTotal = clampScore(base);
-      }
+      // Day 42 (G4): derive the score from STORED turn scores (the same deterministic
+      // summary /complete uses). A session with no scored turns earns 0 and no XP.
+      const storedMeta = (row.meta && typeof row.meta === "object" ? row.meta : {}) as any;
+      const derived = buildSparringSessionSummary({
+        turnScores: Array.isArray(storedMeta.turn_scores) ? storedMeta.turn_scores : [],
+        failedMoments: Array.isArray(storedMeta.failed_moments) ? storedMeta.failed_moments : [],
+      });
+      const hasScoredTurns = derived.turnCount > 0;
+      let numericTotal: number = hasScoredTurns ? clampScore(derived.overall) : 0;
 
       const baseBeforeEmotion = numericTotal;
 
       const emotional =
         (row.meta?.emotional_state as EmotionalState | undefined) ?? null;
 
-      if (emotional) {
+      if (emotional && hasScoredTurns) {
         if (emotional.trust >= 70) numericTotal += 5;
         if (emotional.anger >= 70) numericTotal -= 10;
         if (emotional.boredom >= 70) numericTotal -= 8;
@@ -2200,7 +2076,7 @@ router.post("/score", express.json(), async (req, res) => {
       const ended = (row.meta as any)?.ended || false;
       const endReason = (row.meta as any)?.end_reason || null;
 
-      if (ended && endReason) {
+      if (ended && endReason && hasScoredTurns) {
         if (endReason === "closed") numericTotal += 8;
         else if (endReason === "angry") numericTotal -= 20;
         else if (endReason === "bored") numericTotal -= 15;
@@ -2210,7 +2086,7 @@ router.post("/score", express.json(), async (req, res) => {
       numericTotal = clampScore(numericTotal);
 
       const outcome = computeOutcomeFromScore(numericTotal);
-      const xpAwarded = computeXpForScore(numericTotal, difficulty, mode);
+      const xpAwarded = hasScoredTurns ? computeXpForScore(numericTotal, difficulty, mode) : 0;
 
       // ---- apply streak multiplier + comeback bonus ----
       // IMPORTANT: multiplier is derived from CURRENT streak (not cached xp_multiplier)
@@ -2264,7 +2140,6 @@ router.post("/score", express.json(), async (req, res) => {
       const alreadyCommitted = Boolean((existingMeta as any)?.xp_committed);
       const mergedMeta = {
         ...existingMeta,
-        ...(meta || {}),
         total: numericTotal,
         base_total: baseBeforeEmotion,
         difficulty,
@@ -2284,16 +2159,13 @@ router.post("/score", express.json(), async (req, res) => {
         xp_committed_at: (existingMeta as any)?.xp_committed_at ?? null,
       };
 
-      let finalDuration =
-        typeof durationMs === "number" ? durationMs : row.duration_ms ?? null;
-
-      let finalTurns =
-        typeof turns === "number" ? turns : row.turns ?? null;
+      let finalDuration: number | null = row.duration_ms ?? null;
+      let finalTurns: number | null = row.turns ?? null;
 
       let summary = row.summary ?? null;
       const flags = row.flags ?? null;
 
-      if (finalDuration == null || finalTurns == null || !summary) {
+      { // Day 42: always re-derive from stored turns (never from the request)
         try {
           const { data: turnRows } = await supa
             .from("sparring_turns")
@@ -2302,9 +2174,9 @@ router.post("/score", express.json(), async (req, res) => {
             .order("created_at", { ascending: true });
 
           if (Array.isArray(turnRows) && turnRows.length > 0) {
-            if (finalTurns == null) finalTurns = turnRows.length;
+            finalTurns = turnRows.length;
 
-            if (finalDuration == null && turnRows.length > 1) {
+            if (turnRows.length > 1) {
               const first = new Date(turnRows[0].created_at).getTime();
               const last = new Date(
                 turnRows[turnRows.length - 1].created_at
@@ -2339,10 +2211,7 @@ router.post("/score", express.json(), async (req, res) => {
 
       if (updErr) {
         console.error("[sparring.score] update failed", updErr);
-        return res.status(500).json({
-          ok: false,
-          error: `score update failed: ${updErr?.message || "unknown"}`,
-        });
+        return sparringDeny(res, 500, "score_update_failed");
       }
 
 
@@ -2356,10 +2225,7 @@ router.post("/score", express.json(), async (req, res) => {
 
       if (fetchErr || !updatedRow) {
         console.error("[sparring.score] post-update select failed", fetchErr);
-        return res.status(500).json({
-          ok: false,
-          error: `score select failed: ${fetchErr?.message || "unknown"}`,
-        });
+        return sparringDeny(res, 500, "score_select_failed");
       }
 
 
@@ -2376,7 +2242,7 @@ router.post("/score", express.json(), async (req, res) => {
         const safeAssignmentId = isUuid(rawAssignmentId) ? rawAssignmentId : "";
 
         // Safe guardrails: only attempt if we have a real rep id
-        if (repIdForAssign && repIdForAssign.length > 10) {
+        if (hasScoredTurns && repIdForAssign && repIdForAssign.length > 10) {
           console.info("[assignments:lifecycle]", {
             event: "auto_complete_attempt",
             via: "sparring",
@@ -2497,10 +2363,7 @@ router.post("/score", express.json(), async (req, res) => {
     });
   } catch (e: any) {
     console.error("[sparring.score] exception", e);
-    return res.status(500).json({
-      ok: false,
-      error: e?.message || "score_failed",
-    });
+    return sparringDeny(res, 500, "score_failed");
   }
 });
 
@@ -2512,23 +2375,11 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
   res.setHeader('Cache-Control', 'no-store');
 
   try {
-    // 1) Work out who the rep is
-    let repId: string | null = null;
-    try {
-      // Preferred: Supabase user id via proxy
-      repId = getUserIdHeader(req);
-    } catch {
-      const bodyRep = (req.body as any)?.repId;
-      if (typeof bodyRep === 'string' && bodyRep.trim().length) {
-        repId = bodyRep.trim();
-      }
-    }
-
-    const DEV_REP_ID =
-      process.env.DEV_REP_ID || '11111111-1111-1111-8111-111111111111';
-
-    // If we still don't have a repId (e.g. local curl), fall back to dev rep
-    const effectiveRepId = repId || DEV_REP_ID;
+    // 1) Work out who the rep is — the VERIFIED caller only (Day 42, G3).
+    // No body repId, no dev-rep fallback, no raw org header: client-supplied identity or
+    // hierarchy fields are ignored entirely.
+    const effectiveRepId = callerId(req);
+    if (!effectiveRepId) return sparringDeny(res, 401, 'unauthenticated');
 
     const {
       personaId,
@@ -2537,7 +2388,7 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
       targetDurationSec,
       assignmentId,
       assignment
-    } = req.body as {
+    } = (req.body ?? {}) as {
       personaId?: string;
       difficulty?: string;
       mode?: string;
@@ -2546,26 +2397,28 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
       assignment?: any;
     };
 
-    const orgId = getOrgIdFromRequest(req);
+    if (rateLimited(res, effectiveRepId, 'sessions')) return;
+
+    // Canonical identity: the rep must already exist (never fabricated), and its tenant
+    // hierarchy comes from the Day-39 resolver (reps first, users only fills gaps).
+    const repLookup = await supa.from('reps').select('id').eq('id', effectiveRepId).maybeSingle();
+    if (repLookup.error) return sparringDeny(res, 503, 'hierarchy_lookup_failed');
+    if (!repLookup.data) return sparringDeny(res, 422, 'sparring_rep_profile_missing');
+    const hier = await resolveCallerHierarchy(supa as any, effectiveRepId, {
+      defaultOrgId: process.env.DEFAULT_ORG_ID || null,
+    });
+    if (!hier.ok) {
+      return hier.error === 'hierarchy_lookup_failed'
+        ? sparringDeny(res, 503, 'hierarchy_lookup_failed')
+        : sparringDeny(res, 422, 'sparring_hierarchy_incomplete');
+    }
+    const orgId = hier.hierarchy.org_id;
+    const requesterUser = { company_id: hier.hierarchy.company_id, office_id: hier.hierarchy.office_id };
     const teamSettingsSnapshot = await loadTeamSettingsSnapshot(orgId);
 
-    let requesterUser: any = null;
-
-    try {
-      const { data } = await supa
-        .from("users")
-        .select("company_id, office_id")
-        .eq("id", effectiveRepId)
-        .maybeSingle();
-
-      requesterUser = data || null;
-    } catch (e) {
-      console.warn("[sparring] failed loading requester user", e);
-    }
-
     const companyProfile = await loadCompanyPersonaProfile({
-      companyId: requesterUser?.company_id || null,
-      officeId: requesterUser?.office_id || null,
+      companyId: requesterUser.company_id,
+      officeId: requesterUser.office_id,
     });
 
     const adaptiveDifficulty = computeAdaptiveDifficulty({
@@ -2588,21 +2441,8 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
       console.warn("[scenario_builder_failed]", e);
     }
 
-    // 2) Make sure the rep exists to satisfy FK (reps.id)
-    try {
-      const { error: repUpsertErr } = await supa
-        .from('reps')
-        .upsert(
-          [{ id: effectiveRepId, name: 'Rep' }],
-          { onConflict: 'id', ignoreDuplicates: false }
-        );
-      if (repUpsertErr) {
-        console.warn('[sparring/sessions POST] reps upsert warning', repUpsertErr);
-        // non-fatal – session insert may still succeed if FK not enforced
-      }
-    } catch (e: any) {
-      console.warn('[sparring/sessions POST] reps upsert threw', e?.message || e);
-    }
+    // 2) (Day 42) No reps upsert: an existing canonical rep is never overwritten and a
+    //    missing one is refused above — identity is never fabricated here.
 
     // 3) Insert the new session
     const payload: any = {
@@ -2617,8 +2457,8 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
         requested_difficulty: difficulty || "normal",
         adaptive_difficulty: adaptiveDifficulty,
 
-        company_id: requesterUser?.company_id || null,
-        office_id: requesterUser?.office_id || null,
+        company_id: requesterUser.company_id,
+        office_id: requesterUser.office_id,
 
         buyer_style:
           companyProfile.buyer_style ||
@@ -2700,9 +2540,9 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
       if (cols.sessions) {
         payload.assignment_id =
           typeof assignmentId === "string" && isUuid(assignmentId) ? assignmentId : null;
-        payload.org_id = orgId || null;
-        payload.company_id = requesterUser?.company_id || null;
-        payload.office_id = requesterUser?.office_id || null;
+        payload.org_id = orgId;
+        payload.company_id = requesterUser.company_id;
+        payload.office_id = requesterUser.office_id;
         payload.status = "active";
         payload.state = payload.meta.state;
       }
@@ -2720,15 +2560,13 @@ router.post('/sessions', express.json(), async (req: Request, res: Response) => 
 
     if (error || !data) {
       console.error('[sparring/sessions POST] insert error', error);
-      throw error || new Error('insert_failed');
+      return sparringDeny(res, 400, 'session_create_failed');
     }
 
     return res.json({ ok: true, session: data });
   } catch (err: any) {
     console.error('[sparring/sessions POST] unexpected error', err);
-    return res
-      .status(400)
-      .json({ ok: false, error: err?.message || 'bad_request' });
+    return sparringDeny(res, 400, 'session_create_failed');
   }
 });
 
@@ -2745,25 +2583,18 @@ router.post(
 
     try {
       const id = String(req.params.id);
-      const { text } = (req.body ?? {}) as { text?: string };
 
-      if (!text || typeof text !== 'string' || !text.trim()) {
-        return res
-          .status(400)
-          .json({ ok: false, error: 'text_required' });
-      }
+      // Day 42 (G3/G5): verified caller only; message validated and rate-limited BEFORE any
+      // read, write or provider call.
+      const repId = callerId(req);
+      if (!repId) return sparringDeny(res, 401, 'unauthenticated');
 
-      let repId: string | null = null;
-      try {
-        repId = getUserIdHeader(req);
-      } catch {
-        const bodyRep = (req.body as any)?.repId;
-        if (typeof bodyRep === 'string' && bodyRep.trim().length) {
-          repId = bodyRep.trim();
-        }
-      }
+      const checked = validateTurnText((req.body ?? {}).text);
+      if (!checked.ok) return sparringDeny(res, 400, checked.error);
+      const text = checked.text;
+      if (rateLimited(res, repId, 'turns')) return;
 
-      // 1) Load session and basic access check
+      // 1) Load session and ownership check (only the owner may take turns)
       const { data: session, error: sessErr } = await supa
         .from('sparring_sessions')
         .select('id, rep_id, persona_id, difficulty, meta')
@@ -2775,11 +2606,7 @@ router.post(
         return res.status(404).json({ ok: false, error: 'not_found' });
       }
 
-      if (
-        repId &&
-        session.rep_id &&
-        session.rep_id !== repId
-      ) {
+      if (!session.rep_id || session.rep_id !== repId) {
         return res.status(403).json({ ok: false, error: 'forbidden' });
       }
 
@@ -2806,6 +2633,12 @@ router.post(
       if (turnsErr) {
         console.error('[sparring/turns] load turns error', turnsErr);
         throw turnsErr;
+      }
+
+      // Day 42 (G5): bounded session length — refused before the provider is called.
+      const userTurnsSoFar = (existingTurns ?? []).filter((t: any) => t.role !== 'assistant').length;
+      if (userTurnsSoFar >= SPARRING_LIMITS.maxUserTurnsPerSession) {
+        return sparringDeny(res, 409, 'session_turn_limit');
       }
 
       const history = (existingTurns ?? []).map((t: any) => ({
@@ -2922,6 +2755,7 @@ router.post(
 
       // 4) Decide whether the buyer should "hang up" before calling OpenAI
       let aiText = "";
+      let aiProvenance: { provider: string; fallback: boolean } | null = null;
       let endedThisTurn = false;
       let endReason: "bored" | "angry" | "timeout" | "closed" | null = null;
 
@@ -3016,6 +2850,7 @@ INSTRUCTIONS:
             difficulty: difficultyVal,
           });
           aiText = reply.text;
+          aiProvenance = { provider: String(reply.provider), fallback: !!reply.fallback };
         } catch (llmErr: any) {
           console.error("[sparring/turns] buyer reply error", llmErr);
           aiText =
@@ -3265,29 +3100,23 @@ INSTRUCTIONS:
         state: finalBrainState,
         // TIER 2A Day 103 — structured turn score (additive)
         turnScore: structuredScore,
+        // Day 42 (F-41-2): non-secret provenance of the buyer reply (null for canned hang-up lines)
+        ai_provider: aiProvenance,
       });
     } catch (err: any) {
       console.error(
         'POST /v1/sparring/sessions/:id/turns unexpected error',
         err
       );
-      return res
-        .status(400)
-        .json({ ok: false, error: err?.message || 'bad_request' });
+      return sparringDeny(res, 400, 'turn_failed');
     }
   }
 );
 
-// TIER 2A Day 101 — alias: POST /v1/sparring/sessions/:id/messages
-// Same behaviour as /turns (the Tier 2A canonical name). Express re-dispatch
-// keeps a single handler without restructuring the existing registration.
-router.post(
-  '/sessions/:id/messages',
-  express.json(),
-  (req: Request, res: Response, next) => {
-    req.url = `/sessions/${req.params.id}/turns`;
-    (router as any).handle(req, res, next);
-  }
+// Day 42 (G2): the Tier 2A `/messages` alias had no WEB/runtime consumer and is CLOSED (410).
+// `/turns` is the only turn route. Still behind default-deny (anonymous => 401).
+router.post('/sessions/:id/messages', (_req: Request, res: Response) =>
+  sparringDeny(res, 410, 'route_removed')
 );
 
 // -----------------------------------------
@@ -3309,13 +3138,8 @@ router.post(
       const id = String(req.params.id || "").trim();
       if (!isUuid(id)) return res.status(400).json({ ok: false, error: "invalid_id" });
 
-      let repId: string | null = null;
-      try {
-        repId = getUserIdHeader(req);
-      } catch {
-        const bodyRep = (req.body as any)?.repId;
-        if (typeof bodyRep === "string" && bodyRep.trim().length) repId = bodyRep.trim();
-      }
+      const repId = callerId(req);
+      if (!repId) return sparringDeny(res, 401, 'unauthenticated');
 
       const { data: session, error: sessErr } = await supa
         .from("sparring_sessions")
@@ -3326,7 +3150,7 @@ router.post(
       if (sessErr || !session) {
         return res.status(404).json({ ok: false, error: "not_found" });
       }
-      if (repId && session.rep_id && session.rep_id !== repId) {
+      if (!session.rep_id || session.rep_id !== repId) {
         return res.status(403).json({ ok: false, error: "forbidden" });
       }
 
@@ -3365,14 +3189,15 @@ router.post(
           const rawAssignment = String(meta.assignment_id || "").trim();
           if (isUuid(rawAssignment)) completeUpdate.assignment_id = rawAssignment;
 
-          const { data: repUser } = await supa
-            .from("users")
-            .select("company_id, office_id")
-            .eq("id", session.rep_id)
-            .maybeSingle();
-          if (repUser) {
-            completeUpdate.company_id = (repUser as any).company_id || null;
-            completeUpdate.office_id = (repUser as any).office_id || null;
+          // Day 42 (G3): the canonical resolver (reps first). An unresolvable owner leaves
+          // the columns the session was created with untouched — never nulled.
+          const ownerHier = await resolveCallerHierarchy(supa as any, String(session.rep_id), {
+            defaultOrgId: process.env.DEFAULT_ORG_ID || null,
+          });
+          if (ownerHier.ok) {
+            completeUpdate.org_id = ownerHier.hierarchy.org_id;
+            completeUpdate.company_id = ownerHier.hierarchy.company_id;
+            completeUpdate.office_id = ownerHier.hierarchy.office_id;
           }
         }
       } catch (e: any) {
@@ -3423,7 +3248,7 @@ router.post(
       return res.json({ ok: true, summary, assignmentCompleted });
     } catch (err: any) {
       console.error("POST /v1/sparring/sessions/:id/complete error", err);
-      return res.status(400).json({ ok: false, error: err?.message || "bad_request" });
+      return sparringDeny(res, 400, "complete_failed");
     }
   }
 );
@@ -3632,6 +3457,10 @@ router.post(
         existingAttempts: replayAttempts,
       });
 
+      const replayCaller = callerId(req);
+      if (!replayCaller) return sparringDeny(res, 401, 'unauthenticated');
+      if (rateLimited(res, replayCaller, 'sessions')) return;
+
       const newSessionId = uuidv4();
 
       const newMeta = {
@@ -3662,6 +3491,10 @@ router.post(
           persona_id: sourceSession.persona_id,
           difficulty: sourceSession.difficulty,
           meta: newMeta,
+          // Day 42 (G3): a replay keeps the source session's canonical tenant stamps.
+          ...(sourceSession.org_id ? { org_id: sourceSession.org_id } : {}),
+          ...(sourceSession.company_id ? { company_id: sourceSession.company_id } : {}),
+          ...(sourceSession.office_id ? { office_id: sourceSession.office_id } : {}),
         })
         .select("*")
         .single();
@@ -3976,26 +3809,10 @@ router.get('/sessions/:id', async (req: Request, res: Response) => {
   }
 });
 
-router.post("/analyse-turn", async (req, res) => {
-  const { text } = req.body || {};
-  if (!text) return res.json({ ok: false, error: "text_required" });
-
-  const prompt = `
-Classify this buyer message into:
-- sentiment: positive | neutral | negative
-- intent: curious | buying | resisting | frustrated
-- category: price | timing | authority | confusion | none
-Text: "${text}"
-Return JSON ONLY.
-`;
-
-  const r = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [{ role: "user", content: prompt }],
-    max_tokens: 80
-  });
-
-  return res.json({ ok: true, label: r.choices[0].message.content });
-});
+router.post("/analyse-turn", (_req, res) =>
+  // Day 42 (G2/F-41-1): CLOSED. It called OpenAI directly (ignoring SPARRING_*) for any signed-in
+  // caller and had no WEB consumer. Still behind default-deny (anonymous => 401).
+  sparringDeny(res, 410, 'route_removed')
+);
 
 export default router;

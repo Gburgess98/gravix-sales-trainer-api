@@ -22,6 +22,7 @@ import { assertProductionAdminFlagUnset } from "./productionConfig";
 import { resolveCallerHierarchy } from "./lib/callerHierarchy";
 import { recordScorePostedActivity } from "./lib/scoreActivity";
 import { storagePathOwnedBy } from "./lib/callStoragePath";
+import { assertSparringProviderConfig, describeSparringProvider } from "./lib/sparringProvider";
 import { assertTranscriptionProviderConfig, resolveTranscriptionProvider, describeTranscriptionProvider } from "./lib/transcriptionProvider";
 import { requireSuperAdmin } from "./middleware/requireSuperAdmin";
 import { accessibleRepIds, canAccessRep } from "./lib/repAccess";
@@ -1051,6 +1052,9 @@ app.get("/v1/version", (_req, res) => {
     app_env: process.env.APP_ENV || null,
     // Day 35: resolved transcription provider (non-secret; independent of `scoring`).
     transcription_provider: describeTranscriptionProvider(),
+    // Day 42 (F-41-2): resolved Sparring buyer provider label (non-secret; independent of
+    // scoring/transcription). "unresolved" means the configuration would refuse to boot.
+    sparring: { provider: describeSparringProvider() },
     scoring: {
       contract: resolveScoringContract(),
       provider: resolveScoringProvider(),
@@ -2153,6 +2157,8 @@ export { app };
 assertProductionAdminFlagUnset(process.env);
 // Day 35 (F-34-1): a valid, explicit transcription provider before anything listens.
 assertTranscriptionProviderConfig(process.env);
+// Day 42 (F-41-2): an explicit Sparring provider (never a silent paid default) before listen.
+assertSparringProviderConfig(process.env);
 if (process.env.GRAVIX_API_NO_LISTEN !== "1") {
   const port = Number(process.env.PORT || 4000);
   app.listen(port, () => console.log(`🚀 Gravix API listening on :${port}`));

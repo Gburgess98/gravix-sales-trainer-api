@@ -2,7 +2,9 @@
 // Gravix AI Core — Prospect Brain public surface + provider router.
 //
 // Selection is configuration (architecture §5.2): SPARRING_BRAIN_PROVIDER
-// (canonical), falling back to the legacy SPARRING_PROVIDER, default "openai".
+// (canonical), falling back to the legacy SPARRING_PROVIDER. Day 42: the contract lives in
+// ../sparringProvider (non-production default "stub"; production must be explicit; a paid
+// provider needs its key) — the router itself never defaults to a paid provider.
 // The router owns the fallback chain and provenance; it NEVER throws — the worst
 // case is a deterministic stub line, so a sparring turn cannot crash on provider
 // availability (architecture §5.5).
@@ -16,6 +18,7 @@ import type {
 import { openaiBrain } from "./openaiBrain";
 import { claudeBrain } from "./claudeBrain";
 import { stubBrain, STUB_MODEL } from "./stubBrain";
+import { resolveSparringProvider } from "../sparringProvider";
 
 export type {
   BrainProvider,
@@ -32,27 +35,19 @@ const PROVIDERS: Record<BrainProviderName, BrainProvider> = {
   stub: stubBrain,
 };
 
-const DEFAULT_PROVIDER: BrainProviderName = "openai";
-
-function isBrainProviderName(v: string): v is BrainProviderName {
-  return v === "openai" || v === "claude" || v === "stub";
-}
 
 /**
- * Resolve the configured Brain provider. Canonical env is
- * SPARRING_BRAIN_PROVIDER; the legacy SPARRING_PROVIDER is honoured for
- * backward compatibility. Anything unset or invalid resolves to "openai",
- * matching the existing safety convention (never crash on misconfiguration).
+ * Resolve the configured Brain provider through the explicit Day-42 contract
+ * (../sparringProvider). Boot already refuses an invalid/unset-in-production
+ * configuration; this per-request call must still never throw or pick a paid
+ * provider by accident, so any resolution error degrades to the no-egress "stub".
  */
 export function resolveBrainProvider(): BrainProviderName {
-  const raw = String(
-    process.env.SPARRING_BRAIN_PROVIDER ||
-      process.env.SPARRING_PROVIDER ||
-      DEFAULT_PROVIDER
-  )
-    .trim()
-    .toLowerCase();
-  return isBrainProviderName(raw) ? raw : DEFAULT_PROVIDER;
+  try {
+    return resolveSparringProvider(process.env);
+  } catch {
+    return "stub";
+  }
 }
 
 /**
