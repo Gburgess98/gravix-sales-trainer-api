@@ -24,7 +24,7 @@
  *   • Refuses to run unless APP_ENV=staging AND the Supabase project ref equals
  *     EXPECTED_STAGING_SUPABASE_REF (and differs from PROD_SUPABASE_REF if given).
  *   • Never prints the password, any bearer token, or the service-role key.
- *   • All data is synthetic (0000…-2711 org/company, controlled *.invalid email).
+ *   • All data is synthetic (00000000-2711-4000-8000-… org/company, controlled *.invalid email).
  *   • Production and customer identities are never touched (guard + synthetic ids).
  *
  * ENV
@@ -49,16 +49,14 @@
 
 import "dotenv/config";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { STAGING_TENANT_IDS, STAGING_FIXTURE_CALL_IDS } from "./staging-tenant-ids";
 
 // ── synthetic staging tenant (MUST match sql/seed/staging-day272-fixtures.sql) ──
 
 export const STAGING_TENANT = {
-  tmcId: "00000000-2711-0000-0000-000000000001",
-  orgId: "00000000-2711-0000-0000-000000000002",
-  companyId: "00000000-2711-0000-0000-000000000003",
+  ...STAGING_TENANT_IDS,
   // Day-272 synthetic call fixtures (owner is pure tenant data, no auth FK):
-  stubProofCallId: "00000000-2722-4000-8000-000000000001",
-  v1FallbackCallId: "00000000-2722-4000-8000-000000000002",
+  ...STAGING_FIXTURE_CALL_IDS,
 } as const;
 
 export const DEFAULT_QA_EMAIL = "staging-qa@gravix.invalid";

@@ -28,8 +28,8 @@ if (process.env.APP_ENV !== "staging" || ref !== process.env.EXPECTED_STAGING_SU
 }
 if (!key || !anon || !PW) { console.error("Missing SUPABASE_SERVICE_ROLE_KEY / SUPABASE_ANON_KEY / STAGING_QA_PASSWORD"); process.exit(1); }
 
-const ORG = "00000000-2711-0000-0000-000000000002";
-const COMPANY = "00000000-2711-0000-0000-000000000003";
+const ORG = "00000000-2711-4000-8000-000000000002";
+const COMPANY = "00000000-2711-4000-8000-000000000003";
 const ACCOUNT_ID = "00000000-2833-4000-8000-000000000001"; // synthetic, deterministic → easy cleanup
 const s = createClient(url, key, { auth: { persistSession: false } });
 const cleanup = process.argv.includes("--cleanup");

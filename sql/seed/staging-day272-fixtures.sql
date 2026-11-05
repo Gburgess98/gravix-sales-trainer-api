@@ -1,6 +1,11 @@
 -- Day 271 — SYNTHETIC staging fixtures for the Day-272 Scoring v2 stub proof.
 -- STAGING ONLY. Do NOT run against production. All data below is synthetic
 -- (deterministic 0000…-2711/2722 UUIDs, no real customer/user/email/recording).
+--
+-- Tenant ids (RFC-4122 valid): 00000000-2711-4000-8000-… (version 4, variant 8). The original Day-272 ids
+-- (00000000-2711-0000-0000-…, nibbles 0/0) are rejected by the API's strict UUID predicate (`Missing or invalid
+-- x-org-id`). Existing staging databases are moved with sql/staging/20261105_repair_staging_tenant_uuids.sql; this seed
+-- is for fresh/rebuilt staging databases and must never write the old ids. Single source: scripts/staging-tenant-ids.ts.
 -- Idempotent: safe to re-run. No secrets.
 --
 -- Day 273 — This seed no longer writes auth.users directly. Hand-crafted
@@ -34,16 +39,16 @@ delete from public.calls
 
 -- Tenant / org / company hierarchy -------------------------------------------
 insert into public.tmcs (id, name, slug)
-values ('00000000-2711-0000-0000-000000000001', 'Gravix Staging TMC', 'gravix-staging-tmc')
+values ('00000000-2711-4000-8000-000000000001', 'Gravix Staging TMC', 'gravix-staging-tmc')
 on conflict (id) do nothing;
 
 insert into public.orgs (id, name)
-values ('00000000-2711-0000-0000-000000000002', 'Gravix Staging QA')
+values ('00000000-2711-4000-8000-000000000002', 'Gravix Staging QA')
 on conflict (id) do nothing;
 
 insert into public.companies (id, tmc_id, name, slug)
-values ('00000000-2711-0000-0000-000000000003',
-        '00000000-2711-0000-0000-000000000001',
+values ('00000000-2711-4000-8000-000000000003',
+        '00000000-2711-4000-8000-000000000001',
         'Gravix Staging QA', 'gravix-staging-qa')
 on conflict (id) do nothing;
 
@@ -53,9 +58,9 @@ on conflict (id) do nothing;
 -- provisioned separately via scripts/provision-staging-qa.ts (Admin Auth API),
 -- never by hand-written auth.users / profiles rows here (Day 273).
 insert into public.reps (id, org_id, company_id, tier, name, display_name, first_name, last_name, email)
-values ('00000000-2711-0000-0000-00000000000c',
-        '00000000-2711-0000-0000-000000000002',
-        '00000000-2711-0000-0000-000000000003',
+values ('00000000-2711-4000-8000-00000000000c',
+        '00000000-2711-4000-8000-000000000002',
+        '00000000-2711-4000-8000-000000000003',
         'SalesRep',
         'Jamie Staging', 'Jamie Staging', 'Jamie', 'Staging', 'jamie.staging@gravix.invalid')
 on conflict (id) do nothing;
@@ -66,9 +71,9 @@ insert into public.calls (
   storage_path, audio_path, transcript, analysis_json, created_at
 ) values (
   '00000000-2722-4000-8000-000000000001',
-  '00000000-2711-0000-0000-00000000000b',
-  '00000000-2711-0000-0000-000000000002',
-  '00000000-2711-0000-0000-000000000003',
+  '00000000-2711-4000-8000-00000000000c',
+  '00000000-2711-4000-8000-000000000002',
+  '00000000-2711-4000-8000-000000000003',
   'DAY272_SCORING_V2_STUB_PROOF', 'DAY272_SCORING_V2_STUB_PROOF', 'transcribed',
   'staging/day272/scoring-v2-stub-proof.txt',
   'staging/day272/scoring-v2-stub-proof.txt',
@@ -95,9 +100,9 @@ insert into public.calls (
   storage_path, audio_path, transcript, score_overall, ai_model, rubric, analysis_json, scored_at, created_at
 ) values (
   '00000000-2722-4000-8000-000000000002',
-  '00000000-2711-0000-0000-00000000000b',
-  '00000000-2711-0000-0000-000000000002',
-  '00000000-2711-0000-0000-000000000003',
+  '00000000-2711-4000-8000-00000000000c',
+  '00000000-2711-4000-8000-000000000002',
+  '00000000-2711-4000-8000-000000000003',
   'DAY272_V1_FALLBACK_PROOF', 'DAY272_V1_FALLBACK_PROOF', 'scored',
   'staging/day272/v1-fallback-proof.txt',
   'staging/day272/v1-fallback-proof.txt',

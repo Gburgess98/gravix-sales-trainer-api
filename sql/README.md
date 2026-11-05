@@ -29,7 +29,7 @@ into `00000000_base_schema.sql`**. They are retained only for history/provenance
 
 `seed/staging-day272-fixtures.sql` — **staging-only**, synthetic Day-272 fixtures
 for the Scoring v2 stub proof. Transactional (`begin`/`commit`), fully idempotent
-(`on conflict do nothing`), deterministic `00000000-2711/2722-…` UUIDs, and
+(`on conflict do nothing`), deterministic, RFC-4122-valid `00000000-2711/2722-4000-8000-…` UUIDs (the older `…-0000-0000-…` tenant ids are repaired by `sql/staging/`), and
 `*.invalid` QA emails only. **No customer data, no secrets, no production rows.**
 Never run against production.
 

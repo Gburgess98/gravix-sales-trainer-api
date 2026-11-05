@@ -150,6 +150,9 @@
     "validate:crm-opportunity-detail-dedup": "tsx scripts/validate-crm-opportunity-detail-dedup-day-305.ts",
     "proof:crm-opportunity-detail-dedup": "tsx scripts/proof-crm-opportunity-detail-dedup-day-305.ts",
     "validate:crm-opportunity-pipeline-dedup": "tsx scripts/validate-crm-opportunity-pipeline-dedup-day-306.ts",
-    "proof:crm-opportunity-pipeline-dedup": "tsx scripts/proof-crm-opportunity-pipeline-dedup-day-306.ts"
+    "proof:crm-opportunity-pipeline-dedup": "tsx scripts/proof-crm-opportunity-pipeline-dedup-day-306.ts",
+    "validate:staging-tenant-uuids": "tsx scripts/validate-staging-tenant-uuids.ts",
+    "staging:repair-sql": "tsx scripts/generate-staging-tenant-uuid-repair.ts",
+    "staging:verify-uuids": "tsx scripts/verify-staging-tenant-uuids.ts"
   }
 }

@@ -44,8 +44,8 @@ the synthetic call fixtures in that org (default `call_visibility` is `everyone`
 
 Synthetic tenant (matches the SQL seed):
 
-- org `00000000-2711-0000-0000-000000000002` — *Gravix Staging QA*
-- company `00000000-2711-0000-0000-000000000003` — *Gravix Staging QA*
+- org `00000000-2711-4000-8000-000000000002` — *Gravix Staging QA*
+- company `00000000-2711-4000-8000-000000000003` — *Gravix Staging QA*
 - fixture call `00000000-2722-4000-8000-000000000001` — *DAY272_SCORING_V2_STUB_PROOF*
 
 ---
