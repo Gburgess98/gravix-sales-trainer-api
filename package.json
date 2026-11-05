@@ -40,7 +40,7 @@
     "smoke": "bash scripts/smoke.sh",
     "check": "npm run lint && npm run typecheck && npm run smoke",
     "check:ci": "npm run lint && npm run typecheck",
-    "check:release": "npm run lint && tsc -p tsconfig.json --noEmit --incremental false && npm run build && npm run validate:identity-boundary && npm run validate:authz-remediation && npm run validate:route-authz && npm run validate:admin-hardening && npm run validate:upload-dependencies && npm run validate:rewards-read && npm run validate:audio-metadata && npm run validate:transcription-provider && npm run validate:upload-hierarchy && npm run validate:sparring-safety",
+    "check:release": "npm run lint && tsc -p tsconfig.json --noEmit --incremental false && npm run build && npm run validate:identity-boundary && npm run validate:authz-remediation && npm run validate:route-authz && npm run validate:admin-hardening && npm run validate:upload-dependencies && npm run validate:rewards-read && npm run validate:audio-metadata && npm run validate:transcription-provider && npm run validate:upload-hierarchy && npm run validate:sparring-safety && npm run validate:rls-posture && npm run check:rls-posture",
     "validate:identity-boundary": "tsx scripts/validate-identity-boundary-day-316.ts",
     "validate:authz-remediation": "tsx scripts/validate-authz-remediation-day-26.ts",
     "validate:route-authz": "tsx scripts/validate-route-authz-day-26.ts",
@@ -150,6 +150,8 @@
     "validate:crm-opportunity-detail-dedup": "tsx scripts/validate-crm-opportunity-detail-dedup-day-305.ts",
     "proof:crm-opportunity-detail-dedup": "tsx scripts/proof-crm-opportunity-detail-dedup-day-305.ts",
     "validate:crm-opportunity-pipeline-dedup": "tsx scripts/validate-crm-opportunity-pipeline-dedup-day-306.ts",
-    "proof:crm-opportunity-pipeline-dedup": "tsx scripts/proof-crm-opportunity-pipeline-dedup-day-306.ts"
+    "proof:crm-opportunity-pipeline-dedup": "tsx scripts/proof-crm-opportunity-pipeline-dedup-day-306.ts",
+    "check:rls-posture": "tsx scripts/check-rls-posture.ts",
+    "validate:rls-posture": "tsx scripts/validate-rls-posture.ts"
   }
 }
