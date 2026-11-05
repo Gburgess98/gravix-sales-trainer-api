@@ -1,6 +1,6 @@
 # Staging organisation identity repair — operation record and plan
 
-Status: **PLAN FOR APPROVAL. Nothing has been applied** (no staging DDL/data change, no Railway/Vercel change, no deploy, no production access beyond read-only checks).
+Status: **APPLIED to staging on 2026-11-05 after approval (steps 0–4 and 6); step 5 (retire legacy auth users) NOT run.** Production was not touched (read-only scans only).
 Related: `scripts/staging-tenant-ids.ts` (ids), `sql/staging/20261105_repair_staging_tenant_uuids*.sql` (generated SQL),
 `scripts/validate-staging-tenant-uuids.ts`, `scripts/verify-staging-tenant-uuids.ts`, web commit `b97fe15` (proxy).
 
@@ -52,3 +52,21 @@ The API validates ids with a strict RFC-4122 predicate (`UUID_RE`, version nibbl
 - The proxy's Bearer-scoped `reps` read depends on RLS allowing a user to read their own row (the cookie path made the same assumption). If it cannot, the proxy sends no org header and the API falls back to Railway `DEFAULT_ORG_ID`, which step 3 makes valid — so the repair works either way.
 - The API's own header-less fallback (`DEFAULT_ORG_ID`) can attach a user with no verified org to the default org. Out of scope here (API behaviour unchanged by design); candidate hardening: require a verified org in the API too.
 - Production strays above need their own decision; nothing here touches production.
+
+## 7. Execution record (2026-11-05)
+Run with the Supabase CLI linked to the staging ref only (`supabase link --project-ref <staging>`; `db query --linked`), from a scratch directory.
+- **Step 0 dry run on the REAL staging schema:** forward SQL with `commit` → `rollback`. No error; preview: 1 new org, 0 old, 3 reps and 9 calls in the new org, 2 calls owned by the synthetic rep, 2 activities on the valid call twin, 0 jsonb references left. Re-checked afterwards: nothing persisted (old org present, new absent, 52 failing values).
+  Real-schema facts that confirmed the design: reps/orgs/companies have no RLS; `assignments.rep_id` is `ON DELETE CASCADE` (so references had to be repointed before the old rep was deleted — they are); `reps.org_id` is `ON DELETE RESTRICT`; `calls` has only benign BEFORE-UPDATE triggers (`updated_at` of the 11 repointed calls was bumped).
+- **Step 2 applied** `20261105_repair_staging_tenant_uuids.sql` → old tmc/org/company/rep gone, new ones present, 3 reps in the new org (the two real QA logins and the synthetic rep).
+- **Step 3 Railway** `gravix-sales-trainer-api-staging`: `DEFAULT_ORG_ID` set to `00000000-2711-4000-8000-000000000002` (verified by comparison, value not printed). Previous value: `00000000-2711-0000-0000-000000000002`.
+- **Step 4 web staging** deployed from `b97fe15` (`gravix-sales-trainer-web-staging-c002ig6ab`, aliased to the staging host).
+- **Verification** — `npm run staging:verify-uuids -- --allow-legacy-auth`: every public uuid value passes the strict predicate (only the two legacy `profiles` rows, intentionally tolerated until step 5).
+- **Signed-in API checks through the hosted proxy** (QA manager `day50-manager@…`, QA rep `day50-rep@…`; sessions obtained with an Admin-API magic link, tokens never printed): the proxy forwards the verified org (`…000000000002`) for both; CRM contacts 200 (no `Missing or invalid x-org-id`); manager: overview, team, command centre, calls, assignments, insights, sparring, admin config all 200; rep: the same manager endpoints 403, own calls/assignments/sparring 200; a different, zero-UUID or malformed `x-org-id` → `403 org_mismatch` for both roles; no auth / garbage Bearer / spoofed `x-user-id` → 401. Before the web deploy the old proxy returned 200 for those tampered headers (it silently stripped them).
+- **Side effect to disclose:** my first verification attempt used `STAGING_QA_EMAIL` from `.env.staging.local`, which does not belong to an existing user; `generateLink` therefore **created** a throw-away auth user. I deleted it immediately (`31eeb17a…`). The real QA users were then used via magic link (their `last_sign_in` changed; passwords untouched). `.env.staging.local`'s QA email/password do not match any existing staging user — worth correcting before `staging:qa verify` is relied on.
+- **Not verified here:** browser UI pages (Manager Centre, Team, Calls, Assignments, Insights, Sparring *screens*) — only the data endpoints behind them; there is only one org in staging so cross-tenant access to a *second real org* could not be exercised.
+
+## 8. Follow-ups / findings
+- Step 5 (retire the two malformed legacy auth users) remains optional and unrun.
+- `reps`, `orgs`, `companies` have **RLS disabled** in staging (checked); with RLS off the anon key can read those tables directly. The Bearer-scoped lookup works because of that. Check production and enable RLS with policies (self-read at minimum) as a separate hardening task.
+- API header-less fallback to `DEFAULT_ORG_ID` is unchanged (still attaches an org-less user to the default org).
+- Production strays (zero-UUID org rows, all-same-digit test ids) still need a cleanup decision.
