@@ -37,8 +37,9 @@ const check = (label: string, ok: boolean, detail = "") => { console.log(`${ok ?
 
 type U = { key: string; id: string; email: string; password: string; tier: string; company: string; org: string; token: string };
 const TENANTS = {
-  A: { org: "00000000-2711-0000-0000-000000000002", company: "00000000-2711-0000-0000-000000000003" },
-  B: { org: "00000000-2711-0000-0000-0000000000b2", company: "00000000-2711-0000-0000-0000000000b3" },
+  // RFC-valid synthetic staging ids (after the staging tenant-uuid repair): see sql/staging repair + provision-staging-qa.
+  A: { org: "00000000-2711-4000-8000-000000000002", company: "00000000-2711-4000-8000-000000000003" },
+  B: { org: "00000000-2711-4000-8000-0000000000b2", company: "00000000-2711-4000-8000-0000000000b3" },
 };
 const created = { users: [] as string[], calls: [] as string[], assigns: [] as string[], notes: [] as string[], orgB: false, companyB: false };
 
@@ -145,6 +146,8 @@ async function main() {
     await http(repA2, "POST", "/v1/coach/notes", { callId: cA1, notes: "INJECTED" }),
     await http(repA1, "POST", "/v1/coach/notes", { callId: uuid(), notes: "INJECTED" }),
   ];
+  const dmNames = ["rep deletes teammate's (same tenant)", "rep deletes + tampered headers", "manager A deletes tenant B's + tampered", "manager B deletes tenant A's", "delete malformed id", "delete unknown id", "rep completes teammate's", "manager B completes tenant A's", "rep POSTs note on tenant B call + tampered", "manager A POSTs note on tenant B call", "rep POSTs note on teammate's call", "POST note on unknown call"];
+  dm.forEach((r, i) => console.log(`      denied: ${dmNames[i]} → ${r.status} ${JSON.stringify(r.body)?.slice(0, 70)}`));
   check("every denied mutation is refused (4xx)", dm.every((r) => r.status >= 400 && r.status < 500), dm.map((r) => r.status).join(","));
   const after = { a: await assignRow(aA2), b: await assignRow(aB1), nA: await noteRow(cA1), nB: await noteRow(cB1) };
   check("the database rows are unchanged after every denied attempt", JSON.stringify(before) === JSON.stringify(after));
@@ -158,6 +161,7 @@ async function main() {
 }
 
 async function cleanup() {
+  const counts = { users: created.users.length, calls: created.calls.length, assignments: created.assigns.length, notes: created.notes.length, tenantB: Number(created.orgB) + Number(created.companyB) };
   const e = async (label: string, p: PromiseLike<{ error: any }>) => { const r = await p; if (r.error) console.log(`cleanup ${label}: ${r.error.message}`); };
   if (created.notes.length) await e("notes", admin.from("coach_notes").delete().in("call_id", created.notes));
   if (created.calls.length) { await e("notes(calls)", admin.from("coach_notes").delete().in("call_id", created.calls)); await e("assignments(calls)", admin.from("coach_assignments").delete().in("call_id", created.calls)); }
@@ -166,7 +170,17 @@ async function cleanup() {
   if (created.users.length) { await e("reps", admin.from("reps").delete().in("id", created.users)); for (const id of created.users) await admin.auth.admin.deleteUser(id); }
   if (created.companyB) await e("company", admin.from("companies").delete().eq("id", TENANTS.B.company));
   if (created.orgB) await e("org", admin.from("orgs").delete().eq("id", TENANTS.B.org));
-  console.log("      cleanup complete (temporary users, reps, calls, assignments, notes removed)");
+  // Independent residue check, by the run's unique marker.
+  const left = {
+    authUsers: ((await admin.auth.admin.listUsers({ perPage: 1000 })).data?.users || []).filter((u) => (u.email || "").startsWith(`coachauthz-${RUN}-`)).length,
+    reps: (await admin.from("reps").select("id").like("email", `coachauthz-${RUN}-%`)).data?.length ?? -1,
+    calls: (await admin.from("calls").select("id").like("filename", `coachauthz-${RUN}-%`)).data?.length ?? -1,
+    assignments: (await admin.from("coach_assignments").select("id").like("notes", `coachauthz ${RUN}`)).data?.length ?? -1,
+    notesInjected: (await admin.from("coach_notes").select("id").eq("notes", "INJECTED")).data?.length ?? -1,
+    tenantB: ((await admin.from("companies").select("id").eq("id", TENANTS.B.company)).data?.length ?? 0) + ((await admin.from("orgs").select("id").eq("id", TENANTS.B.org)).data?.length ?? 0),
+  };
+  console.log(`      cleanup: created ${JSON.stringify(counts)}; residue after cleanup ${JSON.stringify(left)}`);
+  if (Object.values(left).some((v) => v !== 0)) { console.log("FAIL  residue remains after cleanup"); fails++; }
 }
 
 main().catch((e) => { console.error("ERROR", e?.message || e); fails++; }).finally(async () => { await cleanup(); console.log(fails ? `\n${fails} check(s) FAILED` : "\nStaging authorisation boundary verified"); process.exit(fails ? 1 : 0); });
