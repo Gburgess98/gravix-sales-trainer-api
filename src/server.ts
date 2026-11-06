@@ -26,6 +26,8 @@ import { assertSparringProviderConfig, describeSparringProvider } from "./lib/sp
 import { assertTranscriptionProviderConfig, resolveTranscriptionProvider, describeTranscriptionProvider } from "./lib/transcriptionProvider";
 import { requireSuperAdmin } from "./middleware/requireSuperAdmin";
 import { accessibleRepIds, canAccessRep } from "./lib/repAccess";
+import { repLookups } from "./lib/repAccess";
+import { deleteCoachAssignment, updateCoachAssignmentStatus, listCoachAssignments, listAssignmentsByEntity, getCoachNote, saveCoachNote, type CoachDeps } from "./lib/coachAssignmentAccess";
 
 import callsRouter from "./routes/calls";
 import pinsRouter from "./routes/pins";
@@ -1320,158 +1322,81 @@ app.post("/v1/admin/digest/daily", requireAdmin, async (req, res) => {
 });
 
 
-// --- Coach Assignments: list by call ---
-app.get("/v1/coach/assignments", requireIdentity, async (req, res) => {
-  try {
-    const callId = req.query.callId ? String(req.query.callId) : null;
-    const accountId = req.query.accountId ? String(req.query.accountId) : null;
-    const contactId = req.query.contactId ? String(req.query.contactId) : null;
-    const assigneeUserId = (req.query.assigneeUserId || req.query.repId) ? String(req.query.assigneeUserId || req.query.repId) : null;
-    const status = req.query.status ? String(req.query.status) as ("open" | "completed") : null;
-    const orgId = req.query.orgId ? String(req.query.orgId) : null;
-
-    const limit = Math.min(Number(req.query.limit || 50), 100);
-
-    // Determine mode
-    let mode: "byCall" | "byAccount" | "byContact" | "byAssignee" | null = null;
-    if (callId) mode = "byCall";
-    else if (accountId) mode = "byAccount";
-    else if (contactId) mode = "byContact";
-    else if (assigneeUserId) mode = "byAssignee";
-
-    if (!mode) {
-      return res.status(400).json({ ok: false, error: "one of callId, accountId, contactId, assigneeUserId|repId required" });
-    }
-
-    // Collect call ids if needed
-    let callIds: string[] = [];
-    if (mode === "byCall") {
-      callIds = [callId!];
-    } else if (mode === "byAccount") {
-      const q = supabase
-        .from('calls')
-        .select('id, org_id')
-        .eq('account_id', accountId!)
-        .order('created_at', { ascending: false })
-        .limit(500);
-      const { data, error } = await (orgId ? q.eq('org_id', orgId) : q);
-      if (error) return res.status(500).json({ ok: false, error: error.message });
-      callIds = (data || []).map((r: any) => String(r.id));
-    } else if (mode === "byContact") {
-      const q = supabase
-        .from('calls')
-        .select('id, org_id')
-        .eq('contact_id', contactId!)
-        .order('created_at', { ascending: false })
-        .limit(500);
-      const { data, error } = await (orgId ? q.eq('org_id', orgId) : q);
-      if (error) return res.status(500).json({ ok: false, error: error.message });
-      callIds = (data || []).map((r: any) => String(r.id));
-    }
-
-    // Base assignments query
-    let aQ = supabase
-      .from('coach_assignments')
-      .select('id, call_id, assignee_user_id, drill_id, notes, status, created_at, completed_at, org_id')
-      .order('created_at', { ascending: false })
-      .limit(limit);
-
-    if (orgId) aQ = aQ.eq('org_id', orgId);
-    if (status) aQ = aQ.eq('status', status);
-
-    if (mode === "byAssignee") {
-      aQ = aQ.eq('assignee_user_id', assigneeUserId!);
-    } else {
-      if (!callIds.length) return res.json({ ok: true, items: [] });
-      aQ = aQ.in('call_id', callIds);
-    }
-
-    const { data: assigns, error: aErr } = await aQ;
-    if (aErr) return res.status(500).json({ ok: false, error: aErr.message });
-
-    // Enrich with call filename (best-effort)
-    const need = Array.from(new Set((assigns || []).map((x: any) => String(x.call_id))));
-    const labelByCall = new Map<string, string>();
-    if (need.length) {
-      const cq = supabase
-        .from('calls')
-        .select('id, filename')
-        .in('id', need)
-        .limit(need.length);
-      const { data: callRows } = await cq;
-      for (const c of callRows || []) {
-        labelByCall.set(String((c as any).id), String((c as any).filename || (c as any).id));
-      }
-    }
-
-    const items = (assigns || []).map((x: any) => ({
-      id: x.id,
-      call_id: x.call_id,
-      call_label: labelByCall.get(String(x.call_id)) || x.call_id,
-      assignee_user_id: x.assignee_user_id,
-      drill_id: x.drill_id,
-      notes: x.notes,
-      status: x.status,
-      created_at: x.created_at,
-      completed_at: x.completed_at || null,
-    }));
-
-    res.set('Cache-Control', 'private, max-age=10');
-    return res.json({ ok: true, items });
-  } catch (e: any) {
-    return res.status(500).json({ ok: false, error: e?.message || 'assignments_list_failed' });
-  }
-});
-
 // --- Coach Assignments: delete by id ---
+// Object-level authorisation (src/lib/coachAssignmentAccess.ts): managers only, and only for reps inside the caller's
+// verified tenant. Reps, other tenants, unknown and out-of-scope ids never delete anything.
+const COACH_ASSIGNMENT_COLS = "id, org_id, assignee_user_id, call_id, drill_id, status, completed_at, created_at";
+const coachAssignmentDeps: CoachDeps = {
+  lookups: repLookups,
+  store: {
+    async getAssignment(id) {
+      const { data, error } = await supabase.from("coach_assignments").select(COACH_ASSIGNMENT_COLS).eq("id", id).maybeSingle();
+      if (error) throw error;
+      return (data as any) ?? null;
+    },
+    async deleteAssignment(id) {
+      const { error } = await supabase.from("coach_assignments").delete().eq("id", id);
+      if (error) throw error;
+    },
+    async updateAssignment(id, patch) {
+      const { data, error } = await supabase.from("coach_assignments").update(patch).eq("id", id).select(COACH_ASSIGNMENT_COLS).maybeSingle();
+      if (error) throw error;
+      return (data as any) ?? null;
+    },
+    async listAssignments({ callIds, assignee, status, max }) {
+      let q = supabase.from("coach_assignments").select(COACH_ASSIGNMENT_COLS + ", notes").order("created_at", { ascending: false }).limit(max);
+      if (status) q = q.eq("status", status);
+      if (assignee) q = q.eq("assignee_user_id", assignee);
+      if (callIds) q = q.in("call_id", callIds);
+      const { data, error } = await q;
+      if (error) throw error;
+      return (data as any[]) ?? [];
+    },
+    async callIdsForEntity({ accountId, contactId }) {
+      const col = accountId ? "account_id" : "contact_id";
+      const { data, error } = await supabase.from("calls").select("id").eq(col, (accountId || contactId)!).order("created_at", { ascending: false }).limit(500);
+      if (error) throw error;
+      return (data || []).map((r: any) => String(r.id));
+    },
+    async getCalls(ids) {
+      const { data, error } = await supabase.from("calls").select("id, user_id, org_id, filename").in("id", ids).limit(Math.max(1, ids.length));
+      if (error) throw error;
+      return (data as any[]) ?? [];
+    },
+    async getNote(callId) {
+      const { data, error } = await supabase.from("coach_notes").select("id, call_id, notes, updated_at").eq("call_id", callId).maybeSingle();
+      if (error) throw error;
+      return (data as any) ?? null;
+    },
+    async upsertNote(callId, notes) {
+      const { data, error } = await supabase
+        .from("coach_notes")
+        .upsert({ call_id: callId, notes, updated_at: new Date().toISOString() }, { onConflict: "call_id" })
+        .select("id, call_id, notes, updated_at")
+        .maybeSingle();
+      if (error) throw error;
+      return (data as any) ?? null;
+    },
+  },
+};
+// Reads: assignee-in-scope rows only (reps: own; managers: their verified tenant). orgId and other client scope are ignored.
+app.get("/v1/coach/assignments", requireIdentity, async (req, res) => {
+  const r = await listCoachAssignments(coachAssignmentDeps, (req as any).userId, req.query as any);
+  if (r.status === 200) res.set("Cache-Control", "private, max-age=10");
+  return res.status(r.status).json(r.body);
+});
 app.delete("/v1/coach/assignments/:id", requireIdentity, async (req, res) => {
-  try {
-    const { id } = req.params;
-    if (!id) return res.status(400).json({ ok: false, error: "id required" });
-    const { error } = await supabase.from("coach_assignments").delete().eq("id", id);
-    if (error) return res.status(500).json({ ok: false, error: error.message });
-    return res.json({ ok: true });
-  } catch (e: any) {
-    return res.status(500).json({ ok: false, error: e?.message || "delete_failed" });
-  }
+  const r = await deleteCoachAssignment(coachAssignmentDeps, (req as any).userId, req.params.id);
+  return res.status(r.status).json(r.body);
 });
 
-// --- Coach Assignments: mark complete / reopen ---
+// --- Coach Assignments: mark complete / reopen (the assignee, or a manager in the same verified tenant) ---
 app.patch("/v1/coach/assignments/:id", requireIdentity, async (req, res) => {
-  try {
-    const id = String(req.params.id || "");
-    if (!id) return res.status(400).json({ ok: false, error: "id required" });
-
-    const { status } = (req.body || {}) as {
-      status?: "open" | "completed";
-    };
-    if (!status || !["open", "completed"].includes(status)) {
-      return res.status(400).json({ ok: false, error: "status must be 'open' or 'completed'" });
-    }
-
-    const patch: any = { status };
-    if (status === "completed") patch.completed_at = new Date().toISOString();
-    if (status === "open") patch.completed_at = null;
-
-    // Update assignment
-    const { data: updated, error } = await supabase
-      .from("coach_assignments")
-      .update(patch)
-      .eq("id", id)
-      .select("id, org_id, assignee_user_id, call_id, drill_id, status, completed_at, created_at")
-      .maybeSingle();
-
-    if (error) return res.status(500).json({ ok: false, error: error.message });
-    if (!updated) return res.status(404).json({ ok: false, error: "not_found" });
-
-    // Activity write temporarily disabled here.
-    // Reason: production DB still has legacy activities type constraints / trigger paths.
-    // Re-enable once activities_type_check and coach_assignments trigger behaviour are aligned.
-
-    return res.json({ ok: true, assignment: updated });
-  } catch (e: any) {
-    return res.status(500).json({ ok: false, error: e?.message || "patch_failed" });
-  }
+  const r = await updateCoachAssignmentStatus(coachAssignmentDeps, (req as any).userId, req.params.id, (req.body || {}).status);
+  // Activity write temporarily disabled here.
+  // Reason: production DB still has legacy activities type constraints / trigger paths.
+  // Re-enable once activities_type_check and coach_assignments trigger behaviour are aligned.
+  return res.status(r.status).json(r.body);
 });
 
 // --- Coach Drills catalog (static for now) ---
@@ -1503,44 +1428,16 @@ app.get("/v1/calls/:id/scores", requireIdentity, async (req, res) => {
   }
 });
 // --- Coach Notes (persist simple text per call) ---
+// Notes belong to their call: the call owner or a manager in the owner's verified tenant (see coachAssignmentAccess.ts).
 app.get("/v1/coach/notes", requireIdentity, async (req, res) => {
-  try {
-    const callId = String(req.query.callId || "");
-    if (!callId) return res.status(400).json({ ok: false, error: "callId required" });
-
-    const { data, error } = await supabase
-      .from("coach_notes")
-      .select("id, call_id, notes, updated_at")
-      .eq("call_id", callId)
-      .maybeSingle();
-
-    if (error) return res.status(500).json({ ok: false, error: error.message });
-    return res.json({ ok: true, note: data || null });
-  } catch (e: any) {
-    return res.status(500).json({ ok: false, error: e?.message || "fetch_failed" });
-  }
+  const r = await getCoachNote(coachAssignmentDeps, (req as any).userId, req.query.callId ? String(req.query.callId) : "");
+  return res.status(r.status).json(r.body);
 });
 
 app.post("/v1/coach/notes", requireIdentity, async (req, res) => {
-  try {
-    const { callId, notes } = (req.body || {}) as { callId?: string; notes?: string };
-    if (!callId) return res.status(400).json({ ok: false, error: "callId required" });
-
-    // Upsert by call_id
-    const { data, error } = await supabase
-      .from("coach_notes")
-      .upsert(
-        { call_id: callId, notes: notes ?? null, updated_at: new Date().toISOString() },
-        { onConflict: "call_id" }
-      )
-      .select("id, call_id, notes, updated_at")
-      .maybeSingle();
-
-    if (error) return res.status(500).json({ ok: false, error: error.message });
-    return res.json({ ok: true, note: data });
-  } catch (e: any) {
-    return res.status(500).json({ ok: false, error: e?.message || "save_failed" });
-  }
+  const b = (req.body || {}) as { callId?: string; notes?: unknown };
+  const r = await saveCoachNote(coachAssignmentDeps, (req as any).userId, b.callId, b.notes);
+  return res.status(r.status).json(r.body);
 });
 
 // --- CRM Overview: Account ---
@@ -1647,74 +1544,8 @@ app.get('/v1/crm/contacts/:id/overview', requireIdentity, async (req, res) => {
 
 // --- Coach Assignments aggregate by account/contact ---
 app.get('/v1/coach/assignments/by-entity', requireIdentity, async (req, res) => {
-  try {
-    const accountId = req.query.accountId ? String(req.query.accountId) : null;
-    const contactId = req.query.contactId ? String(req.query.contactId) : null;
-    const limit = Math.min(Number(req.query.limit || 20), 50);
-
-    if (!accountId && !contactId) {
-      return res.status(400).json({ ok: false, error: 'accountId or contactId required' });
-    }
-
-    // 1) Related calls
-    let callsResp;
-    if (accountId) {
-      callsResp = await supabase
-        .from('calls')
-        .select('id')
-        .eq('account_id', accountId)
-        .order('created_at', { ascending: false })
-        .limit(200);
-    } else {
-      callsResp = await supabase
-        .from('calls')
-        .select('id')
-        .eq('contact_id', contactId)
-        .order('created_at', { ascending: false })
-        .limit(200);
-    }
-    if (callsResp.error) return res.status(500).json({ ok: false, error: callsResp.error.message });
-
-    const callIds = (callsResp.data || []).map((r: any) => r.id);
-    if (!callIds.length) return res.json({ ok: true, items: [] });
-
-    // 2) Assignments for those calls
-    const { data: assigns, error: aErr } = await supabase
-      .from('coach_assignments')
-      .select('id, call_id, drill_id, notes, created_at')
-      .in('call_id', callIds)
-      .order('created_at', { ascending: false })
-      .limit(limit);
-    if (aErr) return res.status(500).json({ ok: false, error: aErr.message });
-
-    // 3) Enrich with call filename (optional)
-    const map = new Map<string, string>();
-    try {
-      const need = Array.from(new Set((assigns || []).map((x: any) => x.call_id)));
-      if (need.length) {
-        const { data: callRows } = await supabase
-          .from('calls')
-          .select('id, filename')
-          .in('id', need);
-        for (const c of callRows || []) {
-          map.set(String((c as any).id), String((c as any).filename || (c as any).id));
-        }
-      }
-    } catch { /* best-effort; failure is non-fatal here */ }
-
-    const items = (assigns || []).map((x: any) => ({
-      id: x.id,
-      call_id: x.call_id,
-      call_label: map.get(String(x.call_id)) || x.call_id,
-      drill_id: x.drill_id,
-      notes: x.notes,
-      created_at: x.created_at,
-    }));
-
-    return res.json({ ok: true, items });
-  } catch (e: any) {
-    return res.status(500).json({ ok: false, error: e?.message || 'assignments_aggregate_failed' });
-  }
+  const r = await listAssignmentsByEntity(coachAssignmentDeps, (req as any).userId, req.query as any);
+  return res.status(r.status).json(r.body);
 });
 
 // --- Admin: index hints (DDL) — returns SQL strings, does not execute ---

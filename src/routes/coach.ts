@@ -1,6 +1,8 @@
 import { Router } from "express";
 import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
+import { repLookups } from "../lib/repAccess";
+import { canAssignTo } from "../lib/coachAssignmentAccess";
 
 console.log("[coach.ts] module loaded", new Date().toISOString());
 
@@ -38,6 +40,8 @@ r.post("/assign", async (req, res) => {
       .single();
     if (error || !call) return res.status(404).json({ ok: false, error: "not_found" });
     if (call.user_id !== requester) return res.status(403).json({ ok: false, error: "forbidden" });
+    // The assignee is client-supplied: only self, or (for managers) a rep inside the caller's verified tenant.
+    if (!(await canAssignTo(requester, body.assigneeUserId, repLookups))) return res.status(403).json({ ok: false, error: "forbidden" });
 
     const reviewFlags = Array.isArray((call as any)?.analysis_json?.review_flags)
       ? (call as any).analysis_json.review_flags

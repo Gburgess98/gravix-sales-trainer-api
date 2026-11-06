@@ -36,7 +36,7 @@ export function isManagerTier(tier: string | null | undefined): boolean {
   return MANAGER_TIERS.has(String(tier || ""));
 }
 
-const dbLookups: RepLookups = {
+export const repLookups: RepLookups = {
   async getRep(id) {
     if (!id) return null;
     const { data, error } = await supaAdmin
@@ -61,7 +61,7 @@ const dbLookups: RepLookups = {
 export async function canAccessRep(
   requesterId: string | null | undefined,
   targetRepId: string | null | undefined,
-  lookups: RepLookups = dbLookups
+  lookups: RepLookups = repLookups
 ): Promise<boolean> {
   const me = String(requesterId || "").trim();
   const target = String(targetRepId || "").trim();
@@ -79,7 +79,7 @@ export async function canAccessRep(
  */
 export async function accessibleRepIds(
   requesterId: string | null | undefined,
-  lookups: RepLookups = dbLookups
+  lookups: RepLookups = repLookups
 ): Promise<string[]> {
   const me = String(requesterId || "").trim();
   if (!me) return [];
