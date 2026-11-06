@@ -14,7 +14,7 @@ import { scoreWithLLM, resolveScoringContract, resolveScoringProvider } from "./
 import { cleanTranscript, buildSegments } from "./lib/transcript";
 
 import { securityHeaders } from "./middleware/security";
-import { globalRateLimit, authRateLimit, uploadRateLimit } from "./middleware/rateLimits";
+import { globalRateLimit, userRateLimit, authRateLimit, uploadRateLimit } from "./middleware/rateLimits";
 import { resolveTrustProxyHops } from "./trustProxy";
 import { resolveIdentity, getBearerToken, isUuid, type AuthCtx } from "./identityTrust";
 import { defaultClaimsVerifier } from "./tokenVerification";
@@ -167,8 +167,8 @@ app.use(globalRateLimit);
 app.use("/v1/auth/login",          authRateLimit);
 app.use("/v1/auth/reset-password", authRateLimit);
 
-// Upload throttle — each upload triggers backend jobs; limit abuse.
-app.use("/v1/upload", uploadRateLimit);
+// (Upload throttle and the per-user limiter are mounted below, AFTER the identity middleware, so web-app traffic that arrives
+// through the shared Vercel egress is limited per authenticated user instead of per shared address.)
 
 // --- Request ID + timing ---
 app.use((req, res, next) => {
@@ -217,6 +217,11 @@ app.use(async (req, res, next) => {
 
   return next();
 });
+
+// Per-user limits for traffic from our own proxy (PROXY_SHARED_SECRET) — keyed on the identity resolved above, never a raw header —
+// and the upload throttle (per user behind the proxy, per address otherwise). Direct/anonymous traffic was already limited by IP above.
+app.use(userRateLimit);
+app.use("/v1/upload", uploadRateLimit);
 
 // Impersonation middleware — runs after auth, before routes.
 // When x-impersonated-user-id is present, validates the actor is SuperAdmin
