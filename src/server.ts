@@ -15,6 +15,7 @@ import { cleanTranscript, buildSegments } from "./lib/transcript";
 
 import { securityHeaders } from "./middleware/security";
 import { globalRateLimit, authRateLimit, uploadRateLimit } from "./middleware/rateLimits";
+import { resolveTrustProxyHops } from "./trustProxy";
 import { resolveIdentity, getBearerToken, isUuid, type AuthCtx } from "./identityTrust";
 import { defaultClaimsVerifier } from "./tokenVerification";
 import { requireIdentityByDefault } from "./routeAuthPolicy";
@@ -92,6 +93,9 @@ type UploadedFile = {
 };
 
 const app = express();
+
+// Trust exactly the two Railway hops (see src/trustProxy.ts) so req.ip — and therefore the rate-limit key — is the real caller.
+app.set("trust proxy", resolveTrustProxyHops());
 
 // Security headers must be first — before any route can respond without them.
 app.use(securityHeaders);
