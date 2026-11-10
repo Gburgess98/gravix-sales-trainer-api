@@ -150,6 +150,7 @@ import { whispererTablesAvailable } from "../whisperer";
 // Day 171: shared org-scoped call read access lives in lib/callAccess so
 // pins.ts can apply the same visibility rule to pin reads.
 import { canAccessCall, getRequesterOrgId } from "../lib/callAccess";
+import { resolveSignedAudio, classifyStorageError, type CallAudioRow } from "../lib/signedAudio";
 
 async function getOpenAssignmentCallIds(callIds: string[]): Promise<Set<string>> {
   const ids = Array.from(new Set(callIds.map((x) => String(x || "").trim()).filter(Boolean)));
@@ -1109,40 +1110,36 @@ router.get("/:id/signed-audio", async (req, res) => {
       return res.status(400).json({ ok: false, error: "invalid id" });
     }
     const requester = getUserIdHeader(req);
-
-    // ensure call exists and belongs to requester
-    const { data: call, error } = await supa
-      .from("calls")
-      .select("user_id,org_id,audio_path")
-      .eq("id", id)
-      .single();
-
-    if (error || !call) return res.status(404).json({ ok: false, error: "not_found" });
-    const allowed = await canAccessCall(requester, call.user_id, call.org_id ?? null);
-    if (!allowed) {
-      return res.status(403).json({ ok: false, error: "forbidden" });
-    }
-    if (!call.audio_path) {
-      return res.status(400).json({ ok: false, error: "no_audio_path" });
-    }
-
     const bucket = process.env.SUPABASE_STORAGE_BUCKET || "calls";
     const ttl = Number(process.env.SIGNED_URL_TTL_SEC || 300); // default 5 min
 
-    const { data: signed, error: signErr } = await supa
-      .storage
-      .from(bucket)
-      .createSignedUrl(call.audio_path, ttl);
-
-    if (signErr || !signed?.signedUrl) {
-      return res
-        .status(500)
-        .json({ ok: false, error: `sign_failed: ${signErr?.message ?? "unknown"}` });
-    }
-
-    res.json({ ok: true, url: signed.signedUrl, ttl });
-  } catch (e: any) {
-    res.status(400).json({ ok: false, error: e.message ?? "bad_request" });
+    // Decision logic lives in lib/signedAudio (unit-proven); responses never carry paths or provider messages.
+    const result = await resolveSignedAudio(
+      {
+        ttlSec: ttl,
+        getCall: async (callId) => {
+          const { data, error } = await supa
+            .from("calls")
+            .select("user_id,org_id,audio_path")
+            .eq("id", callId)
+            .maybeSingle();
+          if (error) throw error;
+          return (data as CallAudioRow | null) ?? null;
+        },
+        canAccess: canAccessCall,
+        sign: async (audioPath, ttlSec) => {
+          const { data, error } = await supa.storage.from(bucket).createSignedUrl(audioPath, ttlSec);
+          if (error || !data?.signedUrl) return { ok: false, reason: error ? classifyStorageError(error) : "failure" };
+          return { ok: true, url: data.signedUrl };
+        },
+        log: (event, detail) => console.error(`[calls/signed-audio] ${event}`, detail),
+      },
+      requester,
+      id
+    );
+    return res.status(result.status).json(result.body);
+  } catch {
+    return res.status(500).json({ ok: false, error: "audio_unavailable" });
   }
 });
 
