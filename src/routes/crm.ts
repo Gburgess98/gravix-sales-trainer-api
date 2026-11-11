@@ -1,4 +1,6 @@
 import { buildScoreTrend } from "../lib/scoreTrend";
+import { resolveScoreTrendScope } from "../lib/scoreTrendAccess";
+import { repLookups } from "../lib/repAccess";
 import { Router } from "express";
 import { randomUUID } from "crypto";
 import { z } from "zod";
@@ -4511,11 +4513,19 @@ router.get("/analytics/stage-conversion", async (req, res) => {
 // GET /v1/crm/analytics/score-trend
 router.get("/analytics/score-trend", async (req, res) => {
   try {
-    const requester = getUserIdHeader(req);
-    const orgId = getOrgIdHeader(req);
+    let requester: string;
+    try {
+      requester = getUserIdHeader(req); // the shared reader (req.userId from the identity middleware first)
+    } catch {
+      return res.status(401).json({ ok: false, error: "missing_user" });
+    }
     const days = Math.min(Math.max(Number(req.query.days ?? 30), 1), 365);
-    const repIdRaw = String(req.query.repId ?? "").trim();
-    const repId = repIdRaw && UUID_RE.test(repIdRaw) ? repIdRaw : null;
+    // Identity, tenant and repId are all resolved from the verified caller (see lib/scoreTrendAccess): managers get their own
+    // organisation (or one rep inside it); a SalesRep gets only their own trend; everything else fails closed.
+    const scope = await resolveScoreTrendScope(repLookups, requester, req.query.repId);
+    if (!scope.ok) return res.status(scope.status).json(scope.body);
+    const orgId = scope.orgId;
+    const repId = scope.repId;
 
     const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
 
@@ -4530,6 +4540,7 @@ router.get("/analytics/score-trend", async (req, res) => {
     if (repId) q = q.eq("user_id", repId);
 
     const r = await q;
+    if (r.error) return res.status(500).json({ ok: false, error: "score_trend_failed" }); // never present a failed read as an empty trend
     const rows = r.data ?? [];
 
     // Only calls with a real score contribute (unscored are excluded, never counted as 0); each point carries its sample size.
@@ -4542,8 +4553,8 @@ router.get("/analytics/score-trend", async (req, res) => {
       requester_id: requester,
       trend,
     });
-  } catch (e: any) {
-    return res.status(400).json({ ok: false, error: e?.message ?? "score_trend_failed" });
+  } catch {
+    return res.status(500).json({ ok: false, error: "score_trend_failed" });
   }
 });
 

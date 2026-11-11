@@ -56,14 +56,14 @@ const fake = http.createServer((req, res) => {
 const A = "aaaaaaaa-0000-4000-8000-00000000000a", B = "bbbbbbbb-0000-4000-8000-00000000000b";
 const OFF_X = "00000000-0000-4000-8000-0000000000f1", OFF_Y = "00000000-0000-4000-8000-0000000000f2";
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
-const U = { rep: id(1), mgr: id(2), owner: id(3), partner: id(4), superadmin: id(5), mgrB: id(6), noTenant: id(7), adminTier: id(8), mgrNoUsersRow: id(9), repB: id(10), ghost: id(99) };
+const U = { rep: id(1), mgr: id(2), owner: id(3), partner: id(4), superadmin: id(5), mgrB: id(6), noTenant: id(7), adminTier: id(8), mgrNoUsersRow: id(9), repB: id(10), ghost: id(99), rep2: id(11) };
 
 function seed() {
   DB.reps = [
-    { id: U.rep, tier: "SalesRep", company_id: A }, { id: U.mgr, tier: "Manager", company_id: A }, { id: U.owner, tier: "Owner", company_id: A },
-    { id: U.partner, tier: "PartnerAdmin", company_id: A }, { id: U.superadmin, tier: "SuperAdmin", company_id: A },
-    { id: U.mgrB, tier: "Manager", company_id: B }, { id: U.noTenant, tier: "Manager", company_id: null }, { id: U.adminTier, tier: "Admin", company_id: A },
-    { id: U.mgrNoUsersRow, tier: "Manager", company_id: A }, { id: U.repB, tier: "SalesRep", company_id: B },
+    { id: U.rep, tier: "SalesRep", company_id: A, org_id: A }, { id: U.mgr, tier: "Manager", company_id: A, org_id: A }, { id: U.owner, tier: "Owner", company_id: A, org_id: A },
+    { id: U.partner, tier: "PartnerAdmin", company_id: A, org_id: A }, { id: U.superadmin, tier: "SuperAdmin", company_id: A, org_id: A },
+    { id: U.mgrB, tier: "Manager", company_id: B, org_id: B }, { id: U.noTenant, tier: "Manager", company_id: null, org_id: null }, { id: U.adminTier, tier: "Admin", company_id: A, org_id: A },
+    { id: U.mgrNoUsersRow, tier: "Manager", company_id: A, org_id: A }, { id: U.repB, tier: "SalesRep", company_id: B, org_id: B }, { id: U.rep2, tier: "SalesRep", company_id: A, org_id: A },
   ];
   // users rows drive the legacy scope (office/company). mgrNoUsersRow / noTenant / ghost intentionally have none.
   DB.users = [
@@ -85,6 +85,7 @@ function seed() {
     call(7, A, U.mgr, recent(5), 90),
     call(8, B, U.repB, recent(2), 10), // other tenant
     call(9, A, U.rep, "2020-01-01", 55), // outside the window
+    call(10, A, U.rep2, recent(6), 33), // another rep in the same tenant
   ];
   DB.__recent2 = [{ d: recent(2) }, { d: recent(3) }, { d: recent(4) }, { d: recent(5) }];
 }
@@ -155,7 +156,7 @@ async function jget(base: string, p: string, headers: Record<string, string> = {
   check("trend: dates ascend, every point has {date, avg_score, count} (additive, compatible shape)", pts.every((p) => typeof p.date === "string" && Number.isInteger(p.avg_score) && Number.isInteger(p.count)) && pts.map((p) => p.date).join() === pts.map((p) => p.date).sort().join());
   check("trend: date window applied (2020 call excluded)", !("2020-01-01" in byDate));
   check("trend: org filter applied — org B's call (score 10) never appears for org A", pts.every((p) => p.avg_score !== 10));
-  const rb = await trend(U.repB, B); check("trend: org B sees only its own single point", (rb.body?.trend ?? []).length === 1 && rb.body.trend[0].avg_score === 10, JSON.stringify(rb.body?.trend));
+  const rb = await trend(U.mgrB, B); check("trend: org B sees only its own single point", (rb.body?.trend ?? []).length === 1 && rb.body.trend[0].avg_score === 10, JSON.stringify(rb.body?.trend));
   r = await trend(U.mgr, A, `days=30&repId=${U.mgr}`); check("trend: rep filter preserved (manager's own call only → one point, 90, count 1)", (r.body?.trend ?? []).length === 1 && r.body.trend[0].avg_score === 90 && r.body.trend[0].count === 1 && r.body.scope === "rep", JSON.stringify(r.body));
   r = await trend(U.mgr, A, "days=1"); check("trend: sparse window → empty trend, ok:true (no fabricated points)", r.status === 200 && r.body?.ok === true && (r.body.trend ?? []).length === 0, JSON.stringify(r.body));
   DB.calls = DB.calls.map((c) => ({ ...c, score_overall: null }));
@@ -165,6 +166,49 @@ async function jget(base: string, p: string, headers: Record<string, string> = {
     trendLib.realScore(null) === null && trendLib.realScore(undefined) === null && trendLib.realScore("") === null && trendLib.realScore(NaN) === null && trendLib.realScore(true as any) === null && trendLib.realScore("72") === 72 && trendLib.realScore(0) === 0);
   check("scoreTrend helper: empty input → []; bad dates skipped", trendLib.buildScoreTrend([]).length === 0 && trendLib.buildScoreTrend([{ score_overall: 50, created_at: null }, { score_overall: 50, created_at: "nope" }]).length === 0);
   check("trend: unsupported/unknown filter shapes never reached the fake DB (harness honesty)", unsupported.length === 0, unsupported.join(","));
+
+  // ── TREND ACCESS (every role; self / other / no-rep; cross-tenant; fail closed)
+  seed(); // fresh data (the sparse tests above blanked the scores)
+  const callsOf = (x: any) => (x.body?.trend ?? []).reduce((n: number, p: any) => n + p.count, 0);
+  const acc = (who: string | null, qs = "days=365", extra: Record<string, string> = {}) => jget(base, `/v1/crm/analytics/score-trend?${qs}`, { ...(who ? { "x-user-id": who } : {}), ...extra });
+  for (const [name, who] of [["Manager", U.mgr], ["Owner", U.owner], ["PartnerAdmin", U.partner], ["SuperAdmin", U.superadmin]] as const) {
+    r = await acc(who);
+    check(`access: ${name} → org/team trend (200, scope team, only own org: 5 scored A calls in the window, none of B's)`, r.status === 200 && r.body?.scope === "team" && callsOf(r) === 5 && (r.body.trend as any[]).every((p) => p.avg_score !== 10), `${r.status} n=${callsOf(r)}`);
+    r = await acc(who, `days=365&repId=${U.rep}`);
+    check(`access: ${name} → a rep inside their tenant (200, scope rep)`, r.status === 200 && r.body?.scope === "rep" && r.body?.rep_id === U.rep, `${r.status}`);
+  }
+  const deniedBodies: string[] = [];
+  const denied = async (label: string, who: string | null, qs: string, status = 403, extra: Record<string, string> = {}) => { const x = await acc(who, qs, extra); if (status === 403) deniedBodies.push(JSON.stringify(x.body)); check(label, x.status === status && !(x.body?.trend), `${x.status} ${JSON.stringify(x.body)?.slice(0, 70)}`); };
+  await denied("access: manager A asking for org B's rep → 403", U.mgr, `days=365&repId=${U.repB}`);
+  await denied("access: manager A asking for an unknown rep id → 403 (same as other tenant)", U.mgr, `days=365&repId=${id(555)}`);
+  await denied("access: manager B asking for org A's rep → 403", U.mgrB, `days=365&repId=${U.rep}`);
+  r = await acc(U.mgr, "days=365", { "x-org-id": B });
+  check("access: a forged x-org-id (org B) is ignored — manager A still gets only org A's data", r.status === 200 && callsOf(r) === 5 && (r.body.trend as any[]).every((p) => p.avg_score !== 10));
+  await denied("access: SalesRep, no repId (org-wide) → 403", U.rep, "days=365");
+  await denied("access: SalesRep asking for another rep in the same tenant → 403", U.rep, `days=365&repId=${U.rep2}`);
+  await denied("access: SalesRep asking for a manager in the same tenant → 403", U.rep, `days=365&repId=${U.mgr}`);
+  await denied("access: SalesRep asking for a rep in another tenant → 403", U.rep, `days=365&repId=${U.repB}`);
+  await denied("access: SalesRep asking for an unknown rep id → 403", U.rep, `days=365&repId=${id(556)}`);
+  r = await acc(U.rep, `days=365&repId=${U.rep}`);
+  check("access: SalesRep asking for THEMSELVES → self-only trend (200, scope rep, only their own scored calls: 3)", r.status === 200 && r.body?.scope === "rep" && r.body?.rep_id === U.rep && callsOf(r) === 3, `${r.status} n=${callsOf(r)}`);
+  r = await acc(U.rep, `days=365&repId=${U.rep.toUpperCase()}`);
+  check("access: self match is case-insensitive but still verified (upper-case own id → 200 self-only)", r.status === 200 && r.body?.scope === "rep" && callsOf(r) === 3);
+  r = await acc(U.repB, `days=365&repId=${U.repB}`); check("access: org B's SalesRep sees only their own call (10), never org A's", r.status === 200 && callsOf(r) === 1 && r.body.trend[0].avg_score === 10);
+  await denied("access: SalesRep with a forged x-org-id still cannot read the org-wide trend", U.rep, "days=365", 403, { "x-org-id": A });
+  await denied("access: unknown 'Admin' tier is treated as non-manager → org-wide 403", U.adminTier, "days=365");
+  r = await acc(U.adminTier, `days=365&repId=${U.adminTier}`); check("access: unknown tier may read only itself", r.status === 200 && r.body?.scope === "rep");
+  await denied("access: Manager with no organisation on record → 403 (fail closed, team)", U.noTenant, "days=365");
+  await denied("access: Manager with no organisation on record → 403 (fail closed, even self)", U.noTenant, `days=365&repId=${U.noTenant}`);
+  await denied("access: caller with no reps row → 403", U.ghost, "days=365");
+  await denied("access: no user id → 401", null, "days=365", 401);
+  await denied("access: malformed user id → 401", "not-a-uuid", "days=365", 401);
+  await denied("access: malformed repId → 400 invalid_rep_id for a manager (never widened to the whole team)", U.mgr, "days=365&repId=abc", 400);
+  await denied("access: malformed repId → 400 for a SalesRep", U.rep, "days=365&repId=abc", 400);
+  check("access: every 403 body is byte-identical (no existence/tenant oracle)", deniedBodies.length >= 10 && new Set(deniedBodies).size === 1, JSON.stringify([...new Set(deniedBodies)]));
+  const trendSrc = fs.readFileSync(path.join(__dirname, "../src/routes/crm.ts"), "utf8");
+  const h = trendSrc.slice(trendSrc.indexOf('router.get("/analytics/score-trend"'), trendSrc.indexOf("Day 213B — display-only rep label"));
+  check("access: handler resolves scope from the verified caller (resolveScoreTrendScope + repLookups); no x-org-id / raw repId / error text", /resolveScoreTrendScope\(repLookups/.test(h) && !/getOrgIdHeader|UUID_RE\.test\(repIdRaw\)|e\?\.message|e\.message/.test(h));
+  check("access: failed read is an error, not an empty trend", /if \(r\.error\) return res\.status\(500\)/.test(h));
 
   // ── COMMAND CENTRE
   check("command-centre: no scored calls → averageOrNull is null, not 0", manager.averageOrNull(0, 0) === null && manager.averageOrNull(Number.NaN, 3) === null);
