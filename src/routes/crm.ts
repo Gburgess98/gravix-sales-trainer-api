@@ -1,3 +1,4 @@
+import { buildScoreTrend } from "../lib/scoreTrend";
 import { Router } from "express";
 import { randomUUID } from "crypto";
 import { z } from "zod";
@@ -4523,6 +4524,7 @@ router.get("/analytics/score-trend", async (req, res) => {
       .select("score_overall,created_at,user_id")
       .eq("org_id", orgId)
       .gte("created_at", sinceIso)
+      .not("score_overall", "is", null)
       .order("created_at", { ascending: true });
 
     if (repId) q = q.eq("user_id", repId);
@@ -4530,19 +4532,8 @@ router.get("/analytics/score-trend", async (req, res) => {
     const r = await q;
     const rows = r.data ?? [];
 
-    const buckets: Record<string, { total: number; count: number }> = {};
-
-    rows.forEach((c: any) => {
-      const d = String(c.created_at).slice(0, 10);
-      if (!buckets[d]) buckets[d] = { total: 0, count: 0 };
-      buckets[d].total += Number(c.score_overall || 0);
-      buckets[d].count += 1;
-    });
-
-    const trend = Object.entries(buckets).map(([date, v]) => ({
-      date,
-      avg_score: Math.round(v.total / v.count),
-    }));
+    // Only calls with a real score contribute (unscored are excluded, never counted as 0); each point carries its sample size.
+    const trend = buildScoreTrend(rows as any[]);
 
     return res.json({
       ok: true,

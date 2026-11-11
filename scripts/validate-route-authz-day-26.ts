@@ -636,8 +636,16 @@ function analyse(files: Files, configFiles: Files): Report {
         break;
       }
       case "requireManager": {
-        const bad = tierLits.filter((x) => !TIERS_MGR.has(x));
-        if (bad.length || !tierLits.length || !/\b403\b/.test(t)) p.push("tier set must be a subset of Manager/Admin/Owner/PartnerAdmin/SuperAdmin (never SalesRep) with a 403 path");
+        // Either a literal tier set inside the guard, or delegation to the shared isManagerTier(); in the latter case the
+        // SHARED set (src/lib/repAccess.ts MANAGER_TIERS) is what must be a non-empty subset of the allowed tiers.
+        let lits = tierLits;
+        if (!lits.length && /!\s*isManagerTier\s*\(\s*tier\s*\)/.test(t)) {
+          const ra = fs.readFileSync(path.join(ROOT, "src/lib/repAccess.ts"), "utf8");
+          const m = ra.match(/export const MANAGER_TIERS = new Set\(\[([^\]]*)\]\)/);
+          lits = m ? (m[1].match(/"([A-Za-z]+)"/g) || []).map((x) => x.replace(/"/g, "")) : [];
+        }
+        const bad = lits.filter((x) => !TIERS_MGR.has(x));
+        if (bad.length || !lits.length || !/\b403\b/.test(t)) p.push("tier set must be a subset of Manager/Admin/Owner/PartnerAdmin/SuperAdmin (never SalesRep) with a 403 path");
         break;
       }
     }

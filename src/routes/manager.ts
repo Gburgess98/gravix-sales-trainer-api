@@ -238,6 +238,11 @@ async function fetchReviewedCallIds(
   return { ids, available: true };
 }
 
+/** Rounded mean, or null when there is nothing to average (missing data is not a score of 0). */
+export function averageOrNull(sum: number, count: number): number | null {
+  return count > 0 && Number.isFinite(sum) ? Math.round(sum / count) : null;
+}
+
 export function computeTeamHealthStatus(args: {
   averageScore: number | null;
   callsNeedingReview: number;
@@ -483,7 +488,7 @@ router.get("/command-centre", async (req: Request, res: Response) => {
       }
     }
 
-    const teamAverage = teamScoreCount > 0 ? Math.round(teamScoreSum / teamScoreCount) : null;
+    const teamAverage = averageOrNull(teamScoreSum, teamScoreCount);
 
     // ── Manager review history (Day 91) ──
     // Reviewed = a row in call_manager_reviews for a call in the scoped window.
@@ -663,7 +668,9 @@ router.get("/command-centre", async (req: Request, res: Response) => {
           callsNeedingReview: callsNeedingReviewCount,
           overdueAssignments: overdueAssignmentRows.length,
         }),
-        averageScore: teamAverage ?? 0,
+        // null = no scored calls in the window (unavailable) — never a fabricated 0.
+        averageScore: teamAverage,
+        scoredCalls: teamScoreCount,
         reviewedCalls: reviewedCount,
         callsNeedingReview: callsNeedingReviewCount,
         openAssignments: openAssignmentRows.length,

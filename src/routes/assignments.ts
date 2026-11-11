@@ -9,6 +9,7 @@ import {
   type UserContext,
 } from "../lib/permissions";
 import { logAuditEvent } from "../lib/audit";
+import { isManagerTier } from "../lib/repAccess";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -262,7 +263,19 @@ async function getUserContext(supa: any, userId: string): Promise<UserContext | 
     .eq("id", userId)
     .maybeSingle();
 
-  if (!data) return null;
+  if (!data) {
+    // No `users` row: derive the tenant scope from the `reps` bridge (manager tiers only) so a manager is never left
+    // UNSCOPED — applyOrgScope() adds no filter for a null context, which would expose every company's assignments.
+    const { data: rep } = await supa
+      .from("reps")
+      .select("tier, company_id")
+      .eq("id", userId)
+      .maybeSingle();
+    if (rep && isManagerTier((rep as any).tier) && (rep as any).company_id) {
+      return { id: userId, role: "company_manager", office_id: null, company_id: String((rep as any).company_id), is_admin: false };
+    }
+    return null;
+  }
 
   return {
     id: String(data.id),
@@ -330,7 +343,6 @@ async function sendSlackWebhook(text: string) {
 
 // Minimal RBAC: allow Manager/Admin/Owner
 
-const MANAGER_ROLES = new Set(["Manager", "Admin", "Owner"]);
 
 function parseTargetIds(value: unknown): string[] {
   const raw = String(value || "").trim();
@@ -386,7 +398,7 @@ async function isManagerUser(userId: string) {
   if (error) throw error;
 
   const tier = String((data as any)?.tier || "");
-  return MANAGER_ROLES.has(tier);
+  return isManagerTier(tier);
 }
 
 async function requireManager(req: Request, res: Response, next: NextFunction) {
@@ -405,7 +417,7 @@ async function requireManager(req: Request, res: Response, next: NextFunction) {
     if (error) return res.status(500).json({ ok: false, error: error.message });
     const tier = String((data as any)?.tier || "");
 
-    if (!MANAGER_ROLES.has(tier)) {
+    if (!isManagerTier(tier)) {
       return res.status(403).json({ ok: false, error: "forbidden_not_manager" });
     }
 
@@ -1526,15 +1538,18 @@ export function assignmentsRoutes() {
 
     const managerContext = await getUserContext(supa, managerId);
 
+    // Fail closed: a manager whose tenant cannot be resolved sees nothing rather than every company's assignments.
+    if (!managerContext || (!managerContext.company_id && !managerContext.office_id)) {
+      return res.json({ ok: true, managerId, items: [], assignments: [], summary: buildAssignmentsSummary([]), nextCursor: null });
+    }
+
     let q = supa
       .from("assignments")
       .select(SELECT_FIELDS)
       .order("created_at", { ascending: false })
       .order("id", { ascending: false });
 
-    if (managerContext) {
-      q = applyOrgScope(q, managerContext);
-    }
+    q = applyOrgScope(q, managerContext);
 
     if (repId) q = q.eq("rep_id", repId);
     if (status) q = q.eq("status", status);
