@@ -10,6 +10,9 @@
 // Day 90 note: "reviewed" calls are counted as scored calls until the
 // call_manager_reviews table lands on Day 91.
 
+import { SCORED_CALL_ROW_LIMIT, countOutcome, isScoredCall, onlyScoredCalls, windowStartIso } from "../lib/scoredCalls";
+import { applyCallScope, resolveCallScope } from "../lib/callScope";
+import { isManagerTier, repLookups } from "../lib/repAccess";
 import { Router, type Request, type Response } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { requireManager } from "../middleware/requireManager";
@@ -62,7 +65,15 @@ async function getUserContext(db: any, userId: string): Promise<UserContext | nu
     .eq("id", userId)
     .maybeSingle();
 
-  if (!data) return null;
+  if (!data) {
+    // No `users` row: scope a manager tier through the `reps` bridge instead of leaving it UNSCOPED (applyHierarchyFilters adds no
+    // filter for a null context, which would expose every company's rows).
+    const { data: rep } = await db.from("reps").select("tier, company_id").eq("id", userId).maybeSingle();
+    if (rep && isManagerTier((rep as any).tier) && (rep as any).company_id) {
+      return { id: userId, role: "company_manager", office_id: null, company_id: String((rep as any).company_id), is_admin: false };
+    }
+    return null;
+  }
 
   return {
     id: String(data.id),
@@ -338,19 +349,23 @@ router.get("/command-centre", async (req: Request, res: Response) => {
     if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
 
     const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? "30"), 10) || 30));
-    const since = isoDaysAgo(days);
     const now = Date.now();
+    // One window and one scored-call definition (lib/scoredCalls) shared with GET /v1/crm/analytics/score-trend, so the KPI,
+    // the average, the needs-review count and the trend all describe exactly the same set of calls.
+    const since = windowStartIso(days, now);
 
     const userContext = await getUserContext(supa, userId);
+    const callScope = await resolveCallScope(supa, userId, repLookups);
+    if (!callScope) return res.status(403).json({ ok: false, error: "forbidden" });
 
-    let callsQuery = supa
-      .from("calls")
-      .select("id, user_id, filename, status, score_overall, analysis_json, rubric, created_at, office_id, company_id")
-      .eq("status", "scored")
+    let callsQuery: any = applyCallScope(
+      (supa as any).from("calls").select("id, user_id, filename, status, score_overall, analysis_json, rubric, created_at, office_id, company_id"),
+      callScope
+    )
       .gte("created_at", since)
       .order("created_at", { ascending: false })
-      .limit(2000);
-    callsQuery = applyHierarchyFilters(callsQuery, userContext);
+      .limit(SCORED_CALL_ROW_LIMIT);
+    callsQuery = onlyScoredCalls(callsQuery);
 
     let assignmentsQuery = supa
       .from("assignments")
@@ -361,15 +376,12 @@ router.get("/command-centre", async (req: Request, res: Response) => {
     assignmentsQuery = applyHierarchyFilters(assignmentsQuery, userContext);
 
     // Day 94: previous matching window (the N days before `since`) for skill trends.
-    const prevSince = isoDaysAgo(days * 2);
-    let prevCallsQuery = supa
-      .from("calls")
-      .select("id, analysis_json, rubric, office_id, company_id")
-      .eq("status", "scored")
+    const prevSince = windowStartIso(days * 2, now);
+    let prevCallsQuery: any = applyCallScope((supa as any).from("calls").select("id, analysis_json, rubric, office_id, company_id"), callScope)
       .gte("created_at", prevSince)
       .lt("created_at", since)
-      .limit(2000);
-    prevCallsQuery = applyHierarchyFilters(prevCallsQuery, userContext);
+      .limit(SCORED_CALL_ROW_LIMIT);
+    prevCallsQuery = onlyScoredCalls(prevCallsQuery);
 
     // Day 94: completed assignments in the current window (count only).
     let completedCountQuery = supa
@@ -392,10 +404,13 @@ router.get("/command-centre", async (req: Request, res: Response) => {
     if (assignmentsResult.error) throw assignmentsResult.error;
     // Trend/impact data is enrichment — fail soft so the command centre still loads.
     if (prevCallsResult.error) console.warn("[manager.command-centre] prev window query failed", prevCallsResult.error.message);
-    const completedAssignments = completedResult.error ? 0 : (completedResult.count ?? 0);
-    if (completedResult.error) console.warn("[manager.command-centre] completed count failed", completedResult.error.message);
+    // A failed (or count-less) query is "unavailable" (null + a safe warning) — never a fabricated 0. A real zero stays 0.
+    const completed = countOutcome(completedResult as any);
+    const completedAssignments = completed.value;
+    if (!completed.available) console.warn("[manager.command-centre] completed assignments count unavailable", (completedResult as any)?.error?.code ?? "no_count");
 
-    const scoredCalls = (callsResult.data ?? []) as ScoredCallRow[];
+    // Canonical scored call = valid finite score_overall (the database filter above, re-checked in memory).
+    const scoredCalls = ((callsResult.data ?? []) as ScoredCallRow[]).filter(isScoredCall);
     const openAssignmentRows = (assignmentsResult.data ?? []) as Array<{
       id: string;
       rep_id: string | null;
@@ -662,6 +677,8 @@ router.get("/command-centre", async (req: Request, res: Response) => {
       ok: true,
       windowDays: days,
       reviewHistoryAvailable: reviewHistory.available,
+      availability: { completedAssignments: completed.available },
+      ...(completed.available ? {} : { warnings: ["completed_assignments_unavailable"] }),
       teamHealth: {
         status: computeTeamHealthStatus({
           averageScore: teamAverage,
@@ -708,21 +725,22 @@ router.get("/review-queue", async (req: Request, res: Response) => {
     if (!userId) return res.status(401).json({ ok: false, error: "missing_user_identity" });
 
     const days = Math.max(1, Math.min(365, parseInt(String(req.query.days ?? "30"), 10) || 30));
-    const since = isoDaysAgo(days);
+    const since = windowStartIso(days);
 
     const rawLimit = parseInt(String(req.query.limit ?? "25"), 10);
     const limit = Math.min(Math.max(Number.isFinite(rawLimit) ? rawLimit : 25, 1), 100);
 
-    const userContext = await getUserContext(supa, userId);
-
-    let callsQuery = supa
-      .from("calls")
-      .select("id, user_id, filename, status, score_overall, analysis_json, rubric, created_at, office_id, company_id")
-      .eq("status", "scored")
+    // Same window, scope and scored-call definition as the command centre, so this queue and its needs-review count agree.
+    const callScope = await resolveCallScope(supa, userId, repLookups);
+    if (!callScope) return res.status(403).json({ ok: false, error: "forbidden" });
+    let callsQuery: any = applyCallScope(
+      (supa as any).from("calls").select("id, user_id, filename, status, score_overall, analysis_json, rubric, created_at, office_id, company_id"),
+      callScope
+    )
       .gte("created_at", since)
       .order("created_at", { ascending: false })
-      .limit(2000);
-    callsQuery = applyHierarchyFilters(callsQuery, userContext);
+      .limit(SCORED_CALL_ROW_LIMIT);
+    callsQuery = onlyScoredCalls(callsQuery);
 
     const [callsResult, reviewHistory] = await Promise.all([
       callsQuery,
@@ -730,7 +748,7 @@ router.get("/review-queue", async (req: Request, res: Response) => {
     ]);
     if (callsResult.error) throw callsResult.error;
 
-    const scoredCalls = (callsResult.data ?? []) as ScoredCallRow[];
+    const scoredCalls = ((callsResult.data ?? []) as ScoredCallRow[]).filter(isScoredCall);
 
     const queue = scoredCalls
       .filter((c) => !reviewHistory.ids.has(String(c.id)))

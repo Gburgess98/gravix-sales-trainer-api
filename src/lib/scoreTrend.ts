@@ -4,18 +4,12 @@
 // day's average toward 0. Now only calls with a real, finite score contribute; a day with no scored calls has no point.
 // Each point also carries `count` (scored calls behind the average) — additive, existing consumers ignore it.
 
+import { realScore } from "./scoredCalls";
+
 export type TrendRow = { score_overall?: unknown; created_at?: unknown };
 export type TrendPoint = { date: string; avg_score: number; count: number };
 
-/** A real score: a finite number (or numeric string). null / undefined / "" / NaN / booleans are NOT scores. */
-export function realScore(v: unknown): number | null {
-  if (typeof v === "number") return Number.isFinite(v) ? v : null;
-  if (typeof v === "string" && v.trim() !== "") {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
-  }
-  return null;
-}
+export { realScore };
 
 export function buildScoreTrend(rows: TrendRow[]): TrendPoint[] {
   const buckets = new Map<string, { total: number; count: number }>();

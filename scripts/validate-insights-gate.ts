@@ -23,6 +23,7 @@ const check = (label: string, ok: boolean, detail = "") => { console.log(`${ok ?
 type Row = Record<string, any>;
 const DB: Record<string, Row[]> = {};
 const unsupported: string[] = [];
+let failCompletedCount = false; // simulate the completed-assignments count query failing (raw DB text must never leak)
 function applyFilters(rows: Row[], sp: URLSearchParams): Row[] {
   let out = rows;
   for (const [k, v] of sp.entries()) {
@@ -32,6 +33,8 @@ function applyFilters(rows: Row[], sp: URLSearchParams): Row[] {
     else if (v === "not.is.null") out = out.filter((r) => r[k] !== null && r[k] !== undefined);
     else if ((m = v.match(/^gte\.(.*)$/))) out = out.filter((r) => String(r[k]) >= m![1]);
     else if ((m = v.match(/^lt\.(.*)$/))) out = out.filter((r) => String(r[k]) < m![1]);
+    else if ((m = v.match(/^in\.\((.*)\)$/))) { const set = new Set(m![1].split(",").map((x) => x.replace(/^"|"$/g, ""))); out = out.filter((r) => set.has(String(r[k]))); }
+    else if (v === "is.null") out = out.filter((r) => r[k] === null || r[k] === undefined);
     else unsupported.push(`${k}=${v}`);
   }
   return out;
@@ -45,6 +48,12 @@ const fake = http.createServer((req, res) => {
   const lim = Number(u.searchParams.get("limit") || 0); if (lim > 0) rows = rows.slice(0, lim);
   const wantObject = /vnd\.pgrst\.object/.test(String(req.headers.accept || ""));
   res.setHeader("content-type", "application/json");
+  if (req.method === "HEAD") {
+    if (failCompletedCount && table === "assignments" && u.searchParams.get("status") === "eq.completed") { res.statusCode = 500; return res.end(); }
+    res.setHeader("content-range", rows.length ? `0-${rows.length - 1}/${rows.length}` : "*/0");
+    return res.end();
+  }
+  if (failCompletedCount && table === "assignments" && u.searchParams.get("status") === "eq.completed") { res.statusCode = 500; return res.end(JSON.stringify({ code: "XX000", message: "pg: SECRET-DB-HOST relation \"assignments\" exploded", details: "", hint: null })); }
   if (wantObject) {
     if (rows.length !== 1) { res.statusCode = 406; return res.end(JSON.stringify({ code: "PGRST116", message: "no/multiple rows", details: "", hint: null })); }
     return res.end(JSON.stringify(rows[0]));
@@ -76,13 +85,13 @@ function seed() {
   ];
   const mk = (n: number, company: string, office: string | null, rep: string) => ({ id: id(1000 + n), rep_id: rep, manager_id: null, type: "call", target_id: null, title: `t${n}`, status: "assigned", due_at: null, created_at: `2026-07-${String(10 + n).padStart(2, "0")}T00:00:00Z`, completed_at: null, completed_by: null, source: null, meta: null, company_id: company, office_id: office });
   DB.assignments = [mk(1, A, OFF_X, U.rep), mk(2, A, OFF_Y, U.rep), mk(3, A, null, U.rep), mk(4, B, null, U.repB), mk(5, B, null, U.repB)];
-  const call = (n: number, org: string, user: string, day: string, score: number | null) => ({ id: id(2000 + n), org_id: org, user_id: user, created_at: `${day}T10:00:00Z`, score_overall: score });
+  const call = (n: number, org: string, user: string, day: string, score: number | null, office: string | null = null) => ({ id: id(2000 + n), org_id: org, company_id: org, office_id: office, user_id: user, created_at: `${day}T10:00:00Z`, score_overall: score, status: "scored", filename: `c${n}`, analysis_json: null, rubric: null });
   const recent = (d: number) => new Date(Date.now() - d * 86400000).toISOString().slice(0, 10);
   DB.calls = [
     call(1, A, U.rep, recent(2), 80), call(2, A, U.rep, recent(2), 60), call(3, A, U.rep, recent(2), null), call(4, A, U.rep, recent(2), null), // day1: avg 70 over 2 scored (not 35)
     call(5, A, U.rep, recent(3), 0), // genuine zero kept
     call(6, A, U.rep, recent(4), null), // only-unscored day → no point
-    call(7, A, U.mgr, recent(5), 90),
+    call(7, A, U.mgr, recent(5), 90, OFF_X), // the only call in the SuperAdmin's office
     call(8, B, U.repB, recent(2), 10), // other tenant
     call(9, A, U.rep, "2020-01-01", 55), // outside the window
     call(10, A, U.rep2, recent(6), 33), // another rep in the same tenant
@@ -113,6 +122,7 @@ async function jget(base: string, p: string, headers: Record<string, string> = {
   app.use(express.json());
   app.use("/v1/assignments", assignmentsRoutes());
   app.use("/v1/crm", crmRouter);
+  app.use("/v1/manager", ((await import("../src/routes/manager")) as any).default as express.Router);
   const srv = http.createServer(app);
   await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
   const base = `http://127.0.0.1:${(srv.address() as any).port}`;
@@ -173,7 +183,8 @@ async function jget(base: string, p: string, headers: Record<string, string> = {
   const acc = (who: string | null, qs = "days=365", extra: Record<string, string> = {}) => jget(base, `/v1/crm/analytics/score-trend?${qs}`, { ...(who ? { "x-user-id": who } : {}), ...extra });
   for (const [name, who] of [["Manager", U.mgr], ["Owner", U.owner], ["PartnerAdmin", U.partner], ["SuperAdmin", U.superadmin]] as const) {
     r = await acc(who);
-    check(`access: ${name} → org/team trend (200, scope team, only own org: 5 scored A calls in the window, none of B's)`, r.status === 200 && r.body?.scope === "team" && callsOf(r) === 5 && (r.body.trend as any[]).every((p) => p.avg_score !== 10), `${r.status} n=${callsOf(r)}`);
+    const want = name === "SuperAdmin" ? 1 : 5; // SuperAdmin keeps the office scope they already had (office X holds one call)
+    check(`access: ${name} → org/team trend (200, scope team, only own org/scope: ${want} scored A call(s) in the window, none of B's)`, r.status === 200 && r.body?.scope === "team" && callsOf(r) === want && (r.body.trend as any[]).every((p) => p.avg_score !== 10), `${r.status} n=${callsOf(r)}`);
     r = await acc(who, `days=365&repId=${U.rep}`);
     check(`access: ${name} → a rep inside their tenant (200, scope rep)`, r.status === 200 && r.body?.scope === "rep" && r.body?.rep_id === U.rep, `${r.status}`);
   }
@@ -209,6 +220,76 @@ async function jget(base: string, p: string, headers: Record<string, string> = {
   const h = trendSrc.slice(trendSrc.indexOf('router.get("/analytics/score-trend"'), trendSrc.indexOf("Day 213B — display-only rep label"));
   check("access: handler resolves scope from the verified caller (resolveScoreTrendScope + repLookups); no x-org-id / raw repId / error text", /resolveScoreTrendScope\(repLookups/.test(h) && !/getOrgIdHeader|UUID_RE\.test\(repIdRaw\)|e\?\.message|e\.message/.test(h));
   check("access: failed read is an error, not an empty trend", /if \(r\.error\) return res\.status\(500\)/.test(h));
+
+  // ── ONE DEFINITION OF A SCORED CALL (trend = KPI = average = needs-review) + COMPLETED ASSIGNMENTS
+  {
+    const day = (d: number) => new Date(Date.now() - d * 86400000).toISOString().slice(0, 10);
+    const mkCall = (n: number, org: string, user: string, d: number, score: number | null, status = "scored") =>
+      ({ id: id(3000 + n), org_id: org, company_id: org, office_id: null, user_id: user, created_at: `${day(d)}T10:00:00Z`, score_overall: score, status, filename: `d${n}`, analysis_json: null, rubric: null });
+    const centre = async (who: string, qs = "days=30") => jget(base, `/v1/manager/command-centre?${qs}`, { "x-user-id": who });
+    const trendSum = (x: any) => (x.body?.trend ?? []).reduce((n: number, p: any) => n + p.count, 0);
+    seed();
+    DB.calls = [
+      mkCall(1, A, U.rep, 2, 80), mkCall(2, A, U.rep, 3, 60, "processing"), // score present, status lagging → still a scored call
+      mkCall(3, A, U.rep, 4, 0), // genuine zero → included
+      mkCall(4, A, U.rep, 5, null), mkCall(5, A, U.rep, 6, null, "processing"), // unscored, any status → excluded
+      mkCall(6, A, U.rep2, 7, 30),
+      mkCall(7, A, U.rep, 40, 90), // outside a 30-day window
+      mkCall(8, B, U.repB, 2, 99), // another organisation
+    ];
+    const t = await trend(U.mgr, A, "days=30");
+    const c = await centre(U.mgr);
+    const includedRows = DB.calls.filter((x) => x.org_id === A && x.score_overall !== null && x.created_at >= new Date(Date.now() - 30 * 86400000).toISOString());
+    const expectN = includedRows.length; // 4: 80, 60 (lagging status), 0, 30
+    const expectAvg = Math.round(includedRows.reduce((n, x) => n + (x.score_overall as number), 0) / expectN);
+    check("definition: seed sanity (4 scored calls incl. a genuine 0 and a lagging status; average 43)", expectN === 4 && expectAvg === 43);
+    check("definition: command-centre scoredCalls EQUALS the sum of the score-trend point counts", c.status === 200 && c.body?.teamHealth?.scoredCalls === trendSum(t) && trendSum(t) === expectN, `centre=${c.body?.teamHealth?.scoredCalls} trend=${trendSum(t)} want=${expectN}`);
+    check("definition: the average is calculated from that same set (43) — and equals the call-weighted trend average", c.body?.teamHealth?.averageScore === expectAvg && Math.round((t.body.trend as any[]).reduce((n, p) => n + p.avg_score * p.count, 0) / trendSum(t)) === expectAvg, `centre=${c.body?.teamHealth?.averageScore}`);
+    check("definition: a call with a score but a lagging status IS counted; an unscored call with status 'scored' is NOT", (t.body.trend as any[]).some((p) => p.date === day(3) && p.count === 1 && p.avg_score === 60) && !(t.body.trend as any[]).some((p) => p.date === day(5)));
+    check("definition: a genuine score of 0 stays in (trend point avg 0, and it lowers the centre average)", (t.body.trend as any[]).some((p) => p.date === day(4) && p.avg_score === 0 && p.count === 1));
+    const expectReview = includedRows.filter((x) => manager.needsReview(x as any)).length;
+    check("definition: needs-review is derived from the same set (null-score calls never appear in it)", c.body?.teamHealth?.callsNeedingReview === expectReview && expectReview >= 2, `centre=${c.body?.teamHealth?.callsNeedingReview} want=${expectReview}`);
+    check("definition: skills/attention come from the same rows (no unscored rep appears)", Array.isArray(c.body?.repsNeedingAttention));
+    const q = await jget(base, "/v1/manager/review-queue?days=30", { "x-user-id": U.mgr });
+    check("definition: the review queue lists the same needs-review calls (count matches the KPI)", q.status === 200 && (q.body?.items ?? q.body?.queue ?? []).length === expectReview, `${q.status} ${(q.body?.items ?? q.body?.queue ?? []).length} vs ${expectReview}`);
+
+    // same window on both sides, other windows and shapes
+    const t1 = await trend(U.mgr, A, "days=1"); const c1 = await centre(U.mgr, "days=1");
+    check("definition: empty window → centre scoredCalls 0 + average null, trend empty (never 0 / never healthy)", c1.body?.teamHealth?.scoredCalls === 0 && c1.body?.teamHealth?.averageScore === null && trendSum(t1) === 0);
+    const t365 = await trend(U.mgr, A, "days=365"); const c365 = await centre(U.mgr, "days=365");
+    check("definition: 365-day window — still equal (the 40-day-old call is now in both)", c365.body?.teamHealth?.scoredCalls === 5 && trendSum(t365) === 5, `centre=${c365.body?.teamHealth?.scoredCalls} trend=${trendSum(t365)}`);
+    DB.calls = [mkCall(9, A, U.rep, 2, 0)];
+    const tz = await trend(U.mgr, A, "days=30"); const cz = await centre(U.mgr);
+    check("definition: only a genuine 0 → 1 scored call, average 0 (a real zero, not unavailable)", trendSum(tz) === 1 && cz.body?.teamHealth?.scoredCalls === 1 && cz.body?.teamHealth?.averageScore === 0);
+    DB.calls = [mkCall(10, A, U.rep, 2, null), mkCall(11, A, U.rep, 3, null, "processing")];
+    const tu = await trend(U.mgr, A, "days=30"); const cu = await centre(U.mgr);
+    check("definition: only unscored calls → 0 scored, average null on both", trendSum(tu) === 0 && cu.body?.teamHealth?.scoredCalls === 0 && cu.body?.teamHealth?.averageScore === null);
+    // tenant isolation of the centre (was unscoped for a manager with no users row)
+    DB.calls = [mkCall(12, A, U.rep, 2, 70), mkCall(13, B, U.repB, 2, 55), mkCall(14, B, U.repB, 3, 45)];
+    const ca = await centre(U.mgr), cb = await centre(U.mgrB), cn = await centre(U.mgrNoUsersRow), cx = await centre(U.noTenant);
+    check("tenant: centre shows only the caller's organisation (A: 1, B: 2)", ca.body?.teamHealth?.scoredCalls === 1 && cb.body?.teamHealth?.scoredCalls === 2, `${ca.body?.teamHealth?.scoredCalls}/${cb.body?.teamHealth?.scoredCalls}`);
+    check("tenant: a manager with no users row is scoped through their company (sees A only, not everyone)", cn.status === 200 && cn.body?.teamHealth?.scoredCalls === 1, `${cn.status} ${cn.body?.teamHealth?.scoredCalls}`);
+    check("tenant: a manager whose organisation can't be resolved is refused (403), not shown everything", cx.status === 403 && !cx.body?.teamHealth);
+    const cr = await centre(U.rep); check("tenant: a SalesRep is still denied the command centre (403)", cr.status === 403);
+
+    // completed assignments: real zero / real count / failure
+    const doneRow = (n: number, company: string, d: number) => ({ id: id(4000 + n), rep_id: U.rep, manager_id: null, type: "call", title: `done${n}`, status: "completed", due_at: null, created_at: `${day(d + 5)}T00:00:00Z`, completed_at: `${day(d)}T00:00:00Z`, company_id: company, office_id: null });
+    DB.assignments = [doneRow(1, A, 3), doneRow(2, A, 10), doneRow(3, A, 60), doneRow(4, B, 3), { ...doneRow(5, A, 2), status: "assigned", completed_at: null }];
+    const ok1 = await centre(U.mgr);
+    check("completed: a real count (2 in the window, not the 60-day-old, not company B's, not the open one)", ok1.body?.coachingImpact?.completedAssignments === 2 && ok1.body?.availability?.completedAssignments === true && !ok1.body?.warnings, JSON.stringify(ok1.body?.coachingImpact) + JSON.stringify(ok1.body?.warnings));
+    const ok0 = await centre(U.mgr, "days=1");
+    check("completed: a REAL zero stays 0 and is available (no warning)", ok0.body?.coachingImpact?.completedAssignments === 0 && ok0.body?.availability?.completedAssignments === true && !ok0.body?.warnings, JSON.stringify(ok0.body?.coachingImpact));
+    failCompletedCount = true;
+    const bad = await centre(U.mgr);
+    failCompletedCount = false;
+    check("completed: a FAILED count is null (not 0) with a safe availability signal and warning", bad.status === 200 && bad.body?.coachingImpact?.completedAssignments === null && bad.body?.availability?.completedAssignments === false && (bad.body?.warnings ?? []).includes("completed_assignments_unavailable"), JSON.stringify(bad.body?.coachingImpact) + JSON.stringify(bad.body?.warnings));
+    check("completed: the failure leaks no raw database text, host or relation name", !/SECRET|pg:|exploded|relation|XX000/i.test(JSON.stringify(bad.body)), JSON.stringify(bad.body).slice(0, 120));
+    check("completed: everything else in the response is intact during the failure (other real counts, average, sample)", bad.body?.teamHealth?.scoredCalls === 1 && typeof bad.body?.teamHealth?.openAssignments === "number" && bad.body?.teamHealth?.overdueAssignments === 0);
+    const sc = await import("../src/lib/scoredCalls");
+    check("scoredCalls helper: realScore / isScoredCall / countOutcome / windowStartIso behave", sc.realScore(0) === 0 && sc.realScore(null) === null && sc.realScore("") === null && sc.isScoredCall({ score_overall: 0 }) && !sc.isScoredCall({ score_overall: null }) && sc.countOutcome({ count: 0 }).value === 0 && sc.countOutcome({ count: 0 }).available && sc.countOutcome({ error: { message: "x" }, count: null }).value === null && !sc.countOutcome({ count: null }).available && sc.windowStartIso(30, 1_000_000_000_000) === new Date(1_000_000_000_000 - 30 * 86400000).toISOString());
+    check("both routes read the one definition (source wiring)", /onlyScoredCalls\(/.test(fs.readFileSync(path.join(__dirname, "../src/routes/crm.ts"), "utf8")) && (fs.readFileSync(path.join(__dirname, "../src/routes/manager.ts"), "utf8").match(/onlyScoredCalls\(/g) || []).length >= 3 && !/\.eq\("status", "scored"\)/.test(fs.readFileSync(path.join(__dirname, "../src/routes/manager.ts"), "utf8").slice(0, fs.readFileSync(path.join(__dirname, "../src/routes/manager.ts"), "utf8").indexOf("router.get(\"/sparring-sessions\""))));
+    check("harness honesty: no unsupported filter reached the fake database", unsupported.length === 0, unsupported.join(","));
+  }
 
   // ── COMMAND CENTRE
   check("command-centre: no scored calls → averageOrNull is null, not 0", manager.averageOrNull(0, 0) === null && manager.averageOrNull(Number.NaN, 3) === null);

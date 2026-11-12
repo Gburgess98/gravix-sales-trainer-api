@@ -1,6 +1,8 @@
 import { buildScoreTrend } from "../lib/scoreTrend";
 import { resolveScoreTrendScope } from "../lib/scoreTrendAccess";
 import { repLookups } from "../lib/repAccess";
+import { SCORED_CALL_ROW_LIMIT, onlyScoredCalls, windowStartIso } from "../lib/scoredCalls";
+import { applyCallScope, resolveCallScope } from "../lib/callScope";
 import { Router } from "express";
 import { randomUUID } from "crypto";
 import { z } from "zod";
@@ -4524,18 +4526,18 @@ router.get("/analytics/score-trend", async (req, res) => {
     // organisation (or one rep inside it); a SalesRep gets only their own trend; everything else fails closed.
     const scope = await resolveScoreTrendScope(repLookups, requester, req.query.repId);
     if (!scope.ok) return res.status(scope.status).json(scope.body);
-    const orgId = scope.orgId;
     const repId = scope.repId;
+    // Same call scope (organisation + the caller's office/company) and same scored-call definition as the command centre.
+    const callScope = await resolveCallScope(supa, requester, repLookups);
+    if (!callScope) return res.status(403).json({ ok: false, error: "forbidden" });
 
-    const sinceIso = new Date(Date.now() - days * 86400000).toISOString();
+    const sinceIso = windowStartIso(days);
 
-    let q = supa
-      .from("calls")
-      .select("score_overall,created_at,user_id")
-      .eq("org_id", orgId)
+    let q: any = applyCallScope((supa as any).from("calls").select("score_overall,created_at,user_id"), callScope)
       .gte("created_at", sinceIso)
-      .not("score_overall", "is", null)
-      .order("created_at", { ascending: true });
+      .order("created_at", { ascending: true })
+      .limit(SCORED_CALL_ROW_LIMIT);
+    q = onlyScoredCalls(q);
 
     if (repId) q = q.eq("user_id", repId);
 
